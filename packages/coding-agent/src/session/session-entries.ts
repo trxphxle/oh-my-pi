@@ -8,6 +8,7 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import type { ModeRetirementPolicy } from "../discord-mode/protocol";
 import type { CompactionMethod } from "./compaction-methods";
 
 export const CURRENT_SESSION_VERSION = 3;
@@ -59,6 +60,8 @@ export interface NewSessionOptions {
 	providerPromptCacheKey?: string;
 	/** Skip flushing the current session and delete it instead of saving. */
 	drop?: boolean;
+	/** Discord disposition for an explicitly deleted native conversation; defaults to retain. */
+	discordRetirement?: ModeRetirementPolicy;
 	/** Additional workspace directories to seed on the new session. */
 	additionalDirectories?: string[];
 }

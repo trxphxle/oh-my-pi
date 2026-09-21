@@ -1,9 +1,13 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, AppendOnlyContextManager } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as retirement from "@oh-my-pi/pi-coding-agent/discord-mode/retirement";
+import { readDiscordDeletionEvents } from "@oh-my-pi/pi-coding-agent/discord-mode/retirement-events";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
@@ -19,6 +23,7 @@ let sharedDir: TempDir;
 let authStorage: AuthStorage;
 let modelRegistry: ModelRegistry;
 
+const deleteSessionWithDiscord = retirement.deleteSessionWithDiscord;
 async function setup(): Promise<void> {
 	sharedDir = TempDir.createSync("@pi-new-session-boundary-shared-");
 	authStorage = await AuthStorage.create(path.join(sharedDir.path(), "auth.db"));
@@ -72,14 +77,138 @@ async function createHarness(options?: {
 	return { agent, session, sessionManager };
 }
 
+async function bindDiscordDeletion(sessionManager: SessionManager): Promise<{ root: string; sessionFile: string }> {
+	sessionManager.appendMessage({ role: "user", content: "saved conversation", timestamp: 1 });
+	await sessionManager.ensureOnDisk();
+	await sessionManager.flush();
+	const sessionFile = await fs.realpath(sessionManager.getSessionFile()!);
+	const projectDir = await fs.realpath(sessionManager.getCwd());
+	const root = path.join(projectDir, "discord-retirement");
+	await fs.mkdir(root, { mode: 0o700 });
+	const groupId = randomUUID();
+	await fs.writeFile(
+		path.join(root, "state.json"),
+		JSON.stringify({
+			version: 1,
+			guildId: "1",
+			ownerId: "2",
+			groups: [{ id: groupId, projectDir }],
+			sessions: [
+				{
+					id: sessionManager.getSessionId(),
+					groupId,
+					sessionFile,
+					projectDir,
+					label: "saved conversation",
+					channelId: "3",
+				},
+			],
+		}),
+		{ mode: 0o600 },
+	);
+	spyOn(retirement, "deleteSessionWithDiscord").mockImplementation((file, remove, policy) =>
+		deleteSessionWithDiscord(file, remove, policy, { root, notify: async () => {} }),
+	);
+	return { root, sessionFile };
+}
+
 describe("AgentSession.newSession boundary", () => {
 	beforeAll(setup);
 	afterAll(teardown);
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		while (cleanup.length > 0) {
 			const run = cleanup.pop();
 			if (run) await run();
 		}
+	});
+
+	for (const policy of [undefined, "delete"] as const) {
+		it(`retires successful native deletion with ${policy ?? "default retain"} authority`, async () => {
+			const { session, sessionManager } = await createHarness();
+			const { root, sessionFile } = await bindDiscordDeletion(sessionManager);
+			const previousId = session.sessionId;
+
+			expect(await session.newSession({ drop: true, discordRetirement: policy })).toBe(true);
+
+			expect(await Bun.file(sessionFile).exists()).toBe(false);
+			expect(session.sessionId).not.toBe(previousId);
+			const events = await readDiscordDeletionEvents(root);
+			expect(
+				events.map(event => ({
+					sessionId: event.binding.sessionId,
+					policy: event.policy,
+					phase: event.phase,
+				})),
+			).toEqual([{ sessionId: previousId, policy: policy ?? "retain", phase: "committed" }]);
+		});
+	}
+
+	it("does not prepare retirement when an extension vetoes deletion", async () => {
+		const { session, sessionManager } = await createHarness({
+			extension: {
+				name: "veto-delete",
+				register: pi => {
+					pi.on("session_before_switch", () => ({ cancel: true }));
+				},
+			},
+		});
+		const { root, sessionFile } = await bindDiscordDeletion(sessionManager);
+		const previousId = session.sessionId;
+
+		expect(await session.newSession({ drop: true, discordRetirement: "delete" })).toBe(false);
+
+		expect(session.sessionId).toBe(previousId);
+		expect(await Bun.file(sessionFile).exists()).toBe(true);
+		expect(await readDiscordDeletionEvents(root)).toEqual([]);
+	});
+
+	it("reports failed native deletion without leaving retirement authority or an inconsistent active session", async () => {
+		const { session, sessionManager } = await createHarness();
+		const { root, sessionFile } = await bindDiscordDeletion(sessionManager);
+		const previousId = session.sessionId;
+		spyOn(sessionManager, "dropSession").mockRejectedValue(new Error("permission denied"));
+
+		await expect(session.newSession({ drop: true })).rejects.toThrow("permission denied");
+
+		expect(await Bun.file(sessionFile).exists()).toBe(true);
+		expect(await readDiscordDeletionEvents(root)).toEqual([]);
+		expect(session.sessionId).not.toBe(previousId);
+		expect(session.messages).toEqual([]);
+		sessionManager.appendMessage({ role: "user", content: "new conversation remains writable", timestamp: 2 });
+		await sessionManager.flush();
+		expect(await Bun.file(sessionManager.getSessionFile()!).text()).toContain("new conversation remains writable");
+		expect(await Bun.file(sessionFile).text()).not.toContain("new conversation remains writable");
+	});
+
+	it("keeps retirement committed when deletion succeeds but artifact cleanup fails", async () => {
+		const { session, sessionManager } = await createHarness();
+		const { root, sessionFile } = await bindDiscordDeletion(sessionManager);
+		const dropSession = sessionManager.dropSession.bind(sessionManager);
+		spyOn(sessionManager, "dropSession").mockImplementation(async file => {
+			await dropSession(file);
+			throw new Error("artifact cleanup failed");
+		});
+
+		await expect(session.newSession({ drop: true })).rejects.toThrow("artifact cleanup failed");
+
+		expect(await Bun.file(sessionFile).exists()).toBe(false);
+		expect(sessionManager.getSessionFile()).not.toBe(sessionFile);
+		expect((await readDiscordDeletionEvents(root)).map(event => event.phase)).toEqual(["committed"]);
+		sessionManager.appendMessage({ role: "user", content: "next conversation", timestamp: 2 });
+		await sessionManager.flush();
+		expect(await Bun.file(sessionFile).exists()).toBe(false);
+	});
+
+	it("keeps saved Discord authority intact across /new and session disposal (/exit)", async () => {
+		const { session, sessionManager } = await createHarness();
+		const { root, sessionFile } = await bindDiscordDeletion(sessionManager);
+
+		await session.newSession();
+		await session.dispose();
+
+		expect(await Bun.file(sessionFile).exists()).toBe(true);
+		expect(await readDiscordDeletionEvents(root)).toEqual([]);
 	});
 
 	it("invalidates a primed append-only context so pre-/new bytes never reach the next turn", async () => {

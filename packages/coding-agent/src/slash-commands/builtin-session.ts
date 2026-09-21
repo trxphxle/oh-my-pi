@@ -1,4 +1,5 @@
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { deleteSessionWithDiscord } from "../discord-mode/retirement";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionOAuthAccountList } from "../session/agent-session-types";
 import {
@@ -214,7 +215,7 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				// the active writer attached to the now-deleted path, so the next
 				// prompt would silently resurrect or corrupt the "deleted" file.
 				try {
-					await runtime.sessionManager.dropSession(sessionFile);
+					await deleteSessionWithDiscord(sessionFile, () => runtime.sessionManager.dropSession(sessionFile));
 				} catch (err) {
 					return usage(`Failed to delete session: ${errorMessage(err)}`, runtime);
 				}

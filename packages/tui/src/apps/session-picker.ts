@@ -1,6 +1,7 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import {
 	SessionSelectorComponent,
+	type SessionDeleteChoice,
 	type SessionSelectorEntry,
 	type SessionHistoryMatcher,
 } from "../overlays/session-selector";
@@ -10,7 +11,8 @@ import { runStandaloneTui } from "./standalone-picker";
 export interface SessionPickerHost<T extends SessionSelectorEntry = SessionSelectorEntry> {
 	loadPinnedIds?(): Promise<ReadonlySet<string>>;
 	loadHistoryMatcher?(): SessionHistoryMatcher;
-	deleteSession?(session: T): Promise<boolean>;
+	deleteSession?(session: T, choice?: string): Promise<boolean>;
+	getDeleteChoices?(session: T): Promise<SessionDeleteChoice[] | undefined>;
 	loadAllSessions?(): Promise<T[]>;
 }
 
@@ -63,6 +65,7 @@ export async function selectSession<T extends SessionSelectorEntry>(
 				},
 				{
 					onDelete: options.allowDelete === false ? undefined : host.deleteSession,
+					getDeleteChoices: options.allowDelete === false ? undefined : host.getDeleteChoices,
 					historyMatcher,
 					loadAllSessions: options.allowGlobalScope === false ? undefined : host.loadAllSessions,
 					allSessions: options.allSessions,

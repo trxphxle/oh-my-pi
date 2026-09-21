@@ -84,6 +84,7 @@ import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { type EditStore, PowerAssertion, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
 import { disposeDiscordModeSession, invalidateDiscordModeSession } from "../discord-mode/session";
+import { deleteSessionWithDiscord } from "../discord-mode/retirement";
 import {
 	$env,
 	escapeXmlText,
@@ -8318,6 +8319,7 @@ export class AgentSession {
 		await this.#bash.flushPending();
 		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
 		let sessionTransitioned = false;
+		let deletionError: Error | undefined;
 		try {
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
@@ -8327,9 +8329,17 @@ export class AgentSession {
 				this.tokenRate.reset();
 				if (options?.drop && previousSessionFile) {
 					try {
-						await this.sessionManager.dropSession(previousSessionFile);
+						await deleteSessionWithDiscord(
+							previousSessionFile,
+							() => this.sessionManager.dropSession(previousSessionFile),
+							options.discordRetirement,
+						);
 					} catch (err) {
 						logger.error("Failed to delete session during /delete", { err });
+						deletionError = new Error(
+							`Failed to delete the previous session: ${err instanceof Error ? err.message : String(err)}. A new session was started.`,
+							{ cause: err },
+						);
 					}
 				} else {
 					await this.sessionManager.flush();
@@ -8402,6 +8412,7 @@ export class AgentSession {
 				});
 			}
 
+			if (deletionError) throw deletionError;
 			return true;
 		} finally {
 			if (advisorRecordersDetached) {

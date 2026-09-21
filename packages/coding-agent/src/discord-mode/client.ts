@@ -57,6 +57,20 @@ function group(value: unknown): value is ModeGroup {
 		(value.overviewId === undefined || typeof value.overviewId === "string")
 	);
 }
+function retirement(value: unknown): boolean {
+	return (
+		record(value) &&
+		typeof value.eventId === "string" &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.eventId) &&
+		(value.policy === "retain" || value.policy === "delete") &&
+		typeof value.deletedAt === "number" &&
+		Number.isSafeInteger(value.deletedAt) &&
+		value.deletedAt >= 0 &&
+		["pending", "done", "attention"].includes(String(value.state)) &&
+		(value.channelId === undefined || (typeof value.channelId === "string" && /^\d{1,22}$/.test(value.channelId))) &&
+		(value.error === undefined || (typeof value.error === "string" && value.error.length <= 500))
+	);
+}
 function session(value: unknown): value is ModeSession {
 	return (
 		record(value) &&
@@ -65,7 +79,15 @@ function session(value: unknown): value is ModeSession {
 		) &&
 		["enabled", "connected", "busy", "pendingInput"].every(key => typeof value[key] === "boolean") &&
 		binding(value.state) &&
-		(value.channelId === undefined || typeof value.channelId === "string")
+		(value.channelId === undefined || typeof value.channelId === "string") &&
+		(value.retirement === undefined ||
+			(retirement(value.retirement) &&
+				record(value.retirement) &&
+				value.retirement.channelId === value.channelId &&
+				!value.enabled &&
+				!value.connected &&
+				!value.busy &&
+				!value.pendingInput))
 	);
 }
 function snapshot(value: unknown): value is ModeSnapshot {

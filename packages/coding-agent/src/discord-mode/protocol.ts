@@ -22,6 +22,32 @@ export interface ModeGroup {
 	overviewId?: string;
 	state: BindingState;
 }
+export type ModeRetirementPolicy = "retain" | "delete";
+export interface ModeRetirement {
+	eventId: string;
+	policy: ModeRetirementPolicy;
+	deletedAt: number;
+	state: "pending" | "done" | "attention";
+	channelId?: string;
+	error?: string;
+}
+export interface ModeDeletionBinding {
+	sessionId: string;
+	sessionFile: string;
+	projectDir: string;
+	channelId?: string;
+	label: string;
+	guildId: string;
+	ownerId: string;
+}
+export interface ModeDeletionEvent {
+	version: 1;
+	id: string;
+	binding: ModeDeletionBinding;
+	policy: ModeRetirementPolicy;
+	phase: "prepared" | "committed";
+	createdAt: number;
+}
 export interface ModeSession {
 	id: string;
 	groupId: string;
@@ -35,6 +61,7 @@ export interface ModeSession {
 	busy: boolean;
 	pendingInput: boolean;
 	state: BindingState;
+	retirement?: ModeRetirement;
 }
 export interface ModeEnrollment {
 	group: ModeGroup;
@@ -78,6 +105,7 @@ export interface ModeSnapshot {
 	gatewayConnected: boolean;
 }
 export type ModeRequest =
+	| { op: "retire"; eventId: string }
 	| {
 			op: "register";
 			requestId: string;
@@ -174,7 +202,15 @@ export interface DiscordPort {
 	rename(id: string, name: string): Promise<void>;
 	move(id: string, categoryId: string): Promise<void>;
 	publish(channelId: string, text: string, key: string): Promise<void>;
-	status(channelId: string, text: string, key: string, connectionId?: string, messageId?: string): Promise<string>;
+	status(
+		channelId: string,
+		text: string,
+		key: string,
+		connectionId?: string,
+		messageId?: string,
+		existingOnly?: boolean,
+	): Promise<string>;
 	showDialog(channelId: string, dialog: ModeDialog): Promise<void>;
 	endDialog(channelId: string, dialogId: string): Promise<void>;
+	retire(channelId: string, sessionId: string, policy: ModeRetirementPolicy): Promise<void>;
 }

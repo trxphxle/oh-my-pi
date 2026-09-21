@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Session pickers now support host-provided deletion choices, including cancellation while choices load.
+
 ### Changed
 
 - Welcome screens, terminal titles, setup flows, and notifications now identify this fork as Haiso.

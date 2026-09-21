@@ -7,6 +7,8 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
+import { HookSelectorComponent } from "@oh-my-pi/pi-tui/overlays/hook-selector";
+import { Container } from "@oh-my-pi/pi-tui";
 import { BtwController } from "@oh-my-pi/pi-coding-agent/modes/controllers/btw-controller";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
@@ -148,6 +150,22 @@ describe("BTW session boundaries", () => {
 		return component;
 	}
 
+	async function openDeleteConfirmation(panel: SessionSelectorComponent): Promise<void> {
+		const ready = Promise.withResolvers<void>();
+		panel.setOnRequestRender(() => {
+			if (
+				panel.children.some(
+					child =>
+						child instanceof Container &&
+						child.children.some(component => component instanceof HookSelectorComponent),
+				)
+			)
+				ready.resolve();
+		});
+		panel.handleInput("\x1b[3~");
+		await ready.promise;
+	}
+
 	async function startTransition(action: "delete command" | "picker delete" | "picker resume") {
 		if (action === "delete command") {
 			vi.spyOn(SelectorController.prototype, "showSessionSelector").mockResolvedValue(undefined);
@@ -168,7 +186,7 @@ describe("BTW session boundaries", () => {
 					}
 				},
 			);
-			panel.handleInput("\x1b[3~");
+			await openDeleteConfirmation(panel);
 		} else {
 			const resume = SelectorController.prototype.handleResumeSession;
 			vi.spyOn(SelectorController.prototype, "handleResumeSession").mockImplementation(async function (
@@ -269,7 +287,7 @@ describe("BTW session boundaries", () => {
 				removed.resolve();
 			},
 		);
-		panel.handleInput("\x1b[3~");
+		await openDeleteConfirmation(panel);
 		panel.handleInput("\n");
 		await removed.promise;
 		expect(await Bun.file(target).exists()).toBe(false);

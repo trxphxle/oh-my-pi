@@ -17,6 +17,7 @@ import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-exe
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { parseExportArgs } from "../../export/html/args";
 import { shareSession } from "../../export/share";
+import { chooseDiscordDeletionPolicy } from "../../discord-mode/deletion-ui";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
 	diffMentalModelContent,
@@ -1040,7 +1041,19 @@ export class CommandController {
 				await Bun.sleep(10);
 			}
 		}
-		if (!(await this.ctx.session.newSession(options))) return;
+		const previousSessionId = this.ctx.session.sessionId;
+		let transitionError: unknown;
+		try {
+			if (!(await this.ctx.session.newSession(options))) return;
+		} catch (error) {
+			if (this.ctx.session.sessionId === previousSessionId) {
+				this.ctx.showError(error instanceof Error ? error.message : String(error));
+				return;
+			}
+			// A partial deletion can still require a fresh session. Rebuild the UI
+			// for that committed transition, but never label the deletion a success.
+			transitionError = error;
+		}
 		// A focused subagent view keeps its own history: return to the main session
 		// first so the transcript below cannot rebuild from the subagent's surviving
 		// conversation, then drop any turn-scoped anchors (coalescing timers,
@@ -1056,7 +1069,11 @@ export class CommandController {
 		this.ctx.clearTransientSessionUi();
 		this.ctx.resetTranscript();
 
-		this.ctx.present([new Spacer(1), new Text(`${theme.fg("accent", `${theme.status.success} ${label}`)}`, 1, 1)]);
+		if (transitionError) {
+			this.ctx.showError(transitionError instanceof Error ? transitionError.message : String(transitionError));
+		} else {
+			this.ctx.present([new Spacer(1), new Text(`${theme.fg("accent", `${theme.status.success} ${label}`)}`, 1, 1)]);
+		}
 		await this.ctx.reloadTodos();
 		this.ctx.ui.requestRender(true, { clearScrollback: true });
 	}
@@ -1109,11 +1126,18 @@ export class CommandController {
 	}
 
 	async handleDeleteCommand(): Promise<void> {
-		if (!this.ctx.sessionManager.getSessionFile()) {
+		const sessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!sessionFile) {
 			this.ctx.showError("Nothing to delete (in-memory session)");
 			return;
 		}
-		await this.#runNewSessionFlow({ drop: true }, "Session deleted");
+		try {
+			const policy = await chooseDiscordDeletionPolicy(this.ctx, sessionFile);
+			if (policy === null) return;
+			await this.#runNewSessionFlow({ drop: true, discordRetirement: policy }, "Session deleted");
+		} catch (error) {
+			this.ctx.showError(`Failed to delete session: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 
 	async handleForkCommand(): Promise<void> {

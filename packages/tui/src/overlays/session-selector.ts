@@ -16,7 +16,7 @@ import {
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import { theme } from "../theme/theme";
 import { contentRowWidth } from "../chrome/selector-helpers";
-import { matchesAppInterrupt, matchesSelectDown, matchesSelectUp } from "../keybinding-matchers";
+import { matchesAppInterrupt, matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../keybinding-matchers";
 /** Session lifecycle status presented by the picker. */
 export type SessionSelectorStatus = "complete" | "interrupted" | "aborted" | "error" | "pending" | "unknown";
 
@@ -819,8 +819,16 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	}
 }
 
+export interface SessionDeleteChoice {
+	value: string;
+	label: string;
+	description?: string;
+}
+
 export interface SessionSelectorOptions<T extends SessionSelectorEntry = SessionSelectorEntry> {
-	onDelete?: (session: T) => Promise<boolean>;
+	onDelete?: (session: T, choice?: string) => Promise<boolean>;
+	/** Undefined preserves the ordinary Yes/No confirmation; custom choices add Cancel. */
+	getDeleteChoices?: (session: T) => Promise<SessionDeleteChoice[] | undefined>;
 	historyMatcher?: SessionHistoryMatcher;
 	/** Loads sessions across all projects for the all-projects scope toggle (Tab). */
 	loadAllSessions?: () => Promise<T[]>;
@@ -864,7 +872,11 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	// scrollback, stranding it above the viewport once the dialog closed).
 	#contentSlot: Container;
 	#messageContainer: Container;
-	#onDelete?: (session: T) => Promise<boolean>;
+	#onDelete?: (session: T, choice?: string) => Promise<boolean>;
+	readonly #getDeleteChoices?: (session: T) => Promise<SessionDeleteChoice[] | undefined>;
+	#deletePending = false;
+	#deleteLookup: { cancelled: boolean } | undefined;
+	#disposed = false;
 	#onRequestRender?: () => void;
 	readonly #loadAllSessions?: () => Promise<T[]>;
 	#folderSessions: T[];
@@ -897,6 +909,7 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 
 		this.#messageContainer = new Container();
 		this.#onDelete = options.onDelete;
+		this.#getDeleteChoices = options.getDeleteChoices;
 		this.#loadAllSessions = options.loadAllSessions;
 		this.#folderSessions = sessions;
 		this.#globalSessions = options.allSessions ?? null;
@@ -936,7 +949,7 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 		};
 		this.#sessionList.onRequestRender = () => this.#onRequestRender?.();
 		this.#sessionList.onDeleteRequest = (session: T) => {
-			this.#showDeleteConfirmation(session);
+			void this.#showDeleteConfirmation(session);
 		};
 		if (this.#loadAllSessions || this.#globalSessions) {
 			this.#sessionList.onToggleScope = () => {
@@ -1009,6 +1022,7 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	 * child-walking dispose would miss its pending history-merge timer.
 	 */
 	override dispose(): void {
+		this.#disposed = true;
 		this.#sessionList.dispose();
 		super.dispose();
 	}
@@ -1023,7 +1037,26 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 		this.#messageContainer.addChild(new Spacer(1));
 	}
 
-	#showDeleteConfirmation(session: T): void {
+	async #showDeleteConfirmation(session: T): Promise<void> {
+		if (this.#deletePending || this.#deleteLookup || this.#confirmationDialog || !this.#onDelete) return;
+		let choices: SessionDeleteChoice[] | undefined;
+		if (this.#getDeleteChoices) {
+			const lookup = { cancelled: false };
+			this.#deleteLookup = lookup;
+			this.#clearError();
+			try {
+				choices = await this.#getDeleteChoices(session);
+			} catch (error) {
+				if (!this.#disposed && !lookup.cancelled) {
+					this.#showError(error instanceof Error ? error.message : String(error));
+					this.#onRequestRender?.();
+				}
+				return;
+			} finally {
+				if (this.#deleteLookup === lookup) this.#deleteLookup = undefined;
+			}
+			if (this.#disposed || lookup.cancelled) return;
+		}
 		const displayName = session.title || session.firstMessage.slice(0, 40) || session.id;
 		const closeDialog = () => {
 			this.#confirmationDialog = null;
@@ -1036,12 +1069,16 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 		};
 		this.#confirmationDialog = new HookSelectorComponent(
 			`Delete session?\n${displayName}`,
-			["Yes", "No"],
+			choices ? [...choices, "Cancel"] : ["Yes", "No"],
 			async (option: string) => {
-				if (option === "Yes" && this.#onDelete) {
+				if (this.#deletePending) return;
+				const choice = choices?.find(choice => choice.label === option);
+				if ((choices ? choice !== undefined : option === "Yes") && this.#onDelete) {
+					this.#deletePending = true;
 					this.#clearError();
 					try {
-						const deleted = await this.#onDelete(session);
+						const deleted = await this.#onDelete(session, choice?.value);
+						if (this.#disposed) return;
 						if (deleted) {
 							this.#sessionList.removeSession(session.path);
 							this.#folderSessions = this.#folderSessions.filter(s => s.path !== session.path);
@@ -1050,10 +1087,12 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 							}
 						}
 					} catch (err) {
-						this.#showError(err instanceof Error ? err.message : String(err));
+						if (!this.#disposed) this.#showError(err instanceof Error ? err.message : String(err));
+					} finally {
+						this.#deletePending = false;
 					}
 				}
-				closeDialog();
+				if (!this.#disposed) closeDialog();
 			},
 			closeDialog,
 		);
@@ -1099,7 +1138,14 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	}
 
 	handleInput(keyData: string): void {
-		if (this.#inputLocked) return;
+		if (this.#inputLocked || this.#deletePending || this.#disposed) return;
+		if (this.#deleteLookup) {
+			if (matchesSelectCancel(keyData)) {
+				this.#deleteLookup.cancelled = true;
+				this.#deleteLookup = undefined;
+			}
+			return;
+		}
 		if (keyData.startsWith("\x1b[<")) {
 			this.#handleMouse(keyData);
 			return;

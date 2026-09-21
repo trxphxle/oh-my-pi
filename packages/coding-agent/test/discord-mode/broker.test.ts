@@ -5,6 +5,14 @@ import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
 import { connectDiscordModeAt } from "../../src/discord-mode/client";
+import { readPrivateJson, writePrivateJson } from "../../src/discord-mode/private-files";
+import {
+	commitDiscordDeletionEvent,
+	discardDiscordDeletionEvent,
+	prepareDiscordDeletionEvent,
+	readDiscordDeletionEvents,
+	withDiscordDeletionLock,
+} from "../../src/discord-mode/retirement-events";
 import { startDiscordModeServer } from "../../src/discord-mode/server";
 import type {
 	ChannelInspection,
@@ -13,6 +21,9 @@ import type {
 	ModeControlRequest,
 	ModeControlResult,
 	ModeDialog,
+	ModeDeletionBinding,
+	ModeDeletionEvent,
+	ModeRetirementPolicy,
 	ModeLease,
 	ModeRequest,
 	ModeSnapshot,
@@ -33,13 +44,18 @@ class FixtureDiscord implements DiscordPort {
 	creates = 0;
 	statusCreates = 0;
 	nextStatusConfirmation: "lost" | "invalid" | undefined;
+	failNextStatusInspection = false;
 	failNextCreate = false;
 	failNextPublish = false;
+	online = true;
+	failNextRetire: "before" | "after" | undefined;
+	beforeRetire: (() => Promise<void>) | undefined;
+	readonly retirements: Array<{ channelId: string; policy: ModeRetirementPolicy }> = [];
 	#next = 1000;
 
 	async start(handlers: DiscordPortHandlers): Promise<void> {
 		this.handlers = handlers;
-		handlers.connection(true);
+		handlers.connection(this.online);
 	}
 	async close(): Promise<void> {
 		this.handlers?.connection(false);
@@ -83,6 +99,39 @@ class FixtureDiscord implements DiscordPort {
 	async move(id: string, categoryId: string): Promise<void> {
 		this.channel(id).parentId = categoryId;
 	}
+	async retire(channelId: string, sessionId: string, policy: ModeRetirementPolicy): Promise<void> {
+		await this.beforeRetire?.();
+		const inspected = await this.inspect(channelId);
+		if (inspected.state === "missing") return;
+		const marker = `haiso:session:${sessionId}`;
+		const closed = `${marker} — Closed: native conversation permanently deleted.`;
+		if (
+			inspected.state !== "found" ||
+			inspected.channel.kind !== "text" ||
+			!inspected.channel.private ||
+			(inspected.channel.topic !== marker && inspected.channel.topic !== closed)
+		)
+			throw new Error("exact owned private channel unavailable");
+		if (this.failNextRetire === "before") {
+			this.failNextRetire = undefined;
+			throw new Error("retirement unavailable before effect");
+		}
+		const channel = this.channel(channelId);
+		if (policy === "retain") {
+			if (channel.topic === closed && channel.name.startsWith("archived-")) return;
+			channel.topic = closed;
+			if (!channel.name.startsWith("archived-")) channel.name = `archived-${channel.name}`.slice(0, 100);
+		} else {
+			this.channels.delete(channelId);
+			this.cards.delete(channelId);
+			this.dialogs.delete(channelId);
+		}
+		this.retirements.push({ channelId, policy });
+		if (this.failNextRetire === "after") {
+			this.failNextRetire = undefined;
+			throw new Error("retirement applied; response and immediate inspection unavailable");
+		}
+	}
 	async publish(channelId: string, text: string, key: string): Promise<void> {
 		this.publications.push({ channelId, text, key });
 		if (this.failNextPublish) {
@@ -96,9 +145,16 @@ class FixtureDiscord implements DiscordPort {
 		_key: string,
 		connectionId?: string,
 		messageId?: string,
+		existingOnly = false,
 	): Promise<string> {
+		if (this.failNextStatusInspection) {
+			this.failNextStatusInspection = false;
+			throw new Error("status inspection temporarily unavailable before mutation");
+		}
 		const existing = this.cards.get(channelId);
-		if (messageId && existing?.id !== messageId) throw new Error("status message does not belong to this channel");
+		if (existingOnly && (!messageId || existing?.id !== messageId))
+			throw new Error("exact saved status message unavailable; replacement is forbidden");
+		if (messageId && existing?.id !== messageId) messageId = undefined;
 		const id = messageId ?? (this.legacyCards.has(channelId) ? existing?.id : undefined);
 		const card = { id: id ?? String(this.#next++), text, connectionId };
 		if (!id) this.statusCreates++;
@@ -183,7 +239,510 @@ function resumed(input: Extract<ModeRequest, { op: "register" }>): Extract<ModeR
 	return { ...input, requestId: randomUUID(), connectionId: randomUUID() };
 }
 
+function deletionBinding(snapshot: ModeSnapshot): ModeDeletionBinding {
+	return {
+		sessionId: snapshot.session.id,
+		sessionFile: snapshot.session.sessionFile,
+		projectDir: snapshot.session.projectDir,
+		channelId: snapshot.session.channelId,
+		label: snapshot.session.label,
+		guildId: config.guildId,
+		ownerId: config.ownerId,
+	};
+}
+
+async function deleted(
+	storePath: string,
+	snapshot: ModeSnapshot,
+	policy: ModeRetirementPolicy = "retain",
+	commit = true,
+): Promise<ModeDeletionEvent> {
+	const root = path.dirname(storePath);
+	const event = await prepareDiscordDeletionEvent(deletionBinding(snapshot), policy, root);
+	await fs.rm(snapshot.session.sessionFile);
+	if (commit) await commitDiscordDeletionEvent(event, root);
+	return event;
+}
+
 describe("durable Discord mode broker", () => {
+	it("durably closes retained conversations before effects, clears input, and rejects every stale route", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-retain-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "retained");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const retired = await broker.request(input);
+			const peer = await broker.request(registration(root, "survivor"));
+			await port.owner(retired, "private queued owner payload");
+			await broker.request({
+				op: "send",
+				lease: lease(retired),
+				requestId: randomUUID(),
+				recipientId: peer.session.id,
+				text: "private outgoing peer payload",
+			});
+			await broker.request({
+				op: "dialog",
+				lease: lease(retired),
+				dialog: { id: "pending", kind: "input", title: "Private input" },
+			});
+			const dialogId = port.dialogs.get(retired.session.channelId!)!.id;
+			await port.handlers!.answer({
+				ownerId: config.ownerId,
+				channelId: retired.session.channelId!,
+				dialogId,
+				value: "private queued answer",
+				cancelled: false,
+			});
+			const statusId = port.cards.get(retired.session.channelId!)!.id;
+			const creates = port.statusCreates;
+			const event = await deleted(storePath, retired);
+			expect((await port.owner(retired, "arrived after native deletion")).text).toContain("nothing was forwarded");
+			await expect(poll(broker, retired)).rejects.toThrow("permanently deleted");
+			port.beforeRetire = async () => {
+				const journal = (await readPrivateJson(storePath)) as {
+					sessions: Array<{ id: string; enabled: boolean; connected: boolean; retirement?: { eventId: string } }>;
+					deliveries: unknown[];
+					dialogs: unknown[];
+				};
+				const tombstone = journal.sessions.find(item => item.id === retired.session.id)!;
+				expect(tombstone.retirement?.eventId).toBe(event.id);
+				expect(tombstone.enabled).toBe(false);
+				expect(tombstone.connected).toBe(false);
+				expect(journal.deliveries).toEqual([]);
+				expect(journal.dialogs).toEqual([]);
+			};
+			const result = await broker.request({ op: "retire", eventId: event.id });
+			expect(result.session.retirement).toMatchObject({
+				eventId: event.id,
+				policy: "retain",
+				state: "done",
+				channelId: retired.session.channelId,
+			});
+			expect(result.lease).toBeUndefined();
+			expect(port.channel(retired.session.channelId!).name).toMatch(/^archived-/);
+			expect(port.cards.get(retired.session.channelId!)).toMatchObject({ id: statusId, connectionId: undefined });
+			expect(port.cards.get(retired.session.channelId!)!.text).toContain("permanently deleted");
+			expect(port.statusCreates).toBe(creates);
+			expect((await poll(broker, peer)).peers).toEqual([]);
+			expect((await poll(broker, peer)).deliveries).toEqual([]);
+			expect(port.cards.get(retired.group.overviewId!)!.text).not.toContain(retired.session.id);
+			expect((await port.owner(retired, "must not become a model prompt")).text).toContain("nothing was forwarded");
+			expect((await port.control(retired, "status", { connectionId: retired.session.connectionId })).text).toContain(
+				"permanently deleted",
+			);
+			expect((await port.control(retired, "queue")).queued).toEqual([]);
+			await expect(port.control(retired, "stop", { connectionId: retired.session.connectionId })).rejects.toThrow(
+				"permanently deleted",
+			);
+			await expect(
+				port.control(retired, "cancel", { connectionId: retired.session.connectionId, deliveryId: randomUUID() }),
+			).rejects.toThrow("permanently deleted");
+			await expect(
+				port.handlers!.answer({
+					ownerId: config.ownerId,
+					channelId: retired.session.channelId!,
+					dialogId,
+					value: "late",
+					cancelled: false,
+				}),
+			).rejects.toThrow("permanently deleted");
+			await expect(poll(broker, retired)).rejects.toThrow("permanently deleted");
+			await expect(
+				broker.request({
+					op: "repair",
+					lease: lease(retired),
+					requestId: randomUUID(),
+					target: "session",
+					resumeQueued: true,
+				}),
+			).rejects.toThrow("permanently deleted");
+			await expect(
+				broker.request({
+					op: "send",
+					lease: lease(peer),
+					requestId: randomUUID(),
+					recipientId: retired.session.id,
+					text: "late peer message",
+				}),
+			).rejects.toThrow("permanently deleted");
+			await expect(broker.request(resumed(input))).rejects.toThrow("permanently deleted");
+			expect(await readDiscordDeletionEvents(path.dirname(storePath))).toEqual([]);
+			await broker.request({ op: "retire", eventId: event.id });
+			expect(port.retirements).toEqual([{ channelId: retired.session.channelId!, policy: "retain" }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("deletes only the explicitly approved bound channel and recovers a lost deletion response", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-delete-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "erase");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			const other = await broker.request(registration(root, "untouched"));
+			const otherChannel = structuredClone(port.channel(other.session.channelId!));
+			const event = await deleted(storePath, session, "delete");
+			port.failNextRetire = "after";
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe(
+				"attention",
+			);
+			expect(port.channels.has(session.session.channelId!)).toBe(false);
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe("done");
+			expect(port.retirements).toEqual([{ channelId: session.session.channelId!, policy: "delete" }]);
+			expect(port.channel(other.session.channelId!)).toEqual(otherChannel);
+			expect(port.channels.has(session.group.categoryId!)).toBe(true);
+			expect(port.channels.has(session.group.overviewId!)).toBe(true);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("adopts offline deletion intent on startup and completes pending archival after reconnect", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-offline-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "offline");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			await broker.close();
+			const event = await deleted(storePath, session);
+			port.online = false;
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			const offline = await broker.request({ op: "retire", eventId: event.id });
+			expect(offline.session.retirement?.state).toBe("pending");
+			expect(offline.session.enabled).toBe(false);
+			expect(port.retirements).toEqual([]);
+			await expect(broker.request(resumed(input))).rejects.toThrow("permanently deleted");
+			port.handlers!.connection(true);
+			await port.handlers!.changed();
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe("done");
+			expect(port.retirements).toEqual([{ channelId: session.session.channelId!, policy: "retain" }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("recovers only prepared intent whose exact native file is proven absent", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-prepared-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "prepared");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			const event = await prepareDiscordDeletionEvent(deletionBinding(session), "retain", path.dirname(storePath));
+			await expect(broker.request({ op: "retire", eventId: event.id })).rejects.toThrow("not committed");
+			expect((await poll(broker, session)).session.enabled).toBe(true);
+			await fs.rm(input.sessionFile);
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe("done");
+			expect(port.retirements).toEqual([{ channelId: session.session.channelId!, policy: "retain" }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("serializes adoption with cancellation and replacement of an explicit deletion attempt", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-transaction-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const eventRoot = path.dirname(storePath);
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "replacement");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			const previous = await prepareDiscordDeletionEvent(deletionBinding(session), "retain", eventRoot);
+			const held = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const replacement = withDiscordDeletionLock(eventRoot, async () => {
+				held.resolve();
+				await release.promise;
+				await discardDiscordDeletionEvent(previous, eventRoot);
+				const current = await prepareDiscordDeletionEvent(deletionBinding(session), "delete", eventRoot);
+				await fs.rm(input.sessionFile);
+				await commitDiscordDeletionEvent(current, eventRoot);
+				return current;
+			});
+			await held.promise;
+			const stale = broker.request({ op: "retire", eventId: previous.id }).catch(error => error);
+			release.resolve();
+			const current = await replacement;
+			expect(await stale).toBeInstanceOf(DiscordModeError);
+			const result = await broker.request({ op: "retire", eventId: current.id });
+			expect(result.session.retirement).toMatchObject({ eventId: current.id, policy: "delete", state: "done" });
+			expect(port.retirements).toEqual([{ channelId: session.session.channelId!, policy: "delete" }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("does not infer deletion from missing files, off, disconnection, or missing parent directories", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-no-inference-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "ordinary");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const ordinary = await broker.request(input);
+			await fs.rm(input.sessionFile);
+			await broker.request({ op: "off", lease: lease(ordinary) });
+			const movedInput = registration(root, "moved");
+			const nativeDir = path.join(root, "native-dir");
+			await fs.mkdir(nativeDir);
+			movedInput.sessionFile = path.join(nativeDir, `${movedInput.sessionId}.jsonl`);
+			await fs.writeFile(
+				movedInput.sessionFile,
+				`${JSON.stringify({ type: "session", id: movedInput.sessionId })}\n`,
+			);
+			const moved = await broker.request(movedInput);
+			const event = await prepareDiscordDeletionEvent(deletionBinding(moved), "retain", path.dirname(storePath));
+			await fs.rename(nativeDir, `${nativeDir}-moved`);
+			await expect(broker.request({ op: "retire", eventId: event.id })).rejects.toThrow();
+			await fs.rename(`${nativeDir}-moved`, nativeDir);
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect((await broker.lookup(input.projectDir, input.sessionId))?.session?.retirement).toBeUndefined();
+			expect((await broker.request(resumed(input))).session.enabled).toBe(true);
+			expect(
+				(await broker.lookup(movedInput.projectDir, movedInput.sessionId))?.session?.retirement,
+			).toBeUndefined();
+			expect(port.retirements).toEqual([]);
+			expect(port.channel(ordinary.session.channelId!).name).not.toMatch(/^archived-/);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("refuses wrong binding and ownership without touching either channel", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-binding-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "target");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			const otherInput = registration(root, "other");
+			await fs.writeFile(
+				otherInput.sessionFile,
+				`${JSON.stringify({ type: "session", id: otherInput.sessionId })}\n`,
+			);
+			const other = await broker.request(otherInput);
+			const forged = await prepareDiscordDeletionEvent(deletionBinding(session), "delete", path.dirname(storePath));
+			forged.binding.channelId = other.session.channelId;
+			await writePrivateJson(path.join(path.dirname(storePath), "deletions", `${session.session.id}.json`), forged);
+			await fs.rm(input.sessionFile);
+			await commitDiscordDeletionEvent(forged, path.dirname(storePath));
+			await expect(broker.request({ op: "retire", eventId: forged.id })).rejects.toThrow("conflicts");
+			expect((await poll(broker, session)).session.retirement).toBeUndefined();
+			const otherEvent = await deleted(storePath, other, "delete");
+			port.channel(other.session.channelId!).topic = `haiso:session:${randomUUID()}`;
+			expect((await broker.request({ op: "retire", eventId: otherEvent.id })).session.retirement?.state).toBe(
+				"attention",
+			);
+			expect(port.channels.has(session.session.channelId!)).toBe(true);
+			expect(port.channels.has(other.session.channelId!)).toBe(true);
+			expect(port.retirements).toEqual([]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("reconciles lost archival responses after restart without duplicate archive effects or new notices", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-recovery-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "recover");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			const creates = port.statusCreates;
+			const event = await deleted(storePath, session);
+			port.failNextRetire = "after";
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe(
+				"attention",
+			);
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe("done");
+			expect(port.channel(session.session.channelId!).name).toBe("archived-recover");
+			expect(port.retirements).toEqual([{ channelId: session.session.channelId!, policy: "retain" }]);
+			expect(port.statusCreates).toBe(creates);
+			const conflicting: ModeDeletionEvent = {
+				...event,
+				id: randomUUID(),
+				policy: "delete",
+				phase: "committed",
+				createdAt: event.createdAt + 1,
+			};
+			await writePrivateJson(
+				path.join(path.dirname(storePath), "deletions", `${session.session.id}.json`),
+				conflicting,
+			);
+			await expect(broker.request({ op: "retire", eventId: conflicting.id })).rejects.toThrow("conflicts");
+			expect(port.channels.has(session.session.channelId!)).toBe(true);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("recovers an unconfirmed saved-card edit without creating a notice and exposes retirement over authenticated IPC", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-notice-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "notice");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			const event = await deleted(storePath, session);
+			port.nextStatusConfirmation = "lost";
+			const creates = port.statusCreates;
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe(
+				"attention",
+			);
+			const closedCardId = port.cards.get(session.session.channelId!)!.id;
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			const socketPath = path.join(root, "ipc.sock");
+			const token = "offline-retirement-fixture-token-123456";
+			const server = await startDiscordModeServer({ broker, socketPath, token });
+			try {
+				const client = await connectDiscordModeAt(socketPath, token);
+				try {
+					const result = await client.request({ op: "retire", eventId: event.id });
+					expect(result.session.retirement).toMatchObject({ eventId: event.id, policy: "retain", state: "done" });
+					expect((await client.lookup(input.projectDir, input.sessionId))?.session?.retirement).toEqual(
+						result.session.retirement,
+					);
+					expect(result.deliveries).toEqual([]);
+					expect(result.answers).toEqual([]);
+				} finally {
+					await client.close();
+				}
+			} finally {
+				await server.close();
+			}
+			expect(port.cards.get(session.session.channelId!)).toMatchObject({
+				id: closedCardId,
+				connectionId: undefined,
+			});
+			expect(port.cards.get(session.session.channelId!)!.text).toContain("permanently deleted");
+			expect(port.statusCreates).toBe(creates);
+			expect(port.retirements).toEqual([{ channelId: session.session.channelId!, policy: "retain" }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("finishes archival despite transient saved-card inspection failure and repairs the notice on recovery", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-card-inspection-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "card-inspection");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			const channelId = session.session.channelId!;
+			const savedCard = structuredClone(port.cards.get(channelId)!);
+			const creates = port.statusCreates;
+			const event = await deleted(storePath, session);
+			port.failNextStatusInspection = true;
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe(
+				"attention",
+			);
+			expect(port.channel(channelId).name).toBe("archived-card-inspection");
+			expect(port.cards.get(channelId)).toEqual(savedCard);
+			const recovered = await broker.request({ op: "retire", eventId: event.id });
+			expect(recovered.session.retirement?.state).toBe("done");
+			expect(port.cards.get(channelId)).toMatchObject({ id: savedCard.id, connectionId: undefined });
+			expect(port.cards.get(channelId)!.text).toContain("permanently deleted");
+			expect(port.statusCreates).toBe(creates);
+			expect(port.retirements).toEqual([{ channelId, policy: "retain" }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("never replaces a missing saved retirement card or adopts a different cached card during recovery", async () => {
+		using temporary = TempDir.createSync("@discord-retirement-card-missing-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "missing-card");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const session = await broker.request(input);
+			const channelId = session.session.channelId!;
+			const event = await deleted(storePath, session);
+			const creates = port.statusCreates;
+			const replacement = {
+				id: "999999",
+				text: "Unrelated cached card; must not be adopted.",
+				connectionId: session.session.connectionId,
+			};
+			port.cards.set(channelId, replacement);
+			port.legacyCards.add(channelId);
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe(
+				"attention",
+			);
+			expect(port.channel(channelId).name).toBe("archived-missing-card");
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe(
+				"attention",
+			);
+			expect(port.cards.get(channelId)).toEqual(replacement);
+			expect(port.statusCreates).toBe(creates);
+			expect(port.retirements).toEqual([{ channelId, policy: "retain" }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
 	it("groups three canonical-folder sessions, isolates other projects, and dispatches FIFO except controls", async () => {
 		using temporary = TempDir.createSync("@discord-broker-membership-");
 		const root = temporary.path();

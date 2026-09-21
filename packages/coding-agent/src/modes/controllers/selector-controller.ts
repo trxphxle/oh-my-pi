@@ -43,6 +43,12 @@ import {
 	theme,
 } from "@oh-my-pi/pi-tui/theme";
 import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import {
+	chooseDiscordDeletionPolicy,
+	discordDeletionPolicy,
+	getDiscordDeletionChoices,
+} from "../../discord-mode/deletion-ui";
+import { deleteSessionWithDiscord } from "../../discord-mode/retirement";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -1906,13 +1912,19 @@ export class SelectorController {
 				: undefined;
 			onSelectSession = session => this.handleResumeSession(session.path);
 			selectorOptions = {
-				onDelete: async (session: SessionInfo) => {
+				getDeleteChoices: getDiscordDeletionChoices,
+				onDelete: async (session: SessionInfo, choice?: string) => {
+					const policy = discordDeletionPolicy(choice);
 					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
 						return false;
 					}
 					const storage = new FileSessionStorage();
 					try {
-						await storage.deleteSessionWithArtifacts(session.path);
+						await deleteSessionWithDiscord(
+							session.path,
+							() => storage.deleteSessionWithArtifacts(session.path),
+							policy,
+						);
 						return true;
 					} catch (error) {
 						throw new Error(
@@ -2069,12 +2081,20 @@ export class SelectorController {
 			return;
 		}
 
-		const confirmed = await this.ctx.showHookConfirm(
-			"Delete Session",
-			"This will permanently delete the current session.\nYou will be returned to the session selector.",
-		);
+		let policy;
+		try {
+			policy = await chooseDiscordDeletionPolicy(this.ctx, sessionFile, () =>
+				this.ctx.showHookConfirm(
+					"Delete Session",
+					"This will permanently delete the current session.\nYou will be returned to the session selector.",
+				),
+			);
+		} catch (error) {
+			this.ctx.showError(`Failed to prepare deletion: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
 
-		if (!confirmed) {
+		if (policy === null) {
 			this.ctx.showStatus("Delete cancelled");
 			return;
 		}
@@ -2085,7 +2105,12 @@ export class SelectorController {
 		}
 
 		// Delete the session file and artifacts directory
-		await storage.deleteSessionWithArtifacts(sessionFile);
+		try {
+			await deleteSessionWithDiscord(sessionFile, () => storage.deleteSessionWithArtifacts(sessionFile), policy);
+		} catch (error) {
+			this.ctx.showError(`Failed to delete session: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
 
 		// Show session selector
 		this.ctx.showStatus("Session deleted");

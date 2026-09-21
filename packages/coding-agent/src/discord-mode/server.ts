@@ -33,6 +33,11 @@ function absolutePath(value: unknown): value is string {
 /** Reject invalid envelopes before they can enter the effect-owning broker queue. */
 export function isModeRequest(value: unknown): value is ModeRequest {
 	if (!record(value) || typeof value.op !== "string") return false;
+	if (value.op === "retire")
+		return (
+			typeof value.eventId === "string" &&
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.eventId)
+		);
 	if (value.op === "register") {
 		return (
 			identifier(value.requestId) &&

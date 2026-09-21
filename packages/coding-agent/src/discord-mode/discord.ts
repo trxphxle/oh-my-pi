@@ -42,6 +42,7 @@ import {
 	type ModeControlRequest,
 	type ModeControlResult,
 	type ModeDialog,
+	type ModeRetirementPolicy,
 	type RemoteChannel,
 } from "./protocol";
 
@@ -571,6 +572,57 @@ export class DiscordAdapter implements DiscordPort {
 		await channel.setParent(categoryId, { lockPermissions: false, reason: "Haiso explicit owner repair" });
 	}
 
+	/** Fetch afresh: null/access failures never authorize treating a channel as deleted. */
+	async #retirementChannel(id: string, marker: string, closedTopic: string): Promise<TextChannel | undefined> {
+		const guild = this.#requireGuild();
+		let channel: GuildBasedChannel | null;
+		try {
+			channel = await guild.channels.fetch(id, { force: true });
+		} catch (error) {
+			if (apiCode(error) === 10003) return undefined;
+			throw new Error("Discord retirement inspection failed; channel deletion is not confirmed.");
+		}
+		if (
+			!channel ||
+			channel.id !== id ||
+			channel.guildId !== this.#config.guildId ||
+			channel.type !== ChannelType.GuildText
+		)
+			throw new Error("Discord retirement requires the exact bound text channel in the configured guild.");
+		if (!this.#private(channel))
+			throw new Error("Discord retirement requires an explicitly owner/bot-private channel.");
+		if (channel.topic !== marker && channel.topic !== closedTopic)
+			throw new Error("Discord retirement refused: channel ownership does not match the deleted native session.");
+		this.#requireManage(channel);
+		return channel;
+	}
+
+	async retire(channelId: string, sessionId: string, policy: ModeRetirementPolicy): Promise<void> {
+		if (!/^\d{1,22}$/.test(channelId) || !UUID.test(sessionId) || (policy !== "retain" && policy !== "delete"))
+			throw new Error("Discord retirement identity or policy is invalid.");
+		const marker = `haiso:session:${sessionId}`;
+		const topic = `${marker} — Closed: native conversation permanently deleted.`;
+		const channel = await this.#retirementChannel(channelId, marker, topic);
+		if (!channel) return;
+		const name = channel.name.startsWith("archived-") ? channel.name : `archived-${channel.name}`.slice(0, 100);
+		if (policy === "retain" && channel.name === name && channel.topic === topic) return;
+		try {
+			if (policy === "delete") await channel.delete("Haiso owner-approved permanent conversation deletion");
+			else
+				await channel.edit({
+					name,
+					topic,
+					reason: "Haiso native conversation permanently deleted; history retained",
+				});
+		} catch {
+			// PATCH/DELETE may have succeeded before the response was lost. Inspect only
+			// this identity; never replay an uncertain mutation in this attempt.
+			const current = await this.#retirementChannel(channelId, marker, topic);
+			if (!current || (policy === "retain" && current.name === name && current.topic === topic)) return;
+			throw new Error("Discord retirement outcome is uncertain; the exact channel needs reconciliation.");
+		}
+	}
+
 	/** Legacy migration only: new posts never carry ownership footers. */
 	async #findMessages(channel: TextChannel, markers: Set<string>): Promise<Map<string, Message>> {
 		const found = new Map<string, Message>();
@@ -673,9 +725,18 @@ export class DiscordAdapter implements DiscordPort {
 		});
 	}
 
-	status(channelId: string, text: string, key: string, connectionId?: string, messageId?: string): Promise<string> {
+	status(
+		channelId: string,
+		text: string,
+		key: string,
+		connectionId?: string,
+		messageId?: string,
+		existingOnly = false,
+	): Promise<string> {
 		if (!text || text.length > 64_000)
 			return Promise.reject(new Error("Discord status exceeds its 64000-character limit."));
+		if (existingOnly && (!messageId || !/^\d{1,22}$/.test(messageId)))
+			return Promise.reject(new Error("Closing a Discord status requires its exact saved message ID."));
 		const marker = `${PREFIX}status:${digest(`${channelId}:${key}`)}`;
 		let card = this.#cards.get(marker);
 		if (!card) {
@@ -690,21 +751,28 @@ export class DiscordAdapter implements DiscordPort {
 			.catch(() => {})
 			.then(async () => {
 				const channel = await this.#textChannel(channelId);
+				if (existingOnly && channel.id !== channelId) throw new Error("The saved Discord channel does not match.");
 				let message: Message | undefined;
-				if (state.id) {
+				const targetId = existingOnly ? messageId : state.id;
+				if (targetId) {
 					try {
-						message = await channel.messages.fetch({ message: state.id, force: true, cache: false });
+						message = await channel.messages.fetch({ message: targetId, force: true, cache: false });
 					} catch (error) {
+						if (existingOnly) throw error;
 						if (apiCode(error) !== 10008) throw error;
 						state.id = undefined;
 						state.uncertain = false;
 					}
 					if (
 						message &&
-						(message.channelId !== channelId || message.author.id !== this.#botId() || message.webhookId)
+						(message.id !== targetId ||
+							message.channelId !== channelId ||
+							message.author.id !== this.#botId() ||
+							message.webhookId)
 					)
 						throw new Error("Discord status is not the saved bot-owned card.");
 				}
+				if (existingOnly && !message) throw new Error("The saved Discord status is unavailable.");
 				if (!message && state.legacy) {
 					message = (await this.#findMessages(channel, new Set([marker]))).get(marker);
 					state.legacy = false;
@@ -732,6 +800,13 @@ export class DiscordAdapter implements DiscordPort {
 					state.uncertain = false;
 				}
 				return message.id;
+			})
+			.catch(error => {
+				if (existingOnly)
+					throw new Error(
+						"The saved Discord status could not be confirmed or updated; no replacement was posted.",
+					);
+				throw error;
 			})
 			.finally(() => {
 				state.queued--;
@@ -773,14 +848,20 @@ export class DiscordAdapter implements DiscordPort {
 		}
 		if (!rejected && kind !== "abort" && (!text.trim() || text.length > DISCORD_MODE_MAX_TEXT))
 			rejected = `Send 1–${DISCORD_MODE_MAX_TEXT} text characters; nothing was forwarded.`;
-		const acknowledgement = await this.#handlers.ownerMessage({
-			id: message.id,
-			channelId: message.channelId,
-			ownerId: message.author.id,
-			text: rejected ? "" : text,
-			kind,
-			...(rejected === undefined ? {} : { rejected }),
-		});
+		let acknowledgement: ModeControlResult;
+		try {
+			acknowledgement = await this.#handlers.ownerMessage({
+				id: message.id,
+				channelId: message.channelId,
+				ownerId: message.author.id,
+				text: rejected ? "" : text,
+				kind,
+				...(rejected === undefined ? {} : { rejected }),
+			});
+		} catch (error) {
+			if (!(error instanceof DiscordModeError)) throw error;
+			acknowledgement = { text: error.message };
+		}
 		// An empty response means this is not a bound Haiso channel. Do not speak there.
 		if (!acknowledgement.text) return;
 		const key = `${PREFIX}ack:${message.id}`;
@@ -1181,10 +1262,12 @@ export class DiscordAdapter implements DiscordPort {
 				result ||
 					"Answer submitted. The original session decides the first answer; completion is not yet confirmed.",
 			);
-		} catch {
+		} catch (error) {
 			await this.#reply(
 				interaction,
-				"Answer outcome is uncertain; it will not be submitted again automatically. Inspect the original session.",
+				error instanceof DiscordModeError
+					? error.message
+					: "Answer outcome is uncertain; it will not be submitted again automatically. Inspect the original session.",
 			);
 		} finally {
 			await this.endDialog(state.channelId, request.id);

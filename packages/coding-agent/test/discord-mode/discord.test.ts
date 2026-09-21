@@ -16,6 +16,7 @@ import {
 	type Guild,
 	GuildApplicationCommandManager,
 	type GuildChannelCreateOptions,
+	type GuildChannelEditOptions,
 	type Interaction,
 	type Message,
 	type InteractionEditReplyOptions,
@@ -27,7 +28,7 @@ import {
 	PermissionsBitField,
 	type TextChannel,
 } from "discord.js";
-import { DiscordModeBroker } from "../../src/discord-mode/broker";
+import { DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
 import { DiscordAdapter } from "../../src/discord-mode/discord";
 import type { DiscordPortHandlers } from "../../src/discord-mode/protocol";
 
@@ -65,6 +66,8 @@ function fixture() {
 	let nextId = 100;
 	let fetchError: unknown;
 	let sendError: "before" | "after" | undefined;
+	let channelError: "before" | "after" | undefined;
+	let channelDeleted = false;
 	let gatewayEvents: Record<string, unknown>[] = [{}];
 	let effective = ALL;
 	let rolesGate: Promise<void> | undefined;
@@ -118,7 +121,7 @@ function fixture() {
 		name: "session",
 		type: ChannelType.GuildText,
 		parentId: "category",
-		topic: "haiso:session:fixture",
+		topic: `haiso:session:${CONNECTION}`,
 		permissionOverwrites: { cache: overwrites },
 		permissionsFor: () => new PermissionsBitField(effective),
 		messages: {
@@ -158,6 +161,27 @@ function fixture() {
 		setParent: vi.fn(async (id: string) => {
 			channel.parentId = id;
 		}),
+		edit: vi.fn(async function (this: { name: string; topic: string }, options: GuildChannelEditOptions) {
+			const failure = channelError;
+			channelError = undefined;
+			if (failure === "before") throw new Error("Authorization: private-token");
+			if (options.name !== undefined) this.name = options.name;
+			if (options.topic !== undefined) this.topic = options.topic ?? "";
+			if (failure === "after") throw new Error("Authorization: private-token");
+			return this;
+		}),
+		delete: vi.fn(async function (this: { id: string }) {
+			const failure = channelError;
+			channelError = undefined;
+			if (failure === "before") throw new Error("Authorization: private-token");
+			if (this.id === CHANNEL) channelDeleted = true;
+			else channels.delete(this.id);
+			for (const [id, message] of history) {
+				if (message.channelId === this.id) history.delete(id);
+			}
+			if (failure === "after") throw new Error("Authorization: private-token");
+			return this;
+		}),
 	};
 	const category = { ...channel, id: "category", type: ChannelType.GuildCategory, parentId: null };
 	const channels = new Map<string, typeof channel | typeof category>();
@@ -177,7 +201,10 @@ function fixture() {
 		channels: {
 			fetch: async (id: string) => {
 				if (fetchError) throw fetchError;
-				if (id === CHANNEL) return channel;
+				if (id === CHANNEL) {
+					if (channelDeleted) throw { code: 10003 };
+					return channel;
+				}
 				if (id === "category" || id === "destination") return { ...category, id };
 				return channels.get(id) ?? null;
 			},
@@ -403,6 +430,9 @@ function fixture() {
 		},
 		setSendError: (error: "before" | "after") => {
 			sendError = error;
+		},
+		setChannelError: (error: "before" | "after") => {
+			channelError = error;
 		},
 		setGatewayEvents: (events: Record<string, unknown>[]) => {
 			gatewayEvents = events;
@@ -889,6 +919,198 @@ describe("Discord mode gateway adapter (offline)", () => {
 		await expect(f.adapter.rename(CHANNEL, "denied")).rejects.toThrow("Manage Channels");
 	});
 
+	it("retains history and permissions, archives once, and still delivers closed-channel owner notices", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		await f.adapter.publish(CHANNEL, "Keep this conversation", "retained-history");
+		const history = [...f.history.values()];
+		const permissions = [...f.overwrites.entries()];
+		await f.adapter.retire(CHANNEL, CONNECTION, "retain");
+		await f.adapter.retire(CHANNEL, CONNECTION, "retain");
+		expect(f.channel.name).toBe("archived-session");
+		expect(f.channel.topic).toContain(`haiso:session:${CONNECTION}`);
+		expect(f.channel.topic).toContain("permanently deleted");
+		expect(f.channel.edit).toHaveBeenCalledTimes(1);
+		expect(Object.keys(f.channel.edit.mock.calls[0]![0]).sort()).toEqual(["name", "reason", "topic"]);
+		expect(f.channel.delete).not.toHaveBeenCalled();
+		expect([...f.history.values()]).toEqual(history);
+		expect([...f.overwrites.entries()]).toEqual(permissions);
+		expect(f.channel.parentId).toBe("category");
+		expect(f.channel.setParent).not.toHaveBeenCalled();
+		expect(f.created).toEqual([]);
+		f.handlers.ownerMessage = async () => ({ text: "Conversation permanently deleted; nothing forwarded." });
+		f.client.emit(Events.MessageCreate, f.ownerMessage("Please continue"));
+		await settleEvents();
+		expect(f.sent.at(-1)?.content).toContain("nothing forwarded");
+		expect(f.sent.at(-1)?.components).toEqual([]);
+	});
+
+	it("requires exact session ownership, guild, text-channel identity, and private permissions before either policy", async () => {
+		for (const policy of ["retain", "delete"] as const) {
+			const f = fixture();
+			await f.adapter.start(f.handlers);
+			const original = {
+				id: f.channel.id,
+				guildId: f.channel.guildId,
+				type: f.channel.type,
+				topic: f.channel.topic,
+			};
+			for (const override of [
+				{ id: "100000000000000099" },
+				{ guildId: "another-guild" },
+				{ type: ChannelType.GuildCategory },
+				{ topic: `haiso:session:${DELIVERY}` },
+				{ topic: `haiso:session:${CONNECTION}-different` },
+				{ topic: `unowned haiso:session:${CONNECTION}` },
+				{ topic: `haiso:session:${CONNECTION}\nhaiso:session:${DELIVERY}` },
+			]) {
+				Object.assign(f.channel, override);
+				await expect(f.adapter.retire(CHANNEL, CONNECTION, policy)).rejects.toThrow("Discord retirement");
+				Object.assign(f.channel, original);
+			}
+			f.overwrites.set("outsider", {
+				id: "outsider",
+				type: OverwriteType.Member,
+				allow: new PermissionsBitField(PermissionFlagsBits.ViewChannel),
+				deny: new PermissionsBitField(0n),
+			});
+			await expect(f.adapter.retire(CHANNEL, CONNECTION, policy)).rejects.toThrow("private");
+			f.overwrites.delete("outsider");
+			f.setEffective(READ_WRITE | PermissionFlagsBits.AttachFiles | PermissionFlagsBits.EmbedLinks);
+			await expect(f.adapter.retire(CHANNEL, CONNECTION, policy)).rejects.toThrow("Manage Channels");
+			expect(f.channel.edit).not.toHaveBeenCalled();
+			expect(f.channel.delete).not.toHaveBeenCalled();
+			expect(f.created).toEqual([]);
+		}
+	});
+
+	it("only treats authoritative unknown-channel errors as completed retirement", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		for (const policy of ["retain", "delete"] as const) {
+			for (const error of [{ code: 50001 }, { code: 50013 }, new Error("Authorization: private-token")]) {
+				f.setFetchError(error);
+				await expect(f.adapter.retire(CHANNEL, CONNECTION, policy)).rejects.toThrow("deletion is not confirmed");
+			}
+			f.setFetchError(undefined);
+			await expect(f.adapter.retire("100000000000000099", CONNECTION, policy)).rejects.toThrow("exact bound");
+			f.setFetchError({ code: 10003 });
+			await f.adapter.retire(CHANNEL, CONNECTION, policy);
+		}
+		expect(f.channel.edit).not.toHaveBeenCalled();
+		expect(f.channel.delete).not.toHaveBeenCalled();
+		expect(f.created).toEqual([]);
+	});
+
+	it("deletes only the approved channel and treats subsequent authoritative absence as complete", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		await f.adapter.publish(CHANNEL, "Delete this history", "delete-history");
+		const unrelated = f.makeMessage({ content: "Keep another channel" }, "100000000000000099");
+		f.history.set(unrelated.id, unrelated);
+		await f.adapter.retire(CHANNEL, CONNECTION, "retain");
+		await f.adapter.retire(CHANNEL, CONNECTION, "delete");
+		await f.adapter.retire(CHANNEL, CONNECTION, "delete");
+		expect(await f.adapter.inspect(CHANNEL)).toEqual({ state: "missing" });
+		expect(f.channel.delete).toHaveBeenCalledTimes(1);
+		expect([...f.history.values()]).toEqual([unrelated]);
+		expect(f.created).toEqual([]);
+		expect(f.channel.setParent).not.toHaveBeenCalled();
+	});
+
+	it("confirms response-lost archive and deletion by inspecting the exact channel without replay", async () => {
+		for (const policy of ["retain", "delete"] as const) {
+			const f = fixture();
+			await f.adapter.start(f.handlers);
+			f.setChannelError("after");
+			await f.adapter.retire(CHANNEL, CONNECTION, policy);
+			await f.adapter.retire(CHANNEL, CONNECTION, policy);
+			expect(f.channel.edit).toHaveBeenCalledTimes(policy === "retain" ? 1 : 0);
+			expect(f.channel.delete).toHaveBeenCalledTimes(policy === "delete" ? 1 : 0);
+			expect(await f.adapter.inspect(CHANNEL)).toMatchObject(
+				policy === "retain"
+					? { state: "found", channel: { name: "archived-session", private: true } }
+					: { state: "missing" },
+			);
+			expect(f.created).toEqual([]);
+		}
+	});
+
+	it("leaves unconfirmed mutations pending and redacts SDK errors instead of retrying", async () => {
+		for (const policy of ["retain", "delete"] as const) {
+			const f = fixture();
+			await f.adapter.start(f.handlers);
+			f.setChannelError("before");
+			await expect(f.adapter.retire(CHANNEL, CONNECTION, policy)).rejects.toThrow("outcome is uncertain");
+			expect(f.channel.name).toBe("session");
+			expect(await f.adapter.inspect(CHANNEL)).toMatchObject({ state: "found" });
+			expect(f.channel.edit).toHaveBeenCalledTimes(policy === "retain" ? 1 : 0);
+			expect(f.channel.delete).toHaveBeenCalledTimes(policy === "delete" ? 1 : 0);
+			expect(f.created).toEqual([]);
+		}
+	});
+
+	it("cannot confirm an uncertain retirement through lost access or a rebound ownership marker", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		f.channel.edit.mockImplementationOnce(async () => {
+			f.setFetchError({ code: 50013 });
+			throw new Error("Authorization: private-token");
+		});
+		await expect(f.adapter.retire(CHANNEL, CONNECTION, "retain")).rejects.toThrow("deletion is not confirmed");
+		f.setFetchError(undefined);
+		f.channel.delete.mockImplementationOnce(async () => {
+			f.channel.topic = `haiso:session:${DELIVERY}`;
+			throw new Error("Authorization: private-token");
+		});
+		await expect(f.adapter.retire(CHANNEL, CONNECTION, "delete")).rejects.toThrow("ownership does not match");
+		expect(f.channel.edit).toHaveBeenCalledTimes(1);
+		expect(f.channel.delete).toHaveBeenCalledTimes(1);
+	});
+
+	it("surfaces safe retirement rejections for owner messages, controls, and native dialog answers", async () => {
+		const f = fixture();
+		const rejection = "Conversation permanently deleted; nothing forwarded.";
+		f.handlers.ownerMessage = async () => {
+			throw new DiscordModeError(rejection);
+		};
+		f.handlers.control = async () => {
+			throw new DiscordModeError(rejection);
+		};
+		f.handlers.answer = async () => {
+			throw new DiscordModeError(rejection);
+		};
+		await f.adapter.start(f.handlers);
+		f.client.emit(Events.MessageCreate, f.ownerMessage("Continue"));
+		await settleEvents();
+		expect(f.sent.at(-1)?.content).toBe(rejection);
+		expect(f.sent.at(-1)?.components).toEqual([]);
+		const control = f.slash("stop");
+		f.client.emit(Events.InteractionCreate, control.event);
+		await settleEvents();
+		expect(control.responses).toEqual([rejection]);
+		await f.adapter.showDialog(CHANNEL, { id: "retired-dialog", kind: "confirm", title: "Approve?" });
+		const answer = f.interaction(controlId(f.sent.at(-1)!, "yes"));
+		f.client.emit(Events.InteractionCreate, answer.event);
+		await settleEvents();
+		expect(answer.responses).toEqual([rejection]);
+		expect(f.edited.at(-1)?.components).toEqual([]);
+	});
+
+	it("does not leak untrusted dialog errors when a broker answer fails", async () => {
+		const f = fixture();
+		f.handlers.answer = async () => {
+			throw new Error("Authorization: private-token");
+		};
+		await f.adapter.start(f.handlers);
+		await f.adapter.showDialog(CHANNEL, { id: "failed-dialog", kind: "confirm", title: "Approve?" });
+		const answer = f.interaction(controlId(f.sent.at(-1)!, "yes"));
+		f.client.emit(Events.InteractionCreate, answer.event);
+		await settleEvents();
+		expect(answer.responses[0]).toContain("uncertain");
+		expect(answer.responses[0]).not.toContain("private-token");
+	});
+
 	it("recovers a lost response from the gateway and preserves complete unicode chunks without mention notifications", async () => {
 		const f = fixture();
 		await f.adapter.start(f.handlers);
@@ -947,6 +1169,103 @@ describe("Discord mode gateway adapter (offline)", () => {
 		expect(f.history.get(messageId)?.content).toBe("idle");
 		expect(f.history.get(messageId)?.embeds).toEqual([]);
 		expect(f.sent).toHaveLength(1);
+	});
+
+	it("closes only the exact saved status even when the same key has a different cached card", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const cached = await f.adapter.status(CHANNEL, "Keep cached card", "exact-card", CONNECTION);
+		const saved = f.makeMessage({ content: "Close saved card" });
+		f.history.set(saved.id, saved);
+		expect(await f.adapter.status(CHANNEL, "Permanently deleted", "exact-card", undefined, saved.id, true)).toBe(
+			saved.id,
+		);
+		expect(f.history.get(cached)?.content).toBe("Keep cached card");
+		expect(saved.content).toBe("Permanently deleted");
+		expect(f.edited.at(-1)?.components).toEqual([]);
+		expect(f.sent).toHaveLength(1);
+	});
+
+	it("never replaces or adopts a missing saved status when closing existing-only", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const cached = await f.adapter.status(CHANNEL, "Keep cached card", "missing-card");
+		const marker = `haiso:status:${createHash("sha256").update(`${CHANNEL}:missing-card`).digest("hex")}`;
+		const legacy = f.makeMessage({ content: "Keep legacy card", embeds: [{ footer: { text: marker } }] });
+		f.history.set(legacy.id, legacy);
+		await expect(f.adapter.status(CHANNEL, "Closed", "missing-card", undefined, undefined, true)).rejects.toThrow(
+			"exact saved",
+		);
+		await expect(f.adapter.status(CHANNEL, "Closed", "missing-card", undefined, "999999", true)).rejects.toThrow(
+			"no replacement",
+		);
+		expect(f.history.get(cached)?.content).toBe("Keep cached card");
+		expect(legacy.content).toBe("Keep legacy card");
+		expect(f.edited).toEqual([]);
+		expect(f.sent).toHaveLength(1);
+	});
+
+	it("reconciles an exact saved status after transient inspection and response-lost edit failures", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const savedId = await f.adapter.status(CHANNEL, "Running", "recover-close", CONNECTION);
+		const saved = f.history.get(savedId)!;
+		f.setFetchError(new Error("Authorization: private-token"));
+		await expect(f.adapter.status(CHANNEL, "Closed", "recover-close", undefined, savedId, true)).rejects.toThrow(
+			"no replacement",
+		);
+		f.setFetchError(undefined);
+		const edit = saved.edit.bind(saved);
+		vi.spyOn(saved, "edit").mockImplementationOnce(async options => {
+			await edit(options);
+			throw new Error("Authorization: private-token");
+		});
+		await expect(f.adapter.status(CHANNEL, "Closed", "recover-close", undefined, savedId, true)).rejects.toThrow(
+			"no replacement",
+		);
+		expect(saved.content).toBe("Closed");
+		expect(await f.adapter.status(CHANNEL, "Closed", "recover-close", undefined, savedId, true)).toBe(savedId);
+		expect(f.edited.at(-1)?.components).toEqual([]);
+		expect(f.sent).toHaveLength(1);
+	});
+
+	it("refuses mismatched or unavailable exact status resources without exposing SDK errors or creating cards", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const saved = f.makeMessage({ content: "Keep this card" });
+		f.history.set(saved.id, saved);
+		for (const override of [
+			{ id: "999999" },
+			{ channelId: "other" },
+			{ author: { id: "foreign", bot: true } },
+			{ webhookId: "foreign-webhook" },
+		]) {
+			const original = {
+				id: saved.id,
+				channelId: saved.channelId,
+				author: saved.author,
+				webhookId: saved.webhookId,
+			};
+			Object.assign(saved, override);
+			await expect(
+				f.adapter.status(CHANNEL, "Closed", "refuse-close", undefined, original.id, true),
+			).rejects.toThrow("no replacement");
+			Object.assign(saved, original);
+		}
+		for (const error of [{ code: 10003 }, { code: 50013 }, new Error("Authorization: private-token")]) {
+			f.setFetchError(error);
+			await expect(f.adapter.status(CHANNEL, "Closed", "refuse-close", undefined, saved.id, true)).rejects.toThrow(
+				"no replacement",
+			);
+		}
+		f.setFetchError(undefined);
+		f.overwrites.delete(OWNER);
+		await expect(f.adapter.status(CHANNEL, "Closed", "refuse-close", undefined, saved.id, true)).rejects.toThrow(
+			"no replacement",
+		);
+		expect(saved.content).toBe("Keep this card");
+		expect(f.sent).toEqual([]);
+		expect(f.edited).toEqual([]);
 	});
 
 	it("adopts a legacy footer-owned card once and strips the footer", async () => {

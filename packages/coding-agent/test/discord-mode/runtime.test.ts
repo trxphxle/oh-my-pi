@@ -134,6 +134,10 @@ describe("Discord authenticated Unix transport", () => {
 		expect((await submit({ protocol: DISCORD_MODE_PROTOCOL, request: report }, "wrong")).status).toBe(401);
 		expect((await submit({ protocol: DISCORD_MODE_PROTOCOL + 1, request: report })).status).toBe(400);
 		expect((await submit({ protocol: DISCORD_MODE_PROTOCOL, request: { ...report, text: 99 } })).status).toBe(400);
+		expect(
+			(await submit({ protocol: DISCORD_MODE_PROTOCOL, request: { op: "retire", eventId: "../wrong-event" } }))
+				.status,
+		).toBe(400);
 		const oversized = await submit({
 			protocol: DISCORD_MODE_PROTOCOL,
 			request: { ...report, text: "x".repeat(DISCORD_MODE_MAX_FRAME) },

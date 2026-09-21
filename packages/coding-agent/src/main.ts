@@ -46,6 +46,8 @@ import {
 import { ModelsConfigFile } from "./config/models-config";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
+import { discordDeletionPolicy, getDiscordDeletionChoices } from "./discord-mode/deletion-ui";
+import { deleteSessionWithDiscord, resumeDiscordRetirements } from "./discord-mode/retirement";
 import { initializeWithSettings } from "./discovery";
 import {
 	clearPluginRootsAndCaches,
@@ -139,14 +141,19 @@ async function loadSessionPicker(): Promise<SessionPicker> {
 	]);
 	return (sessions, options) => {
 		const storage = new FileSessionStorage();
-		return selectSession(sessions, options, {
+		return selectSession<SessionInfo>(sessions, options, {
 			loadPinnedIds: loadPinnedSessionIds,
 			loadHistoryMatcher: () => {
 				const history = HistoryStorage.open();
 				return query => history.matchingSessionIds(query);
 			},
-			deleteSession: async session => {
-				await storage.deleteSessionWithArtifacts(session.path);
+			getDeleteChoices: getDiscordDeletionChoices,
+			deleteSession: async (session, choice) => {
+				await deleteSessionWithDiscord(
+					session.path,
+					() => storage.deleteSessionWithArtifacts(session.path),
+					discordDeletionPolicy(choice),
+				);
 				return true;
 			},
 			loadAllSessions: () => SessionManager.listAll(storage),
@@ -1649,6 +1656,9 @@ export async function runRootCommand(
 			process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
 			process.exit(1);
 		}
+		// runCli has resolved the profile; worker dispatch never reaches this path.
+		// Recover only durable, owner-approved deletion work without enrolling this launch.
+		void resumeDiscordRetirements().catch(() => logger.warn("Discord retirement recovery deferred"));
 		const mode = parsedArgs.mode || "text";
 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 		const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;

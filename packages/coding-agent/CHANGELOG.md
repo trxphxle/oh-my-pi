@@ -7,6 +7,7 @@
 - Added opt-in Haiso Discord mode with named project categories and session channels, remote conversation and approvals, local peer messaging, and explicit repair after Discord changes.
 - Added a verified source installer for the independent `haiso` command and runtime.
 - Added Discord `/session status`, `/session stop`, and `/session queue`, with session-card controls and guidance/cancellation actions for waiting messages.
+- Added session-deletion choices to archive the Discord conversation or explicitly delete its channel, with durable offline cleanup and closed-session notices.
 
 ### Changed
 

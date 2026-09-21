@@ -5,6 +5,12 @@ import { canonicalProjectDir } from "../launch/paths";
 import { discordCategoryName, discordChannelName } from "./names";
 import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "./private-files";
 import {
+	discardDiscordDeletionEvent,
+	isDiscordDeletedSessionFile,
+	readDiscordDeletionEvents,
+	withDiscordDeletionLock,
+} from "./retirement-events";
+import {
 	DISCORD_MODE_MAX_FRAME,
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_SESSIONS,
@@ -16,6 +22,7 @@ import {
 	type DiscordPortHandlers,
 	type ModeControlRequest,
 	type ModeControlResult,
+	type ModeDeletionEvent,
 	type ModeDelivery,
 	type ModeDialogAnswer,
 	type ModeEnrollment,
@@ -84,6 +91,7 @@ const RequestShape = type.or(
 		groupName: Label,
 		"+": "reject",
 	},
+	{ op: "'retire'", eventId: Id, "+": "reject" },
 	{ op: "'poll'", lease: LeaseShape, busy: "boolean", pendingInput: "boolean", "+": "reject" },
 	{ op: "'status'", lease: LeaseShape, "+": "reject" },
 	{ op: "'off'", lease: LeaseShape, "+": "reject" },
@@ -130,6 +138,15 @@ const GroupShape = type({
 	overviewUncertain: "boolean",
 	"+": "reject",
 });
+const RetirementShape = type({
+	eventId: Id,
+	policy: "'retain' | 'delete'",
+	deletedAt: Timestamp,
+	state: "'pending' | 'done' | 'attention'",
+	"channelId?": RemoteId,
+	"error?": type("string").atMostLength(500),
+	"+": "reject",
+});
 const SessionShape = type({
 	id: Id,
 	groupId: Id,
@@ -146,6 +163,7 @@ const SessionShape = type({
 	token: Token,
 	seenAt: Timestamp,
 	uncertain: "boolean",
+	"retirement?": RetirementShape,
 	"+": "reject",
 });
 const DeliveryShape = type({
@@ -293,6 +311,7 @@ export class DiscordModeBroker {
 		await this.#persist();
 		this.#running = true;
 		try {
+			await this.#mutate(() => this.#consumeRetirements());
 			await this.#port.start({
 				ownerMessage: input => this.#mutate(() => this.#ownerMessage(input)),
 				control: input => this.#mutate(() => this.#control(input)),
@@ -333,6 +352,7 @@ export class DiscordModeBroker {
 		Id.assert(sessionId);
 		const canonical = await canonicalProjectDir(projectDir);
 		return this.#mutate(async () => {
+			await this.#consumeRetirements();
 			const group = this.#journal.groups.find(item => item.projectDir === canonical);
 			if (!group) return undefined;
 			const session = this.#journal.sessions.find(item => item.id === sessionId && item.groupId === group.id);
@@ -368,6 +388,16 @@ export class DiscordModeBroker {
 		}
 		return this.#mutate(async () => {
 			await this.#expire();
+			await this.#consumeRetirements(parsed.op === "retire" ? parsed.eventId : undefined);
+			if (parsed.op === "retire") {
+				const retired = this.#journal.sessions.find(item => item.retirement?.eventId === parsed.eventId);
+				if (!retired)
+					throw new DiscordModeError("Deletion intent is not committed or does not match an enrolled session.");
+				await this.#reconcileRetirement(retired);
+				await this.#reconcileGroup(this.#group(retired.groupId));
+				await this.#cards(this.#group(retired.groupId));
+				return this.#snapshot(retired);
+			}
 			if (parsed.op === "register") return this.#register(parsed);
 			const session = this.#authorize(parsed.lease);
 			switch (parsed.op) {
@@ -572,6 +602,10 @@ export class DiscordModeBroker {
 			path.basename(input.sessionFile),
 		);
 		let session = this.#journal.sessions.find(item => item.id === input.sessionId);
+		if (session?.retirement)
+			throw new DiscordModeError(
+				"This conversation was permanently deleted; its identity cannot be enrolled again.",
+			);
 		const registration = { ...input, projectDir, sessionFile };
 		const prior = this.#journal.operations[digest(`register:${input.sessionId}:${input.requestId}`)];
 		if (prior) {
@@ -608,7 +642,7 @@ export class DiscordModeBroker {
 			);
 		let peerBytes = Buffer.byteLength(JSON.stringify({ ...input, projectDir, sessionFile })) + 2048;
 		for (const peer of this.#journal.sessions)
-			if (peer.projectDir === projectDir && peer.id !== input.sessionId)
+			if (peer.projectDir === projectDir && peer.id !== input.sessionId && !peer.retirement)
 				peerBytes += Buffer.byteLength(JSON.stringify(publicSession(peer))) + 256;
 		if (peerBytes > DISCORD_MODE_MAX_FRAME / 2)
 			throw new DiscordModeError(
@@ -705,7 +739,10 @@ export class DiscordModeBroker {
 	#requireCategoryCapacity(group: Group, replacingSessionId?: string): void {
 		const retained = this.#journal.sessions.filter(
 			session =>
-				session.groupId === group.id && session.id !== replacingSessionId && session.channelId !== undefined,
+				session.groupId === group.id &&
+				session.id !== replacingSessionId &&
+				session.channelId !== undefined &&
+				!(session.retirement?.policy === "delete" && session.retirement.state === "done"),
 		).length;
 		if (retained >= 49)
 			throw new DiscordModeError(
@@ -750,6 +787,8 @@ export class DiscordModeBroker {
 
 	#authorize(lease: ModeLease): Session {
 		const session = this.#session(lease.sessionId);
+		if (session.retirement)
+			throw new DiscordModeError("This conversation was permanently deleted; its lease is revoked.");
 		if (
 			!session.enabled ||
 			!session.connected ||
@@ -761,6 +800,8 @@ export class DiscordModeBroker {
 	}
 
 	#requireLive(session: Session): void {
+		if (session.retirement)
+			throw new DiscordModeError("This conversation was permanently deleted; delivery is disabled.");
 		if (!session.enabled || !session.connected || Date.now() - session.seenAt >= DISCORD_MODE_LEASE_MS)
 			throw new DiscordModeError("Session is off or its connection lease expired; delivery is disabled.");
 	}
@@ -954,8 +995,10 @@ export class DiscordModeBroker {
 	async #ownerMessage(raw: Parameters<DiscordPortHandlers["ownerMessage"]>[0]): Promise<ModeControlResult> {
 		await this.#expire();
 		if (raw.ownerId !== this.#config.ownerId) return { text: "" };
+		await this.#consumeRetirements();
 		const session = this.#journal.sessions.find(item => item.channelId === raw.channelId);
 		if (!session) return { text: "" };
+		if (session.retirement) return { text: "This conversation was permanently deleted; nothing was forwarded." };
 		let input: typeof OwnerMessageShape.infer;
 		try {
 			input = OwnerMessageShape.assert(raw);
@@ -1037,8 +1080,18 @@ export class DiscordModeBroker {
 		if (input.ownerId !== this.#config.ownerId)
 			throw new DiscordModeError("Only the configured owner can use session controls.");
 		await this.#expire();
+		await this.#consumeRetirements();
 		const session = this.#journal.sessions.find(item => item.channelId === input.channelId);
 		if (!session) throw new DiscordModeError("This channel is not bound to a session.");
+		if (session.retirement) {
+			if (input.action === "status") return { text: this.#sessionStatus(session) };
+			if (input.action === "queue")
+				return {
+					text: "This conversation was permanently deleted. No messages are queued; nothing can be forwarded.",
+					queued: [],
+				};
+			throw new DiscordModeError("This conversation was permanently deleted; old controls are disabled.");
+		}
 		await this.#reconcileSession(session);
 		await this.#expire();
 		await this.#persist();
@@ -1150,8 +1203,11 @@ export class DiscordModeBroker {
 		const input = RemoteAnswerShape.assert(raw);
 		if (input.ownerId !== this.#config.ownerId)
 			throw new DiscordModeError("Only the configured owner can answer native dialogs.");
+		await this.#consumeRetirements();
 		const session = this.#journal.sessions.find(item => item.channelId === input.channelId);
 		if (!session) throw new DiscordModeError("Dialog channel is no longer bound.");
+		if (session.retirement)
+			throw new DiscordModeError("This conversation was permanently deleted; old dialog answers are rejected.");
 		await this.#reconcileSession(session);
 		this.#requireRemote(session);
 		const pending = this.#journal.dialogs.find(
@@ -1261,7 +1317,7 @@ export class DiscordModeBroker {
 			} else {
 				await this.#repairGroup(group, selected);
 				for (const member of this.#journal.sessions)
-					if (member.groupId === group.id) this.#resumeQueue(member, input.resumeQueued);
+					if (member.groupId === group.id && !member.retirement) this.#resumeQueue(member, input.resumeQueued);
 				this.#journal.dialogs = this.#journal.dialogs.filter(
 					item => this.#session(item.sessionId).groupId !== group.id,
 				);
@@ -1293,7 +1349,9 @@ export class DiscordModeBroker {
 		// Only known surviving children move. Never touch unrelated channels or delete history.
 		const childIds = [
 			group.overviewId,
-			...this.#journal.sessions.filter(item => item.groupId === group.id).map(item => item.channelId),
+			...this.#journal.sessions
+				.filter(item => item.groupId === group.id && !item.retirement)
+				.map(item => item.channelId),
 		];
 		for (const childId of childIds)
 			if (childId) {
@@ -1330,7 +1388,7 @@ export class DiscordModeBroker {
 		group.uncertain = false;
 		await this.#reconcileGroup(group);
 		for (const member of this.#journal.sessions)
-			if (member.groupId === group.id) await this.#reconcileSession(member, false);
+			if (member.groupId === group.id && !member.retirement) await this.#reconcileSession(member, false);
 	}
 
 	#resumeQueue(session: Session, resume: boolean): void {
@@ -1386,6 +1444,7 @@ export class DiscordModeBroker {
 	}
 
 	async #reconcileSession(session: Session, includeGroup = true): Promise<void> {
+		if (session.retirement) return;
 		const group = this.#group(session.groupId);
 		if (includeGroup) await this.#reconcileGroup(group);
 		if (!this.#gateway) {
@@ -1412,9 +1471,171 @@ export class DiscordModeBroker {
 				this.#reconcilePending = false;
 			});
 	}
+	/** Adopt every matching local intent before any Discord effect or native routing. */
+	async #consumeRetirements(requestedId?: string): Promise<void> {
+		const root = path.dirname(this.#storePath);
+		return withDiscordDeletionLock(root, () => this.#adoptRetirements(root, requestedId));
+	}
+
+	async #adoptRetirements(root: string, requestedId?: string): Promise<void> {
+		const events = await readDiscordDeletionEvents(root);
+		const adopted: ModeDeletionEvent[] = [];
+		let rejected = false;
+		for (const event of events) {
+			const binding = event.binding;
+			const session = this.#journal.sessions.find(item => item.id === binding.sessionId);
+			const projectDir = await canonicalProjectDir(binding.projectDir);
+			const sessionFile = path.join(
+				await canonicalProjectDir(path.dirname(binding.sessionFile)),
+				path.basename(binding.sessionFile),
+			);
+			if (
+				!session ||
+				binding.guildId !== this.#config.guildId ||
+				binding.ownerId !== this.#config.ownerId ||
+				projectDir !== session.projectDir ||
+				sessionFile !== session.sessionFile ||
+				binding.channelId !== session.channelId ||
+				this.#journal.sessions.some(item => item.id !== session.id && item.retirement?.eventId === event.id)
+			) {
+				if (event.id === requestedId) rejected = true;
+				continue;
+			}
+			if (session.retirement) {
+				const retirement = session.retirement;
+				if (
+					retirement.eventId !== event.id ||
+					retirement.policy !== event.policy ||
+					retirement.deletedAt !== event.createdAt ||
+					retirement.channelId !== binding.channelId
+				) {
+					if (event.id === requestedId) rejected = true;
+					continue;
+				}
+			} else {
+				// A prepared intent is authoritative only after an accessible parent proves
+				// the exact native file absent. No sweep ever manufactures deletion intent.
+				if (event.phase === "prepared" && !(await isDiscordDeletedSessionFile(session.sessionFile))) continue;
+				session.retirement = {
+					eventId: event.id,
+					policy: event.policy,
+					deletedAt: event.createdAt,
+					state: "pending",
+					channelId: binding.channelId,
+				};
+				this.#revoke(session);
+				session.enabled = false;
+				session.busy = false;
+				session.pendingInput = false;
+				this.#journal.deliveries = this.#journal.deliveries.filter(
+					item => item.sessionId !== session.id && !(item.source === "peer" && item.from === session.id),
+				);
+				// Persist before the next fallible event read/check; an unrelated bad
+				// intent must never leave an adopted in-memory fence without durability.
+				await this.#persist();
+			}
+			adopted.push(event);
+		}
+		// The tombstone contains the complete immutable authority after adoption.
+		// Never remove the outbox entry until these routing fences are durable.
+		for (const event of adopted) {
+			try {
+				await discardDiscordDeletionEvent(event, root);
+			} catch {
+				// A replacement or temporarily inaccessible outbox entry remains fenced.
+			}
+		}
+		if (rejected)
+			throw new DiscordModeError("Deletion event conflicts with its exact saved binding or adopted retirement.");
+	}
+
+	async #reconcileRetirement(session: Session): Promise<void> {
+		const retirement = session.retirement!;
+		if (retirement.state === "done") return;
+		const channelId = retirement.channelId;
+		const attention = async (error: string): Promise<void> => {
+			retirement.state = "attention";
+			retirement.error = error;
+			await this.#persist();
+		};
+		if (channelId !== session.channelId) {
+			await attention("Saved retirement target changed; no Discord channel was touched.");
+			return;
+		}
+		if (!channelId) {
+			if (session.uncertain) {
+				await attention(
+					"Prior channel creation is unconfirmed; no exact target is known and no Discord resource was touched.",
+				);
+				return;
+			}
+			retirement.state = "done";
+			delete retirement.error;
+			await this.#persist();
+			return;
+		}
+		if (!this.#gateway) {
+			session.state = "offline";
+			retirement.state = "pending";
+			retirement.error = "Discord is offline; permanent local closure is effective and remote cleanup is pending.";
+			await this.#persist();
+			return;
+		}
+		// Reinspect the immutable target on every recovery attempt. The port additionally
+		// verifies guild and original ownership before any PATCH/DELETE.
+		const inspected = await this.#inspect(channelId);
+		if (inspected.state === "missing") {
+			session.state = "missing";
+			retirement.state = "done";
+			delete retirement.error;
+			await this.#persist();
+			return;
+		}
+		const marker = `haiso:session:${session.id}`;
+		if (
+			inspected.state !== "found" ||
+			inspected.channel.id !== channelId ||
+			!inspected.channel.private ||
+			inspected.channel.kind !== "text" ||
+			(inspected.channel.topic !== marker &&
+				inspected.channel.topic !== `${marker} — Closed: native conversation permanently deleted.`)
+		) {
+			session.state = "inaccessible";
+			await attention("Exact private channel ownership could not be verified; remote cleanup is pending.");
+			return;
+		}
+		session.state = "ready";
+		const card = this.#journal.cards.find(item => item.channelId === channelId);
+		if (retirement.policy === "retain" && card?.messageId)
+			await this.#card(channelId, this.#sessionStatus(session), undefined, true);
+		try {
+			await this.#external(() => this.#port.retire(channelId, session.id, retirement.policy));
+		} catch {
+			await attention(
+				"Discord retirement outcome is unconfirmed; the exact target will be inspected before recovery.",
+			);
+			return;
+		}
+		session.state = retirement.policy === "delete" ? "missing" : "ready";
+		if (retirement.policy === "retain") {
+			if (card?.messageId && card.state === "done") {
+				await this.#card(channelId, this.#sessionStatus(session, true), undefined, true);
+			}
+			if (!card?.messageId || card.state !== "done") {
+				await attention(
+					"Channel archived; final status-card confirmation is pending. Only the saved message may be updated; no replacement notice will be created.",
+				);
+				return;
+			}
+		}
+		retirement.state = "done";
+		delete retirement.error;
+		await this.#persist();
+	}
 
 	async #reconcile(all: boolean): Promise<void> {
 		await this.#expire();
+		await this.#consumeRetirements();
 		const groups = this.#journal.groups;
 		const sessions = this.#journal.sessions;
 		const total = groups.length + sessions.length;
@@ -1428,7 +1649,8 @@ export class DiscordModeBroker {
 				touched.add(group.id);
 			} else {
 				const session = sessions[selected - groups.length]!;
-				await this.#reconcileSession(session);
+				if (session.retirement) await this.#reconcileRetirement(session);
+				else await this.#reconcileSession(session);
 				touched.add(session.groupId);
 			}
 		}
@@ -1437,13 +1659,18 @@ export class DiscordModeBroker {
 	}
 
 	#sessionActivity(session: Session): string {
+		if (session.retirement) return "Permanently deleted";
 		if (!session.enabled) return "Off";
 		if (!session.connected || Date.now() - session.seenAt >= DISCORD_MODE_LEASE_MS) return "Disconnected";
 		if (session.pendingInput) return "Waiting for input";
 		return session.busy ? "Working" : "Idle";
 	}
 
-	#sessionStatus(session: Session): string {
+	#sessionStatus(session: Session, retirementComplete = false): string {
+		if (session.retirement) {
+			const retirement = session.retirement;
+			return `Haiso · ${session.label}\nSession ${session.id}\nConversation permanently deleted. Nothing is forwarded; all controls and pending input are revoked.\nDiscord ${retirement.policy === "retain" ? "history retained" : "history deletion"} · ${retirementComplete ? "done" : retirement.state}${!retirementComplete && retirement.error ? `\n${retirement.error}` : ""}`;
+		}
 		let queued = 0;
 		let active = 0;
 		let uncertain = 0;
@@ -1458,7 +1685,7 @@ export class DiscordModeBroker {
 
 	async #cards(group: Group): Promise<void> {
 		if (!this.#gateway || group.state !== "ready") return;
-		const members = this.#journal.sessions.filter(session => session.groupId === group.id);
+		const members = this.#journal.sessions.filter(session => session.groupId === group.id && !session.retirement);
 		if (group.overviewId)
 			await this.#card(
 				group.overviewId,
@@ -1474,12 +1701,20 @@ export class DiscordModeBroker {
 			}
 	}
 
-	async #card(channelId: string, text: string, connectionId?: string): Promise<void> {
+	async #card(channelId: string, text: string, connectionId?: string, existingOnly = false): Promise<void> {
 		const fingerprint = digest([text, connectionId]);
 		let card = this.#journal.cards.find(item => item.channelId === channelId);
-		if (card && (card.state !== "done" || (card.messageId && card.fingerprint === fingerprint))) return;
+		// Only exact saved-message replacement is retryable. This mode cannot create
+		// a notice when inspection fails or the saved message has disappeared.
+		if (existingOnly && !card?.messageId) return;
+		if (
+			card &&
+			((!existingOnly && card.state !== "done") ||
+				(card.state === "done" && card.messageId && card.fingerprint === fingerprint))
+		)
+			return;
 		if (!card) {
-			// Retired channels retain history, but no longer need a live status-card fence.
+			// Replaced bindings retain history; permanent retirement keeps its card fence.
 			this.#journal.cards = this.#journal.cards.filter(
 				item =>
 					this.#journal.groups.some(group => group.overviewId === item.channelId) ||
@@ -1495,8 +1730,10 @@ export class DiscordModeBroker {
 		const previousMessageId = card.messageId;
 		try {
 			const messageId = await this.#external(() =>
-				this.#port.status(channelId, text, `status:${channelId}`, connectionId, previousMessageId),
+				this.#port.status(channelId, text, `status:${channelId}`, connectionId, previousMessageId, existingOnly),
 			);
+			if (existingOnly && messageId !== previousMessageId)
+				throw new DiscordModeError("Saved status-card identity changed; no replacement was adopted.");
 			card.messageId = RemoteId.assert(messageId);
 			card.state = "done";
 		} catch {
@@ -1510,7 +1747,7 @@ export class DiscordModeBroker {
 			group: publicGroup(this.#group(session.groupId)),
 			session: publicSession(session),
 			peers: this.#journal.sessions
-				.filter(item => item.groupId === session.groupId && item.id !== session.id)
+				.filter(item => item.groupId === session.groupId && item.id !== session.id && !item.retirement)
 				.map(publicSession),
 			...(lease
 				? { lease: { sessionId: session.id, connectionId: session.connectionId, token: session.token } }
@@ -1571,7 +1808,8 @@ export class DiscordModeBroker {
 			!unique(this.#journal.groups.map(item => item.projectDir)) ||
 			!unique(this.#journal.sessions.map(item => item.id)) ||
 			!unique(this.#journal.sessions.map(item => item.sessionFile)) ||
-			!unique(this.#journal.deliveries.map(item => item.id))
+			!unique(this.#journal.deliveries.map(item => item.id)) ||
+			!unique(this.#journal.sessions.flatMap(item => (item.retirement ? [item.retirement.eventId] : [])))
 		)
 			throw new DiscordModeError("Discord journal contains duplicate persistent identities.");
 		const channels = [
@@ -1579,9 +1817,23 @@ export class DiscordModeBroker {
 			...this.#journal.sessions.map(session => session.channelId),
 		].filter((id): id is string => id !== undefined);
 		if (!unique(channels)) throw new DiscordModeError("Discord journal has competing resource bindings.");
-		for (const session of this.#journal.sessions)
+		for (const session of this.#journal.sessions) {
 			if (this.#group(session.groupId).projectDir !== session.projectDir)
 				throw new DiscordModeError("Session project is inconsistent with its canonical group.");
+			if (
+				session.retirement &&
+				(session.retirement.channelId !== session.channelId ||
+					session.enabled ||
+					session.connected ||
+					session.busy ||
+					session.pendingInput ||
+					this.#journal.deliveries.some(
+						item => item.sessionId === session.id || (item.source === "peer" && item.from === session.id),
+					) ||
+					this.#journal.dialogs.some(item => item.sessionId === session.id))
+			)
+				throw new DiscordModeError("Retired session journal contains a changed target or active routing state.");
+		}
 		for (const delivery of this.#journal.deliveries) {
 			const recipient = this.#session(delivery.sessionId);
 			if (delivery.source === "peer" && this.#session(delivery.from).groupId !== recipient.groupId)

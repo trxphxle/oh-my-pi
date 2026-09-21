@@ -123,10 +123,35 @@ disappears. Peer input never grants owner approval.
 | `/discord reconcile` | Inspect an uncertain operation and explicitly clear its fence without replaying it or claiming success. |
 | Session switch/fork/branch/disposal | Revoke the previous connection before identity changes. Re-enroll explicitly; the same saved session can reuse its channel. |
 | Lost/expired broker lease | Inspect status; use `/discord off`, then `/discord on` to establish a fresh connection. Unknown work remains fenced. |
+| Permanent native session deletion | Retire the binding and pending input; retain Discord history by default, or delete the exact bound channel after an explicit local choice. |
 
 Transport reconnects do not replay uncertain prompts, approvals, publications, or
 resource creation. If a creation response is lost, inspect Discord and adopt the
 existing resource explicitly. Never delete private state to force a retry.
+
+### Permanent session deletion
+
+In the terminal, `/session delete`, `/delete`, and session-picker deletion offer
+two choices for an enrolled conversation: **retain Discord history** (the default)
+or **delete the local session and Discord channel**. The latter permanently erases
+the channel's history; Cancel/Escape changes neither side. Headless `/session delete`
+defaults to retaining Discord history.
+
+Retained channels are renamed `archived-…` and show a closed-session notice.
+This is logical archiving, not Discord's thread archive feature: history remains
+readable, but messages and old controls cannot reach an agent. A new message gets
+a clear “conversation permanently deleted; nothing forwarded” response. Retired
+sessions disappear from active discovery and the project overview; their saved
+identities cannot be re-enrolled or silently resurrected.
+
+Deletion intent is stored privately before removing the native file. Offline
+Discord cleanup resumes on broker reconnection or the next normal Haiso launch,
+without enrolling that launch. Closing a terminal, turning Discord off, moving a
+session, or finding a missing file alone never triggers channel deletion. If file
+removal succeeds but artifact cleanup fails, retirement still proceeds and the
+local cleanup error remains visible. Unverifiable channel ownership or an unknown
+new-notice outcome stays marked for attention rather than guessing or duplicating
+effects.
 
 This is same-user remote access, **not a filesystem or hostile-agent sandbox**.
 Channel permissions explicitly allow the bot and owner, but Discord server owners

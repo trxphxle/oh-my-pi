@@ -1,5 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
+import { SessionSelectorComponent, type SessionSelectorOptions } from "@oh-my-pi/pi-tui/overlays/session-selector";
+import { selectSession } from "@oh-my-pi/pi-tui/apps/session-picker";
+import * as standalonePicker from "@oh-my-pi/pi-tui/apps/standalone-picker";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 
@@ -26,13 +28,16 @@ function createSession(id: string, title: string): SessionInfo {
 	};
 }
 
-function createSelector(onDelete: (session: SessionInfo) => Promise<boolean>): SessionSelectorComponent<SessionInfo> {
+function createSelector(
+	onDelete: NonNullable<SessionSelectorOptions<SessionInfo>["onDelete"]>,
+	options: SessionSelectorOptions<SessionInfo> = {},
+): SessionSelectorComponent<SessionInfo> {
 	return new SessionSelectorComponent(
 		[createSession("session-a", "Alpha"), createSession("session-b", "Beta")],
 		() => {},
 		() => {},
 		() => {},
-		{ onDelete },
+		{ ...options, onDelete },
 	);
 }
 
@@ -129,5 +134,121 @@ describe("SessionSelectorComponent delete confirmation", () => {
 		// The query was actually edited: "alpha" lost its trailing "a".
 		expect(afterBackspace).toContain("alph");
 		expect(afterBackspace).not.toContain("alpha");
+	});
+
+	function nextRender(selector: SessionSelectorComponent<SessionInfo>): Promise<void> {
+		const next = Promise.withResolvers<void>();
+		selector.setOnRequestRender(next.resolve);
+		return next.promise;
+	}
+
+	async function inputAndRender(selector: SessionSelectorComponent<SessionInfo>, input: string): Promise<void> {
+		const rendered = nextRender(selector);
+		selector.handleInput(input);
+		await rendered;
+	}
+
+	const choices = [
+		{ value: "retain", label: "Keep external history" },
+		{ value: "delete", label: "Erase external history", description: "Cannot be undone." },
+	];
+
+	it("uses the first custom deletion choice by default and propagates an explicit second choice", async () => {
+		const selected: Array<string | undefined> = [];
+		const selector = createSelector(
+			async (_session, choice) => {
+				selected.push(choice);
+				return true;
+			},
+			{ getDeleteChoices: async () => choices },
+		);
+
+		await inputAndRender(selector, "\x1b[3~");
+		await inputAndRender(selector, "\n");
+		expect(renderText(selector)).not.toContain("Alpha");
+
+		await inputAndRender(selector, "\x1b[3~");
+		selector.handleInput("\x1b[B");
+		await inputAndRender(selector, "\n");
+		expect(selected).toEqual(["retain", "delete"]);
+		expect(renderText(selector)).not.toContain("Beta");
+	});
+
+	it("cancels both the custom dialog and a pending choice lookup without deleting or reopening it", async () => {
+		const onDelete = vi.fn(async () => true);
+		const pending = Promise.withResolvers<typeof choices>();
+		const lookup = vi.fn(() => pending.promise);
+		const selector = createSelector(onDelete, { getDeleteChoices: lookup });
+		selector.handleInput("\x1b[3~");
+		selector.handleInput("\x1b");
+		pending.resolve(choices);
+		await pending.promise;
+		expect(renderText(selector)).not.toContain("Delete session?");
+
+		await inputAndRender(selector, "\x1b[3~");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(onDelete).not.toHaveBeenCalled();
+		expect(renderText(selector)).toContain("Alpha");
+		expect(renderText(selector)).not.toContain("Delete session?");
+	});
+
+	it("fails closed when choices cannot be loaded and suppresses repeated approval during deletion", async () => {
+		const pending = Promise.withResolvers<boolean>();
+		const onDelete = vi.fn(() => pending.promise);
+		const lookup = vi.fn(async () => {
+			throw new Error("binding unavailable");
+		});
+		const selector = createSelector(onDelete, { getDeleteChoices: lookup });
+		await inputAndRender(selector, "\x1b[3~");
+		expect(renderText(selector)).toContain("binding unavailable");
+		selector.handleInput("\n");
+		expect(onDelete).not.toHaveBeenCalled();
+
+		const retry = createSelector(onDelete, { getDeleteChoices: async () => choices });
+		await inputAndRender(retry, "\x1b[3~");
+		const deleted = nextRender(retry);
+		retry.handleInput("\n");
+		retry.handleInput("\n");
+		retry.handleInput("\x1b");
+		expect(onDelete).toHaveBeenCalledTimes(1);
+		pending.resolve(true);
+		await deleted;
+		expect(renderText(retry)).not.toContain("Alpha");
+	});
+
+	it("forwards host choices through the standalone picker before resuming a remaining session", async () => {
+		const created = Promise.withResolvers<SessionSelectorComponent<SessionInfo>>();
+		vi.spyOn(standalonePicker, "runStandaloneTui").mockImplementation(
+			<T>(factory: Parameters<typeof standalonePicker.runStandaloneTui<T>>[0]) => {
+				const result = Promise.withResolvers<T>();
+				const selector = factory({
+					ui: { terminal: { rows: 24 }, requestRender: () => {}, stop: () => {} },
+					finish: result.resolve,
+				} as Parameters<typeof factory>[0]) as SessionSelectorComponent<SessionInfo>;
+				created.resolve(selector);
+				return result.promise;
+			},
+		);
+		const deleted: Array<{ id: string; choice?: string }> = [];
+		const selection = selectSession(
+			[createSession("session-a", "Alpha"), createSession("session-b", "Beta")],
+			{ historySearch: false },
+			{
+				getDeleteChoices: async () => choices,
+				deleteSession: async (session, choice) => {
+					deleted.push({ id: session.id, choice });
+					return true;
+				},
+			},
+		);
+		const selector = await created.promise;
+		await inputAndRender(selector, "\x1b[3~");
+		selector.handleInput("\x1b[B");
+		await inputAndRender(selector, "\n");
+		selector.handleInput("\n");
+		expect((await selection)?.id).toBe("session-b");
+		expect(deleted).toEqual([{ id: "session-a", choice: "delete" }]);
 	});
 });
