@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Welcome screens, terminal titles, setup flows, and notifications now identify this fork as Haiso.
+
 ## [18.2.5] - 2026-09-17
 
 ### Added

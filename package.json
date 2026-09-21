@@ -1,7 +1,7 @@
 {
-	"name": "omp",
+	"name": "haiso",
 	"private": true,
-	"homepage": "https://omp.sh",
+	"homepage": "https://github.com/trxphxle/oh-my-pi",
 	"license": "MIT",
 	"author": "Stencil Labs, Inc.",
 	"workspaces": {
@@ -49,6 +49,7 @@
 			"@typescript/native-preview": "7.0.0-dev.20260707.2",
 			"chart.js": "^4.5.1",
 			"diff": "^9.0.0",
+			"discord.js": "^14.27.0",
 			"fastembed": "2.1.0",
 			"katex": "^0.18.4",
 			"kitty-vt-wasm": "^0.2.0",

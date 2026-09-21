@@ -83,6 +83,7 @@ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { type EditStore, PowerAssertion, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
+import { disposeDiscordModeSession, invalidateDiscordModeSession } from "../discord-mode/session";
 import {
 	$env,
 	escapeXmlText,
@@ -4834,6 +4835,7 @@ export class AgentSession {
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
+		await disposeDiscordModeSession(this);
 		this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
@@ -8307,6 +8309,7 @@ export class AgentSession {
 			}
 		}
 
+		await invalidateDiscordModeSession(this);
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
@@ -8440,6 +8443,7 @@ export class AgentSession {
 			}
 		}
 
+		await invalidateDiscordModeSession(this);
 		await this.#bash.flushPending();
 		// Flush current session to ensure all entries are written
 		await this.sessionManager.flush();
@@ -8501,6 +8505,7 @@ export class AgentSession {
 	/** Move the active session and artifacts after enforcing mode transition invariants. */
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
+		await invalidateDiscordModeSession(this);
 		await this.sessionManager.moveTo(newCwd, targetSessionDir);
 	}
 
@@ -9488,6 +9493,7 @@ export class AgentSession {
 			}
 		}
 
+		await invalidateDiscordModeSession(this);
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
 		await this.#sessionBeforeSwitchReconciler?.();
@@ -9865,6 +9871,7 @@ export class AgentSession {
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
 
+		await invalidateDiscordModeSession(this);
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -9983,6 +9990,7 @@ export class AgentSession {
 			throw new Error("Cannot branch /btw: session changed since /btw started");
 		}
 
+		await invalidateDiscordModeSession(this);
 		await withTimeout(
 			this.#cancelPostPromptTasks(),
 			POST_PROMPT_DRAIN_TIMEOUT_MS,

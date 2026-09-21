@@ -3,6 +3,8 @@ import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
 import type { CollabHost } from "../../collab/host";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
+import { raceDiscordDialog, requestDiscordAsk } from "../../discord-mode/dialog";
+import { getDiscordModeSession } from "../../discord-mode/session";
 import type {
 	CompactOptions,
 	ExtensionActions,
@@ -598,8 +600,21 @@ export class ExtensionUiController {
 			markableCount: dialogOptions?.markableCount,
 			helpText: dialogOptions?.helpText,
 		};
-		return this.#raceCollabDialog(request, dialogOptions?.signal, signal =>
-			this.showHookSelector(title, options, { ...dialogOptions, signal }, extra),
+		if (extra?.slider) {
+			const end = getDiscordModeSession(this.ctx.session)?.beginLocalDialog();
+			try {
+				return await this.#raceCollabOnly(request, dialogOptions?.signal, signal =>
+					this.showHookSelector(title, options, { ...dialogOptions, signal }, extra),
+				);
+			} finally {
+				end?.();
+			}
+		}
+		return this.#raceCollabDialog(
+			request,
+			dialogOptions?.signal,
+			signal => this.showHookSelector(title, options, { ...dialogOptions, signal }, extra),
+			dialogOptions?.disabledIndices,
 		);
 	}
 
@@ -619,11 +634,33 @@ export class ExtensionUiController {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
-		// Normalize the public extension input once for both race participants:
+		// Normalize the public extension input once for all race participants:
 		// malformed entries (missing/non-string fields) coerce to empty
-		// strings/arrays here instead of throwing inside `sanitizeCarriageReturns`
-		// on the guest path or taking down the local render.
+		// strings/arrays before remote projection or local rendering.
 		const normalized = normalizeDialogQuestions(questions);
+		const discord = getDiscordModeSession(this.ctx.session);
+		if (!discord?.enabled) return this.#showCollabAskDialog(normalized, dialogOptions);
+		const end = discord.beginLocalDialog();
+		try {
+			return await raceDiscordDialog(
+				signal =>
+					requestDiscordAsk(
+						normalized,
+						(dialog, remoteSignal) => discord.requestDialog(dialog, remoteSignal),
+						signal,
+					),
+				signal => this.#showCollabAskDialog(normalized, { ...dialogOptions, signal }),
+				dialogOptions?.signal,
+			);
+		} finally {
+			end();
+		}
+	}
+
+	async #showCollabAskDialog(
+		normalized: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined> {
 		const host = this.ctx.collabHost;
 		if (!host) return this.#showLocalAskDialog(normalized, dialogOptions);
 		const localAbort = new AbortController();
@@ -756,6 +793,48 @@ export class ExtensionUiController {
 	 * eventual result is returned.
 	 */
 	async #raceCollabDialog(
+		request: CollabUiRequestDraft,
+		signal: AbortSignal | undefined,
+		local: (signal: AbortSignal | undefined) => Promise<string | undefined>,
+		disabledIndices?: readonly number[],
+	): Promise<string | undefined> {
+		const discord = getDiscordModeSession(this.ctx.session);
+		if (!discord?.enabled) return this.#raceCollabOnly(request, signal, local);
+		const end = discord.beginLocalDialog();
+		const rows =
+			request.kind === "select"
+				? request.options
+						.map((option, index) => ({
+							label: typeof option === "string" ? option : option.label,
+							display: `[${index + 1}] ${request.checkedIndices?.includes(index) ? "(selected) " : ""}${typeof option === "string" ? option : `${option.label}${option.description ? `\n${option.description}` : ""}`}`,
+							disabled: disabledIndices?.includes(index),
+						}))
+						.filter(row => !row.disabled)
+				: [];
+		const labels = rows.map(row => row.label);
+		const options = request.kind === "select" ? rows.map(row => row.display) : undefined;
+		try {
+			return await raceDiscordDialog(
+				async remoteSignal => {
+					const result = await discord.requestDialog(
+						request.kind === "select"
+							? { kind: "select", title: request.title, message: request.helpText, options }
+							: { kind: "editor", title: request.title, prefill: request.prefill },
+						remoteSignal,
+					);
+					if (result.kind === "unavailable") return result;
+					if (typeof result.value !== "string") return { kind: "answered", value: undefined };
+					return { kind: "answered", value: options ? labels[options.indexOf(result.value)] : result.value };
+				},
+				localSignal => this.#raceCollabOnly(request, localSignal, local),
+				signal,
+			);
+		} finally {
+			end();
+		}
+	}
+
+	async #raceCollabOnly(
 		request: CollabUiRequestDraft,
 		signal: AbortSignal | undefined,
 		local: (signal: AbortSignal | undefined) => Promise<string | undefined>,
@@ -1006,14 +1085,56 @@ export class ExtensionUiController {
 	 * Show a confirmation dialog for hooks.
 	 */
 	async showHookConfirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
-		const result = await this.showHookSelector(`${title}\n${message}`, ["Yes", "No"], dialogOptions);
-		return result === "Yes";
+		const local = async (signal: AbortSignal | undefined) => {
+			const result = await this.#raceCollabOnly(
+				{ kind: "select", title: `${title}\n${message}`, options: ["Yes", "No"] },
+				signal,
+				localSignal =>
+					this.showHookSelector(`${title}\n${message}`, ["Yes", "No"], { ...dialogOptions, signal: localSignal }),
+			);
+			return result === "Yes";
+		};
+		const discord = getDiscordModeSession(this.ctx.session);
+		if (!discord?.enabled) return local(dialogOptions?.signal);
+		const end = discord.beginLocalDialog();
+		try {
+			return await raceDiscordDialog(
+				async signal => {
+					const result = await discord.requestDialog({ kind: "confirm", title, message }, signal);
+					return result.kind === "unavailable" ? result : { kind: "answered", value: result.value === true };
+				},
+				local,
+				dialogOptions?.signal,
+			);
+		} finally {
+			end();
+		}
 	}
 
 	/**
 	 * Show a text input for hooks.
 	 */
 	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		const discord = getDiscordModeSession(this.ctx.session);
+		if (!discord?.enabled) return this.#showLocalHookInput(title, placeholder, dialogOptions);
+		const end = discord.beginLocalDialog();
+		return raceDiscordDialog(
+			async signal => {
+				const result = await discord.requestDialog({ kind: "input", title, message: placeholder }, signal);
+				return result.kind === "unavailable"
+					? result
+					: { kind: "answered", value: typeof result.value === "string" ? result.value : undefined };
+			},
+			signal => this.#showLocalHookInput(title, placeholder, { ...dialogOptions, signal }),
+			dialogOptions?.signal,
+		).finally(end);
+	}
+
+	#showLocalHookInput(
 		title: string,
 		placeholder?: string,
 		dialogOptions?: ExtensionUIDialogOptions,

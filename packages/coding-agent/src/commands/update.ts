@@ -2,6 +2,7 @@
  * Check for and install updates.
  */
 
+import { APP_NAME } from "@oh-my-pi/pi-utils";
 import { Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { updateHelp as commandHelp } from "../cli/command-help";
 import * as pluginCli from "../cli/plugin-cli";
@@ -12,19 +13,22 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 export default class Update extends Command {
 	static description = commandHelp.description;
 	static flags = {
-		force: Flags.boolean({ char: "f", description: "Force update", default: false }),
-		check: Flags.boolean({ char: "c", description: "Check for updates without installing", default: false }),
+		force: Flags.boolean({
+			char: "f",
+			description: "Show guidance; automatic application replacement is disabled",
+			default: false,
+		}),
+		check: Flags.boolean({
+			char: "c",
+			description: "Show source update guidance without a remote version check",
+			default: false,
+		}),
 		plugins: Flags.boolean({ char: "l", description: "Update installed plugins", default: false }),
-		canary: Flags.boolean({ description: "Switch to the canary channel and update", default: false }),
-		stable: Flags.boolean({ description: "Switch back to the stable channel", default: false }),
+		canary: Flags.boolean({ description: "Show guidance; upstream channel switching is disabled", default: false }),
+		stable: Flags.boolean({ description: "Show guidance; upstream channel switching is disabled", default: false }),
 	};
 
-	static examples = [
-		"omp update",
-		"omp update --check",
-		"omp update --canary",
-		"# If GitHub rate-limits release metadata, set GITHUB_TOKEN or GH_TOKEN\n  GITHUB_TOKEN=... omp update",
-	];
+	static examples = [`${APP_NAME} update`, `${APP_NAME} update --plugins`];
 
 	async run(): Promise<void> {
 		const { flags } = await this.parse(Update);

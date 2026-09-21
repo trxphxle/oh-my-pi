@@ -34,11 +34,13 @@ import {
 	BLOB_BROKER_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
 	DAEMON_BROKER_WORKER_ARG,
+	DISCORD_MODE_WORKER_ARG,
 	LSP_MUX_WORKER_ARG,
 	STATS_ACTIVITY_WORKER_ARG,
 	TERMINAL_OUTPUT_WORKER_ARG,
 } from "./cli/worker-selectors";
 import type * as JsProcessEntry from "./eval/js/process-entry";
+import type * as DiscordWorker from "./discord-mode/worker";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -170,6 +172,8 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestLspMux();
 	await smokeTestBlobBroker();
 	await smokeTestTerminalOutputWorker();
+	const { smokeTestDiscordModeWorker }: typeof DiscordWorker = require("./discord-mode/worker");
+	await smokeTestDiscordModeWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -183,6 +187,11 @@ const TTS_WORKER_ARG = "__omp_worker_tts";
 const MNEMOPI_EMBED_WORKER_ARG = "__omp_worker_mnemopi_embed";
 
 async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
+	if (arg === DISCORD_MODE_WORKER_ARG) {
+		const { startDiscordModeWorker }: typeof DiscordWorker = require("./discord-mode/worker");
+		await startDiscordModeWorker();
+		return true;
+	}
 	if (arg === TINY_WORKER_ARG) {
 		await runTinyWorker();
 		return true;

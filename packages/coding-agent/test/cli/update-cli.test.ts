@@ -2,28 +2,28 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
 
 type FetchInput = string | URL | Request;
-type FetchInit = RequestInit | BunFetchRequestInit;
 
-describe("runUpdateCommand fetch cancellation", () => {
+describe("source-checkout update protection", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
 
-	it("checks release metadata with a timeout signal", async () => {
-		let requestSignal: AbortSignal | undefined;
+	it("never fetches an official release, including forced channel updates", async () => {
 		vi.spyOn(console, "log").mockImplementation(() => {});
 		const fetchStub = Object.assign(
-			async (_input: FetchInput, init?: FetchInit) => {
-				requestSignal = init?.signal ?? undefined;
-				return Response.json({ version: "999.0.0" });
+			async () => {
+				throw new Error("Application updates must not reach the network");
 			},
 			{ preconnect: globalThis.fetch.preconnect },
 		);
-		vi.spyOn(globalThis, "fetch").mockImplementation(fetchStub);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchStub);
 
+		await runUpdateCommand({ force: false, check: false });
 		await runUpdateCommand({ force: false, check: true });
+		await runUpdateCommand({ force: true, check: false, channel: "canary" });
+		await runUpdateCommand({ force: true, check: false, channel: "stable" });
 
-		expect(requestSignal).toBeInstanceOf(AbortSignal);
+		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 });
 

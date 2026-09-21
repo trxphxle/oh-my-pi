@@ -22,11 +22,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $which } from "@oh-my-pi/pi-utils";
+import { $which, APP_DISPLAY_NAME } from "@oh-my-pi/pi-utils";
 import type { TerminalId, TerminalNotification } from "./terminal-capabilities";
-
-/** Application name surfaced as the notification source. */
-const APP_NAME = "Oh My Pi";
 
 /** Resolved notifier binary used to fan a notification out to D-Bus. */
 export type DesktopNotifierKind = "notify-send" | "gdbus";
@@ -111,9 +108,9 @@ interface ResolvedNotificationFields {
 
 function resolveFields(message: string | TerminalNotification): ResolvedNotificationFields {
 	if (typeof message === "string") {
-		return { title: APP_NAME, body: message, urgency: "normal" };
+		return { title: APP_DISPLAY_NAME, body: message, urgency: "normal" };
 	}
-	const title = message.title?.trim() || APP_NAME;
+	const title = message.title?.trim() || APP_DISPLAY_NAME;
 	const body = message.body ?? "";
 	const urgency = message.urgency === "critical" || message.urgency === "low" ? message.urgency : "normal";
 	return { title, body, urgency };
@@ -138,7 +135,7 @@ const URGENCY_BYTE: Record<ResolvedNotificationFields["urgency"], number> = {
 export function buildDesktopNotifyCommand(notifier: DesktopNotifier, message: string | TerminalNotification): string[] {
 	const { title, body, urgency } = resolveFields(message);
 	if (notifier.kind === "notify-send") {
-		return [notifier.path, "--app-name", APP_NAME, `--urgency=${urgency}`, "--expire-time=5000", title, body];
+		return [notifier.path, "--app-name", APP_DISPLAY_NAME, `--urgency=${urgency}`, "--expire-time=5000", title, body];
 	}
 	const hints = `{"urgency": <byte ${URGENCY_BYTE[urgency]}>}`;
 	return [
@@ -151,7 +148,7 @@ export function buildDesktopNotifyCommand(notifier: DesktopNotifier, message: st
 		"/org/freedesktop/Notifications",
 		"--method",
 		"org.freedesktop.Notifications.Notify",
-		APP_NAME,
+		APP_DISPLAY_NAME,
 		"0",
 		"",
 		title,

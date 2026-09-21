@@ -10,7 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { $env, $which, APP_NAME, compareVersions, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
+import { $env, $which, APP_DISPLAY_NAME, APP_NAME, compareVersions, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
@@ -2065,6 +2065,23 @@ export async function runUpdateCommand(opts: {
 	check: boolean;
 	channel?: UpdateChannel;
 }): Promise<void> {
+	// Haiso is maintained from its source checkout. Never route its launcher
+	// through OMP's official registry, installer, or package-manager takeover.
+	if (APP_NAME !== "omp") {
+		console.log(`${APP_NAME}/${VERSION}`);
+		console.log(`${APP_DISPLAY_NAME} is a source-checkout fork; automatic application updates are disabled.`);
+		console.log("No application update was checked or installed.");
+		console.log("");
+		console.log(`To update, open the ${APP_DISPLAY_NAME} source checkout and preserve your local changes first.`);
+		console.log("Fetch and review upstream OMP changes, then merge or rebase them manually,");
+		console.log(`resolve conflicts while retaining ${APP_DISPLAY_NAME} changes, install checkout dependencies,`);
+		console.log(
+			`and verify the checkout before restarting ${APP_DISPLAY_NAME}. Rebuild native dependencies if needed.`,
+		);
+		console.log("Do not run the official OMP installer or a global npm/bun update for this fork.");
+		console.log(`Plugin updates remain available with: ${APP_NAME} update --plugins`);
+		return;
+	}
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 	const persistedChannel = readPersistedChannel() ?? "stable";
 	const channel = opts.channel ?? persistedChannel;
@@ -2175,23 +2192,20 @@ export async function runUpdateCommand(opts: {
  * Print update command help.
  */
 export function printUpdateHelp(): void {
-	console.log(`${chalk.bold(`${APP_NAME} update`)} - Check for and install updates
+	console.log(`${chalk.bold(`${APP_NAME} update`)} - Source-checkout update guidance
 
 ${chalk.bold("Usage:")}
   ${APP_NAME} update [options]
 
 ${chalk.bold("Options:")}
-  -c, --check     Check for updates without installing
-  -f, --force     Force reinstall even if up to date
-  -l, --plugins   Update installed plugins
-  --canary        Switch to the canary channel and update
-  --stable        Switch back to the stable channel
+  -l, --plugins   Update installed plugins (does not update ${APP_DISPLAY_NAME})
+  -c, --check     Show manual source update guidance; no remote version check
+  -f, --force     Show guidance; automatic application replacement is disabled
+  --canary        Show guidance; upstream channel switching is disabled
+  --stable        Show guidance; upstream channel switching is disabled
 
 ${chalk.bold("Examples:")}
-  ${APP_NAME} update              Update to latest version
-  ${APP_NAME} update --check      Check if updates are available
-  ${APP_NAME} update --force      Force reinstall
-  ${APP_NAME} update -l           Update installed plugins
-  ${APP_NAME} update --canary    Switch to the canary channel and update
+  ${APP_NAME} update              Show manual source-checkout update guidance
+  ${APP_NAME} update --plugins    Update installed plugins only
 `);
 }

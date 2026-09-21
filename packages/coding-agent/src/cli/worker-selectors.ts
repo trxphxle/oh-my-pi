@@ -7,6 +7,8 @@
  */
 /** Blob-broker selector shared by the CLI dispatcher and worker launcher. */
 export const BLOB_BROKER_WORKER_ARG = "__omp_worker_blob_broker";
+/** Discord-mode selector shared by the CLI dispatcher and worker launcher. */
+export const DISCORD_MODE_WORKER_ARG = "__omp_worker_discord_mode";
 /** Computer-worker selector shared by the CLI dispatcher and worker launcher. */
 export const COMPUTER_WORKER_ARG = "__omp_worker_computer";
 /** Daemon-broker selector shared by the CLI dispatcher and worker launcher. */

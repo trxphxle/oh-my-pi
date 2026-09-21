@@ -117,11 +117,5 @@ describe("lazy status color re-resolves on theme switch", () => {
 		const lightOutput = notification.render(100).join("\n");
 		for (const prefix of Object.values(lightPrefixes)) expect(lightOutput).toContain(prefix);
 		for (const prefix of Object.values(darkPrefixes)) expect(lightOutput).not.toContain(prefix);
-
-		const semanticLines = Bun.stripANSI(lightOutput)
-			.split("\n")
-			.map(line => line.trim())
-			.filter(line => line === "Update Available" || line.startsWith("New version "));
-		expect(semanticLines).toEqual(["Update Available", "New version 1.2.3 is available. Run: omp update"]);
 	});
 });

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Haiso identifies itself separately while preserving existing `.omp` configuration, XDG storage, logs, and provider compatibility.
+
 ## [18.2.5] - 2026-09-17
 
 ### Added
