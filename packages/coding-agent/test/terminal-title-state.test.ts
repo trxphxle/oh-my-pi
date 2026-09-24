@@ -8,11 +8,13 @@ import {
 	setTerminalTitleSpinnerStyle,
 	setTerminalTitleState,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
-import { APP_DISPLAY_NAME, setTerminalHeadless } from "@oh-my-pi/pi-utils";
+import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
 import { mockWindowsConsoleTitle, type WindowsConsoleTitleMock } from "./terminal-title-test-utils";
 
 const LABEL = "my-project";
-const BRAND = APP_DISPLAY_NAME;
+// The brand the title runtime prefixes every composed title with. Plain π —
+// window titles render in the OS UI font, so nerd-font glyphs are unusable here.
+const BRAND = "π";
 
 describe("buildTerminalTitleWithState", () => {
 	it("separates brand and label with '>' when idle/done (your turn)", () => {
@@ -26,7 +28,7 @@ describe("buildTerminalTitleWithState", () => {
 	it("animates spinner frames in the separator slot while working outside Windows", () => {
 		const frame0 = buildTerminalTitleWithState(LABEL, "working", 0, true, "linux", "braille", {});
 		const frame1 = buildTerminalTitleWithState(LABEL, "working", 1, true, "linux", "braille", {});
-		// The brand stays unchanged; only the separator between brand and label
+		// The brand stays a bare `π`; only the separator between brand and label
 		// carries the spinner glyph, and it advances per frame.
 		expect(frame0).toBe(`${BRAND} ⠋ ${LABEL}`);
 		expect(frame1).toBe(`${BRAND} ⠙ ${LABEL}`);
@@ -290,7 +292,7 @@ describe("disposeTerminalTitleState", () => {
 		expect(titles.length).toBeGreaterThan(0);
 		for (const title of titles) {
 			expect(title).toContain("my-project");
-			expect(title).toMatch(/ [-\\|/] my-project$/);
+			expect(title).toMatch(/^π [-\\|/] my-project$/);
 			expect(title).not.toContain("⠋");
 		}
 	});
@@ -319,7 +321,7 @@ describe("disposeTerminalTitleState", () => {
 		expect(titles.length).toBeGreaterThan(0);
 		for (const title of titles) {
 			expect(title).toContain("my-project");
-			expect(title).toMatch(/ [○◔◑◕●] my-project$/);
+			expect(title).toMatch(/^π [○◔◑◕●] my-project$/);
 		}
 	});
 

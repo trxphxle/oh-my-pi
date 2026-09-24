@@ -78,7 +78,7 @@
       "name": "@oh-my-pi/pi-coding-agent",
       "version": "18.3.0",
       "bin": {
-        "haiso": "src/cli.ts",
+        "omp": "src/cli.ts",
       },
       "dependencies": {
         "@babel/parser": "catalog:",

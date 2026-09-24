@@ -1,29 +1,37 @@
+/**
+ * Immutable compiled Haiso releases: freeze a built binary plus its standalone Bun runtime into a
+ * sealed, read-only release directory, then publish it by atomically swapping the prefix symlink.
+ */
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as ptree from "@oh-my-pi/pi-utils/ptree";
 import * as logger from "@oh-my-pi/pi-utils/logger";
-import { quotePosixPath } from "../ssh/utils";
+import * as ptree from "@oh-my-pi/pi-utils/ptree";
 
 const OWNER = "haiso-release-installer";
 const LEGACY_OWNER = "haiso-source-installer";
 const DIGEST = /^[a-f0-9]{64}$/;
+const COMMIT = /^[a-f0-9]{40}$/;
 const TAG = /^v?(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)$/;
+const SEMVER = /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/;
+
+/** The updater the launcher routes `haiso update` to, relative to the source repository. */
+export const UPDATER_ENTRY = "scripts/haiso/update.ts";
 
 export interface InstallOptions {
 	binary: string;
 	runtime: string;
-	forkPatch: string;
 	upstream: { tag: string; commit: string };
-	compatibility: { state: string; broker: string };
+	/** Repository root, the built commit and the `haiso` branch tip it was built from. */
+	source: { repo: string; commit: string; haisoCommit: string };
 	prefix?: string;
 	binDir?: string;
+	stateDir?: string;
 	replaceLegacy?: boolean;
 }
 
-export interface InstallReceipt {
-	schemaVersion: 2;
+interface ReceiptCommon {
 	owner: typeof OWNER;
 	id: string;
 	installedAt: string;
@@ -33,14 +41,42 @@ export interface InstallReceipt {
 	release: string;
 	executable: string;
 	executableSha256: string;
-	forkPatch: string;
-	forkPatchSha256: string;
 	upstream: { tag: string; commit: string };
-	compatibility: { state: string; broker: string };
 	runtime: { suppliedPath: string; installedPath: string; version: string; sha256: string };
 	previousRelease: string | null;
 	/** Compare-and-switch baseline; a legacy baseline is never a rollback target. */
 	activationBaseline: string | null;
+}
+
+/** A release built from the `haiso` git branch. */
+export interface ReleaseReceipt extends ReceiptCommon {
+	schemaVersion: 3;
+	source: InstallOptions["source"];
+	stateDir: string;
+}
+
+/** A release rebuilt from a frozen fork.patch; still readable and a rollback target, never produced again. */
+export interface LegacyReleaseReceipt extends ReceiptCommon {
+	schemaVersion: 2;
+	source?: undefined;
+	forkPatch: string;
+	forkPatchSha256: string;
+	compatibility: { state: string; broker: string };
+}
+
+export type InstallReceipt = ReleaseReceipt | LegacyReleaseReceipt;
+
+export function defaultPrefix(): string {
+	return path.join(os.homedir(), ".local/share/haiso/fork");
+}
+
+export function defaultStateDir(prefix: string): string {
+	return path.join(path.dirname(prefix), `${path.basename(prefix)}-update`);
+}
+
+/** POSIX single-quote a value for `sh`. */
+export function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 function requirePlatform(): void {
@@ -60,7 +96,7 @@ function assertOwner(file: string, info: fs.Stats): void {
 	if (info.uid !== process.getuid?.()) throw new Error(`Refusing path not owned by this user: ${file}`);
 }
 
-// Preserve the source installer's ancestor checks, including macOS's root-owned /var and /tmp aliases.
+// Walk every ancestor, tolerating only macOS's root-owned /var and /tmp aliases as symlinks.
 async function safeDirectory(directory: string, create: boolean): Promise<string> {
 	const parent = path.dirname(directory);
 	if (parent === directory) return directory;
@@ -103,10 +139,13 @@ async function canonicalPrefix(requested: string, create: boolean): Promise<stri
 	return path.join(await ownedParent(path.dirname(resolved), create), path.basename(resolved));
 }
 
+function isNormalAbsolute(value: unknown): value is string {
+	return typeof value === "string" && path.isAbsolute(value) && path.normalize(value) === value;
+}
+
 function isReleasePath(release: string, prefix: string): boolean {
 	return (
-		path.isAbsolute(release) &&
-		path.normalize(release) === release &&
+		isNormalAbsolute(release) &&
 		path.dirname(release) === path.dirname(prefix) &&
 		path.basename(release).startsWith(`.${path.basename(prefix)}-release-`) &&
 		path.basename(release).length > `.${path.basename(prefix)}-release-`.length
@@ -122,7 +161,7 @@ function checkLayout(prefix: string, launcher: string, release?: string): void {
 		binDir.startsWith(`${prefix}${path.sep}`) ||
 		(release && (binDir === release || binDir.startsWith(`${release}${path.sep}`)))
 	) {
-		throw new Error("--bin-dir must be outside --prefix and every release directory.");
+		throw new Error("The launcher directory must be outside the prefix and every release directory.");
 	}
 }
 
@@ -164,18 +203,58 @@ async function fileHash(file: string): Promise<string> {
 	}
 }
 
-function launcherText(executable: string, prefix: string): string {
-	return `#!/bin/sh\nunset BUN_BE_BUN PI_COMPILED\nHAISO_PREFIX=${quotePosixPath(prefix)}\nexport HAISO_PREFIX\nexec ${quotePosixPath(executable)} "$@"\n`;
+interface LauncherInputs {
+	prefix: string;
+	runtime: string;
+	repo: string;
+	stateDir: string;
+	executable: string;
 }
 
-function validatePins(upstream: InstallOptions["upstream"], compatibility: InstallOptions["compatibility"]): string {
-	const version = TAG.exec(upstream?.tag)?.[1];
-	if (!version || !/^[a-f0-9]{40}$/.test(upstream?.commit))
+/**
+ * `haiso update …` runs the repository updater on the release's own runtime (plugin updates stay
+ * in the binary); other launches schedule at most one daily background check and print any held-update
+ * notice before replacing the shell with the frozen executable.
+ */
+function launcherText(inputs: LauncherInputs): string {
+	return `#!/bin/sh
+unset BUN_BE_BUN PI_COMPILED
+HAISO_PREFIX=${shellQuote(inputs.prefix)}
+export HAISO_PREFIX
+runtime=${shellQuote(inputs.runtime)}
+updater=${shellQuote(path.join(inputs.repo, UPDATER_ENTRY))}
+state=${shellQuote(inputs.stateDir)}
+if [ "$1" = update ]; then
+	case " $* " in
+	*" --plugins "* | *" -l "*) ;;
+	*)
+		shift
+		[ -f "$updater" ] || { echo "haiso: updater not found: $updater" >&2; exit 1; }
+		exec "$runtime" "$updater" "$@"
+		;;
+	esac
+fi
+if [ -z "$HAISO_UPDATE_DISABLED" ] && [ -f "$updater" ] && grep -q '"enabled": *true' "$state/settings.json" 2>/dev/null && [ -z "$(find "$state/last-check" -mmin -1440 2>/dev/null)" ]; then
+	: >"$state/last-check" 2>/dev/null && { nohup "$runtime" "$updater" --background >/dev/null 2>&1 & }
+fi
+[ -f "$state/notice" ] && cat "$state/notice" >&2
+exec ${shellQuote(inputs.executable)} "$@"
+`;
+}
+
+function legacyLauncherText(executable: string, prefix: string): string {
+	return `#!/bin/sh\nunset BUN_BE_BUN PI_COMPILED\nHAISO_PREFIX=${shellQuote(prefix)}\nexport HAISO_PREFIX\nexec ${shellQuote(executable)} "$@"\n`;
+}
+
+function validatePins(upstream: InstallOptions["upstream"] | undefined): string {
+	const version = TAG.exec(upstream?.tag ?? "")?.[1];
+	if (!version || !COMMIT.test(upstream?.commit ?? ""))
 		throw new Error("Pinned upstream tag and full commit are required.");
-	if (!DIGEST.test(compatibility?.state) || !DIGEST.test(compatibility?.broker)) {
-		throw new Error("State and broker compatibility fingerprints must be SHA-256 digests.");
-	}
 	return `haiso/${version}`;
+}
+
+function validSource(source: InstallOptions["source"] | undefined): boolean {
+	return !!source && isNormalAbsolute(source.repo) && COMMIT.test(source.commit) && COMMIT.test(source.haisoCommit);
 }
 
 async function readReceiptFile(release: string): Promise<unknown> {
@@ -190,8 +269,7 @@ async function readReceiptFile(release: string): Promise<unknown> {
 /** Validate the retained bytes, ownership, layout and receipt before trusting any metadata. */
 export async function readHaisoRelease(release: string): Promise<InstallReceipt> {
 	requirePlatform();
-	if (!path.isAbsolute(release) || path.normalize(release) !== release)
-		throw new Error(`Unsafe release path: ${release}`);
+	if (!isNormalAbsolute(release)) throw new Error(`Unsafe release path: ${release}`);
 	const parent = await ownedParent(path.dirname(release), false);
 	if (parent !== path.dirname(release)) throw new Error(`Non-canonical release path: ${release}`);
 	const info = await fs.promises.lstat(release);
@@ -199,8 +277,9 @@ export async function readHaisoRelease(release: string): Promise<InstallReceipt>
 	if (!info.isDirectory() || (info.mode & 0o222) !== 0)
 		throw new Error(`Unsafe or mutable release directory: ${release}`);
 	const value = await readReceiptFile(release);
-	if (typeof value !== "object" || value === null || !("schemaVersion" in value) || value.schemaVersion !== 2) {
-		throw new Error("Mutable v1 installations are not eligible for activation or rollback; use --replace-legacy.");
+	const schemaVersion = typeof value === "object" && value !== null && "schemaVersion" in value && value.schemaVersion;
+	if (schemaVersion !== 2 && schemaVersion !== 3) {
+		throw new Error("Mutable v1 installations are not eligible for activation or rollback.");
 	}
 	const receipt = value as InstallReceipt;
 	const receiptPath = path.join(release, "receipt.json");
@@ -212,36 +291,33 @@ export async function readHaisoRelease(release: string): Promise<InstallReceipt>
 		throw new Error(`Tampered install receipt: ${receiptPath}`);
 	if (
 		receipt.owner !== OWNER ||
-		typeof receipt.prefix !== "string" ||
-		!path.isAbsolute(receipt.prefix) ||
-		path.normalize(receipt.prefix) !== receipt.prefix ||
+		!isNormalAbsolute(receipt.prefix) ||
 		receipt.release !== release ||
 		!isReleasePath(release, receipt.prefix) ||
 		receipt.id !== path.basename(release) ||
 		typeof receipt.installedAt !== "string" ||
 		!Number.isFinite(Date.parse(receipt.installedAt)) ||
-		typeof receipt.launcher !== "string" ||
-		!path.isAbsolute(receipt.launcher) ||
-		path.normalize(receipt.launcher) !== receipt.launcher ||
+		!isNormalAbsolute(receipt.launcher) ||
 		receipt.executable !== path.join(release, "bin/haiso") ||
-		receipt.forkPatch !== path.join(release, "fork.patch") ||
 		receipt.runtime?.installedPath !== path.join(release, "runtime/bun") ||
-		typeof receipt.runtime.suppliedPath !== "string" ||
-		!path.isAbsolute(receipt.runtime.suppliedPath) ||
-		!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(receipt.runtime.version) ||
-		![receipt.executableSha256, receipt.forkPatchSha256, receipt.runtime.sha256].every(hash => DIGEST.test(hash)) ||
+		!isNormalAbsolute(receipt.runtime.suppliedPath) ||
+		!SEMVER.test(receipt.runtime.version) ||
+		!DIGEST.test(receipt.executableSha256) ||
+		!DIGEST.test(receipt.runtime.sha256) ||
+		(receipt.schemaVersion === 3
+			? !validSource(receipt.source) || !isNormalAbsolute(receipt.stateDir)
+			: receipt.forkPatch !== path.join(release, "fork.patch") ||
+				!DIGEST.test(receipt.forkPatchSha256) ||
+				!DIGEST.test(receipt.compatibility?.state) ||
+				!DIGEST.test(receipt.compatibility?.broker)) ||
 		(receipt.previousRelease !== null &&
-			(typeof receipt.previousRelease !== "string" ||
-				!isReleasePath(receipt.previousRelease, receipt.prefix) ||
-				receipt.previousRelease === release)) ||
+			(!isReleasePath(receipt.previousRelease, receipt.prefix) || receipt.previousRelease === release)) ||
 		(receipt.activationBaseline !== null &&
-			(typeof receipt.activationBaseline !== "string" ||
-				!isReleasePath(receipt.activationBaseline, receipt.prefix) ||
-				receipt.activationBaseline === release))
+			(!isReleasePath(receipt.activationBaseline, receipt.prefix) || receipt.activationBaseline === release))
 	) {
 		throw new Error(`Invalid release ownership receipt: ${receiptPath}`);
 	}
-	if (receipt.version !== validatePins(receipt.upstream, receipt.compatibility))
+	if (receipt.version !== validatePins(receipt.upstream))
 		throw new Error(`Release version does not match pinned upstream: ${release}`);
 	checkLayout(receipt.prefix, receipt.launcher, release);
 	for (const directory of [path.join(release, "bin"), path.join(release, "runtime")]) {
@@ -250,17 +326,28 @@ export async function readHaisoRelease(release: string): Promise<InstallReceipt>
 		if (!directoryInfo.isDirectory() || (directoryInfo.mode & 0o222) !== 0)
 			throw new Error(`Unsafe release directory: ${directory}`);
 	}
-	for (const [file, expected, executable] of [
+	const frozen: [string, string, boolean][] = [
 		[receipt.executable, receipt.executableSha256, true],
-		[receipt.forkPatch, receipt.forkPatchSha256, false],
 		[receipt.runtime.installedPath, receipt.runtime.sha256, true],
-	] as const) {
+	];
+	if (receipt.schemaVersion === 2) frozen.push([receipt.forkPatch, receipt.forkPatchSha256, false]);
+	for (const [file, expected, executable] of frozen) {
 		await ownedFile(file, executable);
 		if ((await fileHash(file)) !== expected) throw new Error(`Release hash mismatch: ${file}`);
 	}
 	const wrapper = path.join(release, "bin/launch");
 	await ownedFile(wrapper, true);
-	if ((await fs.promises.readFile(wrapper, "utf8")) !== launcherText(receipt.executable, receipt.prefix))
+	const expectedLauncher =
+		receipt.schemaVersion === 3
+			? launcherText({
+					prefix: receipt.prefix,
+					runtime: receipt.runtime.installedPath,
+					repo: receipt.source.repo,
+					stateDir: receipt.stateDir,
+					executable: receipt.executable,
+				})
+			: legacyLauncherText(receipt.executable, receipt.prefix);
+	if ((await fs.promises.readFile(wrapper, "utf8")) !== expectedLauncher)
 		throw new Error(`Tampered release launcher: ${wrapper}`);
 	return receipt;
 }
@@ -294,8 +381,7 @@ async function activeRelease(prefix: string, allowLegacy: boolean): Promise<Acti
 		) {
 			throw new Error(`Install root has no matching ownership receipt: ${prefix}`);
 		}
-		if (!allowLegacy)
-			throw new Error("Mutable v1 installation requires --replace-legacy and is not rollback-eligible.");
+		if (!allowLegacy) throw new Error("Mutable v1 installation requires replaceLegacy and is not rollback-eligible.");
 		return { target, receipt: null };
 	}
 	const receipt = await readHaisoRelease(target);
@@ -303,9 +389,7 @@ async function activeRelease(prefix: string, allowLegacy: boolean): Promise<Acti
 	return { target, receipt };
 }
 
-export async function currentHaisoRelease(
-	prefix = path.join(os.homedir(), ".local/share/haiso/fork"),
-): Promise<InstallReceipt | null> {
+export async function currentHaisoRelease(prefix = defaultPrefix()): Promise<InstallReceipt | null> {
 	requirePlatform();
 	// A clean machine need not have the install parent yet; do not create it for status.
 	const requested = path.resolve(prefix);
@@ -320,9 +404,7 @@ async function launcherState(launcher: string, prefix: string, replaceLegacy: bo
 	if (!info.isFile() && !info.isSymbolicLink()) throw new Error(`Refusing non-file launcher: ${launcher}`);
 	if (info.isSymbolicLink() && (await fs.promises.readlink(launcher)) === path.join(prefix, "bin/launch")) return true;
 	if (!replaceLegacy)
-		throw new Error(
-			`${launcher} already exists. Use --replace-legacy to authorize replacing this unmanaged launcher.`,
-		);
+		throw new Error(`${launcher} already exists and is not managed; replaceLegacy must authorize replacing it.`);
 	return false;
 }
 
@@ -370,7 +452,6 @@ async function withProbeHome<T>(operation: (home: string, env: NodeJS.ProcessEnv
 			PI_CODING_AGENT_DIR: path.join(home, "agent"),
 			OMP_AGENT_DIR: path.join(home, "agent"),
 			HAISO_UPDATE_DISABLED: "1",
-			HAISO_DISABLE_UPDATES: "1",
 			NO_COLOR: "1",
 			TERM: "dumb",
 		};
@@ -403,6 +484,16 @@ async function probe(command: string[], cwd: string, env: NodeJS.ProcessEnv, tim
 	return stdout.trim();
 }
 
+/** Both the version and the isolated worker smoke must pass before a launcher is trusted. */
+async function probeLauncher(launcher: string, expectedVersion: string, home: string, env: NodeJS.ProcessEnv) {
+	const version = await probe([launcher, "--version"], home, env);
+	if (version !== expectedVersion)
+		throw new Error(`Compiled Haiso validation expected ${expectedVersion}, got ${JSON.stringify(version)}.`);
+	const smoke = await probe([launcher, "--smoke-test"], home, env, 120_000);
+	if (!smoke.includes("smoke-test: ok"))
+		throw new Error(`Compiled Haiso smoke test did not report success: ${JSON.stringify(smoke.slice(-200))}`);
+}
+
 async function assertNative(file: string, label: string): Promise<void> {
 	const info = await fs.promises.lstat(file);
 	if (
@@ -429,36 +520,37 @@ async function assertNative(file: string, label: string): Promise<void> {
 	}
 }
 
-async function copyFrozen(source: string, destination: string, executable: boolean): Promise<string> {
+async function copyFrozen(source: string, destination: string): Promise<string> {
 	const info = await fs.promises.lstat(source);
 	if (!info.isFile() || (info.mode & 0o022) !== 0 || (info.uid !== 0 && info.uid !== process.getuid?.()))
 		throw new Error(`Unsafe supplied artifact: ${source}`);
 	const before = await fingerprint(source);
 	const expected = await fileHash(source);
 	await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
-	await fs.promises.chmod(destination, executable ? 0o500 : 0o400);
+	await fs.promises.chmod(destination, 0o500);
 	await unchanged(source, before);
 	if ((await fileHash(destination)) !== expected) throw new Error(`Artifact changed while copying: ${source}`);
 	return expected;
 }
 
 /** Freeze and validate a release without modifying either public installation name. */
-export async function stageHaiso(options: InstallOptions): Promise<InstallReceipt> {
+export async function stageHaiso(options: InstallOptions): Promise<ReleaseReceipt> {
 	requirePlatform();
-	if (!options.binary || !options.runtime || !options.forkPatch)
-		throw new Error("--binary, --runtime and --fork-patch are required.");
-	const expectedVersion = validatePins(options.upstream, options.compatibility);
+	if (!options.binary || !options.runtime) throw new Error("A compiled binary and a standalone runtime are required.");
+	const expectedVersion = validatePins(options.upstream);
+	if (!validSource(options.source))
+		throw new Error("Source repository must be an absolute path with full built and haiso commits.");
 	const binary = await fs.promises.realpath(path.resolve(options.binary));
 	const suppliedRuntime = await fs.promises.realpath(path.resolve(options.runtime));
-	const suppliedPatch = await fs.promises.realpath(path.resolve(options.forkPatch));
-	await assertNative(binary, "--binary");
-	await assertNative(suppliedRuntime, "--runtime");
-	const requestedPrefix = path.resolve(options.prefix ?? path.join(os.homedir(), ".local/share/haiso/fork"));
+	await assertNative(binary, "binary");
+	await assertNative(suppliedRuntime, "runtime");
+	const requestedPrefix = path.resolve(options.prefix ?? defaultPrefix());
 	const requestedBinDir = path.resolve(options.binDir ?? path.join(os.homedir(), ".local/bin"));
 	checkLayout(requestedPrefix, path.join(requestedBinDir, "haiso"));
 	const prefix = await canonicalPrefix(requestedPrefix, true);
 	const binDir = await ownedParent(requestedBinDir, true);
 	const launcher = path.join(binDir, "haiso");
+	const stateDir = path.resolve(options.stateDir ?? defaultStateDir(prefix));
 	checkLayout(prefix, launcher);
 	return withLock(prefix, async () => {
 		const prefixBefore = await fingerprint(prefix);
@@ -475,16 +567,18 @@ export async function stageHaiso(options: InstallOptions): Promise<InstallReceip
 			await fs.promises.mkdir(path.join(release, "runtime"), { mode: 0o700 });
 			const executable = path.join(release, "bin/haiso");
 			const runtime = path.join(release, "runtime/bun");
-			const forkPatch = path.join(release, "fork.patch");
-			const executableSha256 = await copyFrozen(binary, executable, true);
-			const runtimeSha256 = await copyFrozen(suppliedRuntime, runtime, true);
-			const forkPatchSha256 = await copyFrozen(suppliedPatch, forkPatch, false);
+			const executableSha256 = await copyFrozen(binary, executable);
+			const runtimeSha256 = await copyFrozen(suppliedRuntime, runtime);
+			const source = { ...options.source };
 			const wrapper = path.join(release, "bin/launch");
-			await fs.promises.writeFile(wrapper, launcherText(executable, prefix), { mode: 0o500, flag: "wx" });
+			await fs.promises.writeFile(
+				wrapper,
+				launcherText({ prefix, runtime, repo: source.repo, stateDir, executable }),
+				{ mode: 0o500, flag: "wx" },
+			);
 			const runtimeVersion = await withProbeHome(async (home, env) => {
 				const version = await probe([runtime, "--version"], home, env);
-				if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version))
-					throw new Error(`Unexpected Bun --version output: ${version}`);
+				if (!SEMVER.test(version)) throw new Error(`Unexpected Bun --version output: ${version}`);
 				const marker = `haiso-runtime-${crypto.randomUUID()}`;
 				const proof = await probe(
 					[runtime, "-e", `console.log(${JSON.stringify(marker)} + ":" + Bun.version)`],
@@ -495,32 +589,11 @@ export async function stageHaiso(options: InstallOptions): Promise<InstallReceip
 					throw new Error(
 						"Runtime cannot evaluate Bun source independently; supply standalone Bun, not a compiled application.",
 					);
-				const binaryVersion = await probe([wrapper, "--version"], home, env);
-				if (binaryVersion !== expectedVersion)
-					throw new Error(
-						`Compiled Haiso validation expected ${expectedVersion}, got ${JSON.stringify(binaryVersion)}.`,
-					);
-				const compiled: unknown = JSON.parse(await probe([wrapper, "__omp_worker_haiso_release_probe"], home, env));
-				if (
-					typeof compiled !== "object" ||
-					compiled === null ||
-					!("compiled" in compiled) ||
-					compiled.compiled !== true ||
-					!("bunVersion" in compiled) ||
-					compiled.bunVersion !== version ||
-					!("executable" in compiled) ||
-					compiled.executable !== executable ||
-					!("brokerNamespace" in compiled) ||
-					compiled.brokerNamespace !== options.compatibility.broker
-				)
-					throw new Error(
-						"Compiled Haiso must use the supplied standalone Bun version, its immutable executable path and the pinned broker namespace.",
-					);
-				await probe([wrapper, "--smoke-test"], home, env, 120_000);
+				await probeLauncher(wrapper, expectedVersion, home, env);
 				return version;
 			});
-			const receipt: InstallReceipt = {
-				schemaVersion: 2,
+			const receipt: ReleaseReceipt = {
+				schemaVersion: 3,
 				owner: OWNER,
 				id: path.basename(release),
 				installedAt: new Date().toISOString(),
@@ -530,10 +603,9 @@ export async function stageHaiso(options: InstallOptions): Promise<InstallReceip
 				release,
 				executable,
 				executableSha256,
-				forkPatch,
-				forkPatchSha256,
-				upstream: { ...options.upstream },
-				compatibility: { ...options.compatibility },
+				upstream: { tag: options.upstream.tag, commit: options.upstream.commit },
+				source,
+				stateDir,
 				runtime: {
 					suppliedPath: suppliedRuntime,
 					installedPath: runtime,
@@ -567,9 +639,10 @@ export async function stageHaiso(options: InstallOptions): Promise<InstallReceip
 	});
 }
 
+/** Publish a staged release, refusing if the active release is no longer `expectedCurrent`. */
 export async function activateHaiso(
 	release: string,
-	options: { expectedCurrent?: string | null; reviewed?: boolean; replaceLegacy?: boolean },
+	options: { expectedCurrent?: string | null; replaceLegacy?: boolean },
 ): Promise<InstallReceipt> {
 	const initial = await readHaisoRelease(release);
 	const prefix = await canonicalPrefix(initial.prefix, false);
@@ -581,19 +654,8 @@ export async function activateHaiso(
 		const expected = options.expectedCurrent === undefined ? receipt.activationBaseline : options.expectedCurrent;
 		if ((current?.target ?? null) !== expected)
 			throw new Error("Active release changed since staging; refusing activation after active-release drift.");
-		if (current?.receipt) {
-			if (current.receipt.launcher !== receipt.launcher)
-				throw new Error("An update must retain the current managed launcher path.");
-			if (
-				!options.reviewed &&
-				(current.receipt.compatibility.state !== receipt.compatibility.state ||
-					current.receipt.compatibility.broker !== receipt.compatibility.broker)
-			) {
-				throw new Error(
-					"State or broker compatibility changed; explicit reviewed activation is required. Shared state is never rolled back.",
-				);
-			}
-		}
+		if (current?.receipt && current.receipt.launcher !== receipt.launcher)
+			throw new Error("An update must retain the current managed launcher path.");
 		const binDir = await ownedParent(path.dirname(receipt.launcher), false);
 		const launcherBefore = await fingerprint(receipt.launcher);
 		const managedLauncher = await launcherState(receipt.launcher, prefix, options.replaceLegacy === true);
@@ -605,11 +667,7 @@ export async function activateHaiso(
 			await fs.promises.chmod(linkStage, 0o700);
 			const stagedLauncher = path.join(linkStage, "haiso");
 			await fs.promises.symlink(path.join(release, "bin/launch"), stagedLauncher);
-			await withProbeHome(async (home, env) => {
-				if ((await probe([stagedLauncher, "--version"], home, env)) !== receipt.version)
-					throw new Error("Staged launcher version changed during verification.");
-				await probe([stagedLauncher, "--smoke-test"], home, env, 120_000);
-			});
+			await withProbeHome((home, env) => probeLauncher(stagedLauncher, receipt.version, home, env));
 			await readHaisoRelease(release);
 			await safeDirectory(path.dirname(prefix), false);
 			await safeDirectory(binDir, false);
@@ -657,15 +715,8 @@ export async function activateHaiso(
 	});
 }
 
-export async function installHaiso(options: InstallOptions): Promise<InstallReceipt> {
-	const receipt = await stageHaiso(options);
-	return activateHaiso(receipt.release, {
-		expectedCurrent: receipt.activationBaseline,
-		replaceLegacy: options.replaceLegacy,
-	});
-}
-
-export async function rollbackHaiso(options: { prefix?: string; reviewed?: boolean }): Promise<InstallReceipt> {
+/** Re-activate the release the current one replaced. Shared ~/.omp state is never rolled back. */
+export async function rollbackHaiso(options: { prefix?: string }): Promise<InstallReceipt> {
 	const current = await currentHaisoRelease(options.prefix);
 	if (!current?.previousRelease)
 		throw new Error(
@@ -674,5 +725,5 @@ export async function rollbackHaiso(options: { prefix?: string; reviewed?: boole
 	const previous = await readHaisoRelease(current.previousRelease);
 	if (previous.prefix !== current.prefix || previous.launcher !== current.launcher)
 		throw new Error("Rollback receipt does not belong to this installation.");
-	return activateHaiso(previous.release, { expectedCurrent: current.release, reviewed: options.reviewed });
+	return activateHaiso(previous.release, { expectedCurrent: current.release });
 }

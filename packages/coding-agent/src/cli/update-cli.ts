@@ -15,7 +15,6 @@ import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
 import { settings } from "../config/settings";
 import { theme } from "@oh-my-pi/pi-tui/theme";
-import { type HaisoUpdateRequest, runHaisoUpdate } from "../haiso-update/engine";
 import {
 	isTimeoutError,
 	isUnsupportedProxyError,
@@ -2064,42 +2063,7 @@ export async function runUpdateCommand(opts: {
 	force: boolean;
 	check: boolean;
 	channel?: UpdateChannel;
-	stage?: boolean;
-	apply?: string;
-	rollback?: boolean;
-	status?: boolean;
-	auto?: "on" | "off";
-	reviewed?: boolean;
 }): Promise<void> {
-	// Haiso integrates upstream into its own verified releases; it must never
-	// enter OMP's package-manager or official binary replacement paths.
-	if (APP_NAME !== "omp") {
-		if (opts.channel === "canary") throw new Error("Haiso updates support stable upstream releases only.");
-		const action: HaisoUpdateRequest["action"] = opts.check
-			? "check"
-			: opts.stage
-				? "stage"
-				: opts.apply
-					? "apply"
-					: opts.rollback
-						? "rollback"
-						: opts.status
-							? "status"
-							: opts.auto !== undefined
-								? "auto"
-								: "update";
-		await runHaisoUpdate(
-			{
-				action,
-				candidateId: opts.apply,
-				enabled: opts.auto === undefined ? undefined : opts.auto === "on",
-				reviewed: opts.reviewed,
-				force: opts.force,
-			},
-			line => console.log(line),
-		);
-		return;
-	}
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 	const persistedChannel = readPersistedChannel() ?? "stable";
 	const channel = opts.channel ?? persistedChannel;
@@ -2142,6 +2106,8 @@ export async function runUpdateCommand(opts: {
 		// Just check, don't install
 		return;
 	}
+	// Haiso: never self-replace with official OMP. The launcher routes `haiso update` to scripts/haiso/update.ts.
+	if (APP_NAME !== "omp") throw new Error(`Run \`${APP_NAME} update\` through the Haiso launcher (see HAISO.md).`);
 
 	// Choose update method based on the prioritized omp binary in PATH. For
 	// binary-only releases the package managers are never consulted: a bun/npm
@@ -2204,4 +2170,29 @@ export async function runUpdateCommand(opts: {
 		console.error(chalk.red(`Update failed: ${err}`));
 		process.exit(1);
 	}
+}
+
+/**
+ * Print update command help.
+ */
+export function printUpdateHelp(): void {
+	console.log(`${chalk.bold(`${APP_NAME} update`)} - Check for and install updates
+
+${chalk.bold("Usage:")}
+  ${APP_NAME} update [options]
+
+${chalk.bold("Options:")}
+  -c, --check     Check for updates without installing
+  -f, --force     Force reinstall even if up to date
+  -l, --plugins   Update installed plugins
+  --canary        Switch to the canary channel and update
+  --stable        Switch back to the stable channel
+
+${chalk.bold("Examples:")}
+  ${APP_NAME} update              Update to latest version
+  ${APP_NAME} update --check      Check if updates are available
+  ${APP_NAME} update --force      Force reinstall
+  ${APP_NAME} update -l           Update installed plugins
+  ${APP_NAME} update --canary    Switch to the canary channel and update
+`);
 }

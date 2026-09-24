@@ -16,7 +16,7 @@ import {
 	setTerminalTitleSpinnerStyle,
 	setTerminalTitleState,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
-import { APP_DISPLAY_NAME, isWsl, logger, setTerminalHeadless } from "@oh-my-pi/pi-utils";
+import { isWsl, logger, setTerminalHeadless } from "@oh-my-pi/pi-utils";
 import { mockWindowsConsoleTitle, type WindowsConsoleTitleMock } from "./terminal-title-test-utils";
 
 function getModelOrThrow(id: string): Model<Api> {
@@ -854,7 +854,7 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 // renders instead of skipping the platform: the contract under test — the override was
 // released, so the run state drives the title again — holds identically on both.
 function expectWorkingSeparator(title: string | undefined, label: string): void {
-	if (isWsl()) expect(title).toBe(`${APP_DISPLAY_NAME} : ${label}`);
+	if (isWsl()) expect(title).toBe(`π : ${label}`);
 	else expect(SPINNER_FRAMES.some(frame => title?.includes(frame))).toBe(true);
 }
 
@@ -1001,14 +1001,14 @@ describe("terminal title runtime", () => {
 			resetEmitted();
 
 			setTerminalTitleState("working");
-			expect(emittedTitles()).toEqual([`${APP_DISPLAY_NAME} ⠋ windows-project`]);
+			expect(emittedTitles()).toEqual(["π ⠋ windows-project"]);
 
 			resetEmitted();
 			vi.advanceTimersByTime(160);
 			const titles = emittedTitles();
 			expect(titles.length).toBeGreaterThan(0);
 			expect(titles.every(title => SPINNER_FRAMES.some(frame => title.includes(frame)))).toBe(true);
-			expect(titles.some(title => title !== `${APP_DISPLAY_NAME} ⠋ windows-project`)).toBe(true);
+			expect(titles.some(title => title !== "π ⠋ windows-project")).toBe(true);
 		} finally {
 			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 		}
@@ -1024,7 +1024,7 @@ describe("terminal title runtime", () => {
 			resetEmitted();
 
 			setTerminalTitleState("working");
-			expect(emittedTitles()).toEqual([`${APP_DISPLAY_NAME} : wsl-project`]);
+			expect(emittedTitles()).toEqual(["π : wsl-project"]);
 
 			resetEmitted();
 			vi.advanceTimersByTime(400);
@@ -1095,7 +1095,7 @@ describe("terminal title runtime", () => {
 			native.succeeds = false;
 			setSessionTerminalTitle("windows-project-2");
 
-			expect(emittedTitles().at(-1)).toBe(`${APP_DISPLAY_NAME} : windows-project-2`);
+			expect(emittedTitles().at(-1)).toBe("π : windows-project-2");
 			expect(vi.getTimerCount()).toBe(0);
 			resetEmitted();
 			vi.advanceTimersByTime(400);

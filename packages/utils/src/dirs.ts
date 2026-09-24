@@ -17,14 +17,8 @@ import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
 import { isEnoent, isEnotdir } from "./fs-error";
 
-/** Runtime executable name; storage and provider wire identities remain compatible with OMP. */
+/** Executable name. Haiso keeps OMP's storage (`.omp`, XDG `omp`) so both apps share data. */
 export const APP_NAME: string = "haiso";
-
-/** Human-readable product name. */
-export const APP_DISPLAY_NAME: string = "Haiso";
-
-/** Existing XDG storage namespace, independent of the runtime product name. */
-export const XDG_DIR_NAME: string = "omp";
 
 /** Config directory name (e.g. ".omp") */
 export const CONFIG_DIR_NAME: string = ".omp";
@@ -360,7 +354,7 @@ class DirResolver {
 				const value = process.env[envVar];
 				if (!value) return undefined;
 				try {
-					const appRoot = path.join(value, XDG_DIR_NAME);
+					const appRoot = path.join(value, "omp");
 					if (profile) {
 						const profilePath = path.join(appRoot, "profiles", profile);
 						if (fs.existsSync(profilePath)) {
@@ -609,8 +603,7 @@ export function getLogsDir(): string {
 
 /** Get this process's dated log path (~/.omp/logs/omp.YYYY-MM-DD.PID.log). */
 export function getLogPath(date = new Date(), pid = process.pid): string {
-	// Preserve existing log filenames and rotation state across the product rename.
-	return path.join(getLogsDir(), `omp.${date.toISOString().slice(0, 10)}.${pid}.log`);
+	return path.join(getLogsDir(), `${APP_NAME}.${date.toISOString().slice(0, 10)}.${pid}.log`);
 }
 
 /**
@@ -950,7 +943,7 @@ export function getCrashLogPath(agentDir?: string): string {
 
 /** Get the debug log path (~/.omp/agent/omp-debug.log). */
 export function getDebugLogPath(agentDir?: string): string {
-	return dirs.agentSubdir(agentDir, "omp-debug.log", "state");
+	return dirs.agentSubdir(agentDir, `${APP_NAME}-debug.log`, "state");
 }
 
 /**
@@ -1076,13 +1069,13 @@ let cachedInstallId: string | null = null;
 const INSTALL_ID_FILE = "install-id";
 /**
  * Application label for usage attribution (`OMP_APP_NAME`), defaulting to
- * `haiso`. Embedders that drive the app programmatically (CI bots, …) set
+ * `omp`. Embedders that drive omp programmatically (robomp, CI bots, …) set
  * the env var so broker-side per-client burn tracking can answer "what did
  * app X use" instead of folding everything into one install-wide bucket.
  */
 export function getAppName(): string {
 	const value = process.env.OMP_APP_NAME?.trim();
-	return value ? value : APP_NAME;
+	return value ? value : "omp";
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

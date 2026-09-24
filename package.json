@@ -1,7 +1,7 @@
 {
-	"name": "haiso",
+	"name": "omp",
 	"private": true,
-	"homepage": "https://github.com/trxphxle/oh-my-pi",
+	"homepage": "https://omp.sh",
 	"license": "MIT",
 	"author": { "name": "Stencil Labs, Inc.", "url": "https://stencil.so" },
 	"workspaces": {

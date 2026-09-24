@@ -9,10 +9,6 @@
 export const BLOB_BROKER_WORKER_ARG = "__omp_worker_blob_broker";
 /** Discord-mode selector shared by the CLI dispatcher and worker launcher. */
 export const DISCORD_MODE_WORKER_ARG = "__omp_worker_discord_mode";
-/** Guarded Haiso updater, always hosted by the installed CLI executable. */
-export const HAISO_UPDATE_WORKER_ARG = "__omp_worker_haiso_update";
-/** Isolated installer probe for the compiled runtime and pinned executable. */
-export const HAISO_RELEASE_PROBE_ARG = "__omp_worker_haiso_release_probe";
 /** Computer-worker selector shared by the CLI dispatcher and worker launcher. */
 export const COMPUTER_WORKER_ARG = "__omp_worker_computer";
 /** Daemon-broker selector shared by the CLI dispatcher and worker launcher. */

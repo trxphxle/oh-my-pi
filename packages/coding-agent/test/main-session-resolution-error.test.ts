@@ -16,7 +16,6 @@ import * as sessionListingModule from "@oh-my-pi/pi-coding-agent/session/session
 import { loadSessionFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { ForkSourceNotFoundError, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { APP_NAME } from "@oh-my-pi/pi-utils";
 
 function buildResumeArgs(resume: string, sessionDir?: string): Args {
 	return {
@@ -111,7 +110,7 @@ describe("createSessionManager — missing session (#2084)", () => {
 			).rejects.toMatchObject({
 				name: "SessionResolutionError",
 				message: 'Session "019ea530-0000-7000-0000-000000000000" not found.',
-				hint: expect.stringContaining(`${APP_NAME} --resume`),
+				hint: expect.stringContaining("omp --resume"),
 			});
 
 			// Confirm it's the exported class so `runRootCommand`'s `instanceof` check works.
@@ -142,7 +141,7 @@ describe("createSessionManager — missing session (#2084)", () => {
 			).rejects.toMatchObject({
 				name: "SessionResolutionError",
 				message: `Session "${missingId}" not found.`,
-				hint: expect.stringContaining(`${APP_NAME} --resume`),
+				hint: expect.stringContaining("omp --resume"),
 			});
 		} finally {
 			await fsp.rm(cwd, { recursive: true, force: true });
@@ -164,7 +163,7 @@ describe("createSessionManager — missing session (#2084)", () => {
 			).rejects.toMatchObject({
 				name: "SessionResolutionError",
 				message: `Session "${missingId}" not found.`,
-				hint: expect.stringContaining(`${APP_NAME} --resume`),
+				hint: expect.stringContaining("omp --resume"),
 			});
 		} finally {
 			await fsp.rm(cwd, { recursive: true, force: true });
@@ -183,7 +182,7 @@ describe("createSessionManager — missing session (#2084)", () => {
 			).rejects.toMatchObject({
 				name: "SessionResolutionError",
 				message: 'Session "019ea530-0000-7000-0000-000000000000" not found.',
-				hint: expect.stringContaining(`${APP_NAME} --resume`),
+				hint: expect.stringContaining("omp --resume"),
 			});
 		} finally {
 			vi.restoreAllMocks();
@@ -209,7 +208,7 @@ describe("createSessionManager — missing session (#2084)", () => {
 			).rejects.toMatchObject({
 				name: "SessionResolutionError",
 				message: `Session "${missingPath}" not found.`,
-				hint: expect.stringContaining(`${APP_NAME} --resume`),
+				hint: expect.stringContaining("omp --resume"),
 			});
 			await expect(fsp.readdir(sessionDir)).resolves.toEqual([]);
 		} finally {
@@ -282,7 +281,7 @@ describe("createSessionManager — missing session (#2084)", () => {
 			).rejects.toMatchObject({
 				name: "SessionResolutionError",
 				message: `Session "${forkId}" not found.`,
-				hint: expect.stringContaining(`${APP_NAME} --resume`),
+				hint: expect.stringContaining("omp --resume"),
 			});
 			await expect(fsp.readdir(sessionDir)).resolves.toEqual([]);
 		} finally {
@@ -303,7 +302,7 @@ describe("createSessionManager — missing session (#2084)", () => {
 			).rejects.toMatchObject({
 				name: "SessionResolutionError",
 				message: `Session "${enotdirChild}" not found.`,
-				hint: expect.stringContaining(`${APP_NAME} --resume`),
+				hint: expect.stringContaining("omp --resume"),
 			});
 			await expect(fsp.readdir(sessionDir)).resolves.toEqual([]);
 		} finally {

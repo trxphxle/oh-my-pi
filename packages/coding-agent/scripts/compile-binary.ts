@@ -22,8 +22,6 @@ export interface CodingAgentCompileOptions {
 	readonly target?: Bun.Build.CompileTarget;
 	/** Optional unmodified Bun executable used as the standalone runtime template. */
 	readonly executablePath?: string;
-	/** Pinned generic-daemon protocol namespace for this Haiso release. */
-	readonly haisoBrokerNamespace?: string;
 	/** Match release builds that minify identifiers while retaining names. */
 	readonly minifyIdentifiers?: boolean;
 	/** Disable Bun's built-in Darwin signing before the caller re-signs. */
@@ -48,8 +46,8 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 				"process.env.PI_COMPILED": JSON.stringify("true"),
 				"process.env.PI_TINY_TRANSFORMERS_VERSION": JSON.stringify(options.transformersVersion),
 				"process.env.PI_DOCS_EMBED": JSON.stringify((await buildDocsIndexPayload()).payload),
-				"process.env.HAISO_DAEMON_NAMESPACE": JSON.stringify(options.haisoBrokerNamespace ?? ""),
-				"process.env.HAISO_NATIVE_NAMESPACE": JSON.stringify(options.haisoBrokerNamespace ? "haiso" : ""),
+				// Haiso: per-executable native addon dir, so releases never share one with OMP or each other.
+				"process.env.HAISO_NATIVE_NAMESPACE": JSON.stringify("haiso"),
 			},
 			// Precompiled bytecode skips parsing the ~20 MB bundle at boot:
 			// `omp --version` 256 ms -> 30 ms on M4 Max (+52 MB binary).

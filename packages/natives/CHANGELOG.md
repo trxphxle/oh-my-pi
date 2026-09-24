@@ -2,10 +2,6 @@
 
 ## [Unreleased]
 
-### Changed
-
-- Compiled Haiso releases keep extracted native addons separate from official OMP and older running Haiso releases.
-
 ## [18.3.0] - 2026-09-24
 
 ### Added

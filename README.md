@@ -1,119 +1,111 @@
-# Haiso
+<p align="center">
+  <img src="https://github.com/can1357/oh-my-pi/blob/main/assets/hero.png?raw=true" alt="omp">
+</p>
 
-Haiso is a personal fork of [Oh My Pi](https://github.com/can1357/oh-my-pi),
-tracking stable upstream releases; `haiso update --status` shows the installed version and exact upstream commit.
-It retains the upstream coding engine, tools, providers, and session model, with
-Haiso's opt-in Discord session controls and its own application identity.
+<p align="center">
+  <strong>A coding agent with the IDE wired in.</strong>
+  <strong><a href="https://omp.sh">omp.sh</a></strong>
+</p>
 
-Use **`haiso`** for this fork. An existing **`omp`** command remains the separate
-official installation. Package namespaces and `.omp` configuration/history
-locations are intentionally retained. Shared-state migrations are compatibility-gated;
-switching executables does not reverse them. Haiso is not an official OMP release.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent"><img src="https://img.shields.io/npm/v/@oh-my-pi/pi-coding-agent?style=flat&colorA=222222&colorB=CB3837" alt="npm version"></a>
+  <a href="https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep-E05735?style=flat&colorA=222222" alt="Changelog"></a>
+  <a href="https://github.com/can1357/oh-my-pi/actions"><img src="https://img.shields.io/github/actions/workflow/status/can1357/oh-my-pi/ci.yml?style=flat&colorA=222222&colorB=3FB950" alt="CI"></a>
+  <a href="https://github.com/can1357/oh-my-pi/blob/main/LICENSE"><img src="https://img.shields.io/github/license/can1357/oh-my-pi?style=flat&colorA=222222&colorB=58A6FF" alt="License"></a>
+  <a href="https://www.typescriptlang.org"><img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&colorA=222222&logo=typescript&logoColor=white" alt="TypeScript"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-DEA584?style=flat&colorA=222222&logo=rust&logoColor=white" alt="Rust"></a>
+  <a href="https://bun.sh"><img src="https://img.shields.io/badge/runtime-Bun-f472b6?style=flat&colorA=222222" alt="Bun"></a>
+  <a href="https://discord.gg/4NMW9cdXZa"><img src="https://img.shields.io/badge/Discord-5865F2?style=flat&colorA=222222&logo=discord&logoColor=white" alt="Discord"></a>
+</p>
 
-- [Discord setup, controls, and recovery](packages/coding-agent/README.md#haiso-discord-mode-personal-fork)
-- [Changelog](packages/coding-agent/CHANGELOG.md)
-- [License and retained upstream credits](LICENSE)
+<p align="center">
+  Built by <a href="https://stencil.so">Stencil Labs</a> · Fork of <a href="https://github.com/badlogic/pi-mono">Pi</a> by <a href="https://github.com/mariozechner">@mariozechner</a>
+</p>
 
-The feature reference below is inherited from OMP. Where an upstream example
-uses the `omp` executable, use `haiso` for this fork; `.omp` paths and protocol
-identifiers intentionally keep their existing names. Do not use upstream
-installers to update Haiso.
+The most capable agent surface that ships. Continuously tuned by real-world use — complete out of the box, open all the way down.
 
-## Install and update this fork
+**60+** providers · **31** built-in tools · **14** lsp ops · **28** dap ops · **~80k** lines of Rust core.
 
-Haiso runs a verified compiled executable, not a mutable development checkout.
-`~/.local/bin/haiso` selects an immutable release under
-`~/.local/share/haiso/`; the active `fork` symlink is switched atomically.
-Each release retains its matching standalone Bun, frozen fork patch, upstream
-commit, artifact hashes, and compatibility fingerprints. Existing processes and
-their workers remain pinned to their original executable.
+> [!NOTE]
+> Pull requests are **temporarily open to everyone** as a trial. We previously
+> required a vouch before accepting PRs; that requirement is lifted for now
+> while we evaluate how open contributions go. Depending on the results, the
+> vouch system may return.
 
-Bootstrap installation is a maintainer operation: build a reviewed candidate
-with matching dependencies/native bindings, freeze its complete patch against
-the official upstream commit, and compute its compatibility fingerprints with
-`computeCompatibility` in `packages/coding-agent/src/haiso-update/compatibility.ts`.
-Supply those artifacts and pins to the installer; `bun scripts/install-haiso.ts --help`
-lists the required arguments. An existing launcher or mutable source install
-requires explicit `--replace-legacy`. Do not use the upstream global installer,
-`bun setup`, or `bun link` to install this fork: they can target official OMP.
+## Install
 
-```sh
-haiso --version
-haiso
-haiso --resume
-```
-
-From an already-running old/source-launched session, exit normally before using
-`haiso --resume` to reopen the same conversation. Do not run two writers against
-one saved session.
+**macOS · Linux**
 
 ```sh
-haiso update --check           # Discover the latest official stable tag and commit
-haiso update --stage           # Integrate, build, test, and retain a candidate
-haiso update --status          # Inspect current release and held candidates
-haiso update --apply ID        # Activate the exact verified candidate shown by status
-haiso update --auto on         # Opt into guarded checks on subsequent launches
-haiso update --auto off
-haiso update --rollback        # Switch to a retained compatible compiled release
-haiso update --plugins        # Plugin updates remain separate
+curl -fsSL https://omp.sh/install | sh
 ```
 
-Plain `haiso update` stages and activates only a compatible verified candidate.
-`--force` retries failed staging or rebuilds the same pinned release without
-weakening checks. Automatic mode is off until enabled, checks at most daily on
-managed launches, and uses one updater at a time. It never edits the developer
-checkout or replaces `omp`. Git, public GitHub/npm access, the pinned Bun runtime,
-and the platform build/signing tools must be available.
+> **Alpine / musl:** the prebuilt musl binary links `libstdc++`/`libgcc` dynamically, which stock Alpine does not ship. Install them first: `apk add libstdc++ libgcc`.
 
-Conflicts, failed verification, changed candidate bytes, or a changed active
-release stop activation. Minor/major transitions and state/broker fingerprint
-changes remain held for review. After inspecting the migration and affected
-profiles, `--apply ID --reviewed` acknowledges that compatibility transition;
-it cannot bypass failed checks. Generic service brokers use protocol-specific
-scopes, and extracted native addons use release-specific caches. Existing
-Discord connections retain their recorded supervisor lease instead of moving
-to a new service broker.
-
-Rollback changes only executable selection, disables automatic updates, and
-never restores databases or restarts brokers. Changed compatibility requires
-`--rollback --reviewed`; assess whether older code can still read the current
-state. Legacy mutable source installs are preserved but are not rollback
-targets. In particular, OMP 18.3 renames SingularityAPI credential providers,
-and older Haiso cannot interpret all migrated settings selectors.
-
-Updater records and logs live beside `fork` in `fork-update/`. It retains at
-most four staged candidates and stops before accumulating eight releases.
-Cleanup is manual: never remove the active release or one used by a running
-process. Build details: [development guide](packages/coding-agent/DEVELOPMENT.md).
-
-### Optional connector for official OMP
-
-Keep the official `omp` executable and load only the optional bridge extension:
+**Homebrew**
 
 ```sh
-bun packages/omp-bridge/scripts/build.ts
-omp --extension /absolute/path/to/oh-my-pi/packages/omp-bridge/dist/index.js --resume
+brew install can1357/tap/omp
 ```
 
-In the resumed OMP conversation, run `/bridge on` to attach to the already-configured,
-running Haiso broker. No Haiso system prompt, bot-token setup, or model settings are
-loaded into OMP. The extension is off by default and adds one `bridge` tool only
-while attached. See [connector setup and limits](packages/coding-agent/README.md#optional-official-omp-connector).
+**Bun (recommended)**
 
+```sh
+bun install -g @oh-my-pi/pi-coding-agent
+```
+
+**Nix**
+
+```sh
+# Run without installing
+nix run github:can1357/oh-my-pi
+
+# Or install into the active profile
+nix profile install github:can1357/oh-my-pi
+```
+
+Flake consumers can use `packages.<system>.omp`, `overlays.default`, `nixosModules.default`, or `homeManagerModules.default`. A Home Manager configuration can install OMP and own its settings declaratively:
+
+```nix
+{
+  inputs.omp.url = "github:can1357/oh-my-pi";
+
+  # In your Home Manager module:
+  imports = [ inputs.omp.homeManagerModules.default ];
+  programs.omp = {
+    enable = true;
+    settings.startup.quiet = true;
+  };
+}
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://omp.sh/install.ps1 | iex
+```
+
+**Pinned versions (mise)**
+
+```sh
+mise use -g github:can1357/oh-my-pi
+```
+
+macOS · Linux · Windows · bun ≥ 1.3.14
 
 ### Shell completions
 
-`haiso` generates completion scripts for **bash**, **zsh**, and **fish** from its live command/flag metadata. Model and session completions use the fork's existing catalog and saved conversations.
+`omp` generates its own completion scripts for **bash**, **zsh**, and **fish** from the live command/flag metadata, so they never drift from the actual CLI. Subcommands, flags, and enum values complete statically; model names (`--model`, `--smol`, `--slow`, `--plan`) resolve against the bundled model catalog and `--resume` against your on-disk sessions.
 
 ```sh
 # zsh — add to ~/.zshrc (or write the output into a file on your $fpath)
-eval "$(haiso completions zsh)"
+eval "$(omp completions zsh)"
 
 # bash — add to ~/.bashrc
-eval "$(haiso completions bash)"
+eval "$(omp completions bash)"
 
 # fish
-haiso completions fish > ~/.config/fish/completions/haiso.fish
+omp completions fish > ~/.config/fish/completions/omp.fish
 ```
 
 ## Every tool, _benchmaxxed_.

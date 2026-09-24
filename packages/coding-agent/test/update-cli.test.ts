@@ -91,12 +91,15 @@ describe("update command plugin dispatch", () => {
 		expect(updateSpy).not.toHaveBeenCalled();
 	});
 
-	it("rejects mixed application/plugin operations instead of choosing one silently", async () => {
-		await expect(new Update(["--stage", "--plugins"], TEST_CONFIG).run()).rejects.toThrow();
-	});
+	it("keeps normal update flags on the app updater path", async () => {
+		const pluginSpy = spyOn(pluginCli, "runPluginCommand").mockResolvedValue(undefined);
+		const updateSpy = spyOn(updateCli, "runUpdateCommand").mockResolvedValue(undefined);
 
-	it("requires an exact activation or rollback for compatibility review", async () => {
-		await expect(new Update(["--reviewed"], TEST_CONFIG).run()).rejects.toThrow();
+		const command = new Update(["--check", "--force"], TEST_CONFIG);
+		await command.run();
+
+		expect(updateSpy).toHaveBeenCalledWith({ force: true, check: true, channel: undefined });
+		expect(pluginSpy).not.toHaveBeenCalled();
 	});
 });
 

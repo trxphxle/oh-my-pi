@@ -2,27 +2,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added opt-in Haiso Discord mode with named project categories and session channels, remote conversation and approvals, local peer messaging, and explicit repair after Discord changes.
-- Added immutable Haiso releases with guarded stable updates, isolated candidate verification, automatic-update controls, and compatibility-checked rollback.
-- Added Discord `/session status`, `/session stop`, and `/session queue`, with session-card controls and guidance/cancellation actions for waiting messages.
-- Added session-deletion choices to archive the Discord conversation or explicitly delete its channel, with durable offline cleanup and closed-session notices.
-- Added an optional official OMP connector with explicit `/bridge` attachment, peer messaging, and reports without loading Haiso's application runtime or changing model settings.
-
-### Changed
-
-- Haiso now incorporates OMP 18.3.0 while retaining its native Discord integration and optional official OMP connector.
-- Discord mode now opens state-aware controls with explicit on/off and connection indicators instead of an instructional paragraph.
-- Replaced legacy Discord `/omp`, `/team`, and `/tell` commands with channel-bound session controls.
-
-### Fixed
-
-- Fixed upgraded Haiso clients dropping an existing Discord broker's supervisor lease.
-- Fixed Discord messages silently failing to reach connected sessions.
-- Fixed `/discord on` repeating channel setup instead of directly reconnecting a saved conversation's existing channel.
-- Removed technical delivery headers and tracking-hash footers from Discord replies while retaining duplicate-post safeguards.
-
 ## [18.3.0] - 2026-09-24
 
 ### Breaking Changes

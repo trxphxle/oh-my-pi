@@ -2,15 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import {
-	APP_DISPLAY_NAME,
-	APP_NAME,
-	getBlobsDir,
-	isEnoent,
-	logger,
-	type postmortem,
-	VERSION,
-} from "@oh-my-pi/pi-utils";
+import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import {
 	type Agent,
 	type AgentSideConnection,
@@ -652,8 +644,8 @@ export class AcpAgent implements Agent {
 			authMethods.push({
 				type: "terminal",
 				id: "terminal",
-				name: `Set up ${APP_DISPLAY_NAME} in terminal`,
-				description: `Launch the ${APP_NAME} TUI to add provider keys and select models.`,
+				name: "Set up omp in terminal",
+				description: "Launch the omp TUI to add provider keys and select models.",
 				args: [ACP_TERMINAL_AUTH_FLAG],
 			});
 		}
@@ -661,7 +653,7 @@ export class AcpAgent implements Agent {
 			protocolVersion: PROTOCOL_VERSION,
 			agentInfo: {
 				name: "oh-my-pi",
-				title: APP_DISPLAY_NAME,
+				title: "omp",
 				version: VERSION,
 			},
 			authMethods,

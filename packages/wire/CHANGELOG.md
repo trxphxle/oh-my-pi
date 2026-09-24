@@ -2,10 +2,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added shared Discord session and connector contracts for native and external clients.
-
 ## [18.2.11] - 2026-09-23
 
 ### Added

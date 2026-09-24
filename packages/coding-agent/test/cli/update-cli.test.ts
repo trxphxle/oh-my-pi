@@ -1,34 +1,29 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
-import * as releases from "../../src/haiso-update/release";
 
 type FetchInput = string | URL | Request;
+type FetchInit = RequestInit | BunFetchRequestInit;
 
-describe("unmanaged Haiso update protection", () => {
+describe("runUpdateCommand fetch cancellation", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
 
-	it("refuses forced application replacement without a managed release", async () => {
+	it("checks release metadata with a timeout signal", async () => {
+		let requestSignal: AbortSignal | undefined;
 		vi.spyOn(console, "log").mockImplementation(() => {});
-		vi.spyOn(releases, "currentHaisoRelease").mockResolvedValue(null);
 		const fetchStub = Object.assign(
-			async () => {
-				throw new Error("Application updates must not reach the network");
+			async (_input: FetchInput, init?: FetchInit) => {
+				requestSignal = init?.signal ?? undefined;
+				return Response.json({ version: "999.0.0" });
 			},
 			{ preconnect: globalThis.fetch.preconnect },
 		);
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchStub);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchStub);
 
-		await expect(runUpdateCommand({ force: true, check: false, channel: "stable" })).rejects.toThrow();
+		await runUpdateCommand({ force: false, check: true });
 
-		expect(fetchSpy).not.toHaveBeenCalled();
-	});
-
-	it("rejects canary selection before looking up or replacing an installation", async () => {
-		const lookup = vi.spyOn(releases, "currentHaisoRelease").mockResolvedValue(null);
-		await expect(runUpdateCommand({ force: true, check: false, channel: "canary" })).rejects.toThrow();
-		expect(lookup).not.toHaveBeenCalled();
+		expect(requestSignal).toBeInstanceOf(AbortSignal);
 	});
 });
 
