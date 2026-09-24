@@ -691,7 +691,8 @@ function junitFailures(xml: string): Set<string> {
 
 /**
  * Run a package's bun tests and return failing test keys; throws when failures cannot be attributed.
- * Full suites run in parallel; re-runs of failing files run serially so contention flakes drop out.
+ * Full suites run in parallel. Re-runs (`parallel: false`) run each file in its own process, so
+ * neither contention nor state leaking between files decides the verdict for candidate or baseline.
  */
 async function runSuite(
 	session: Session,
@@ -702,44 +703,48 @@ async function runSuite(
 	parallel: boolean,
 ): Promise<Set<string>> {
 	session.say(`• ${label}`);
-	const report = path.join(env.TMPDIR ?? os.tmpdir(), `junit-${crypto.randomUUID()}.xml`);
 	const failures = new Set<string>();
-	let file: string | undefined;
 	const width = Math.max(2, Math.floor(os.availableParallelism() / 2));
-	const result = await session.run(
-		[
-			process.execPath,
-			"test",
-			...(parallel ? [`--parallel=${width}`, "--only-failures"] : []),
-			"--reporter=junit",
-			`--reporter-outfile=${report}`,
-			...targets,
-		],
-		cwd,
-		env,
-		60 * MINUTE,
-		{
-			// Files that fail to load are absent from the JUnit report; bun prints them under their header.
-			onLine: line => {
-				const header = /^(\S.*\.(?:test|spec)\.[cm]?[jt]sx?):$/.exec(line);
-				if (header) file = header[1];
-				else if (file && line.startsWith("# Unhandled error between tests"))
-					failures.add(`${file}\0\0(unhandled error)`);
+	for (const batch of parallel ? [targets] : targets.map(target => [target])) {
+		const report = path.join(env.TMPDIR ?? os.tmpdir(), `junit-${crypto.randomUUID()}.xml`);
+		const found = new Set<string>();
+		let file: string | undefined;
+		const result = await session.run(
+			[
+				process.execPath,
+				"test",
+				...(parallel ? [`--parallel=${width}`, "--only-failures"] : []),
+				"--reporter=junit",
+				`--reporter-outfile=${report}`,
+				...batch,
+			],
+			cwd,
+			env,
+			60 * MINUTE,
+			{
+				// Files that fail to load are absent from the JUnit report; bun prints them under their header.
+				onLine: line => {
+					const header = /^(\S.*\.(?:test|spec)\.[cm]?[jt]sx?):$/.exec(line);
+					if (header) file = header[1];
+					else if (file && line.startsWith("# Unhandled error between tests"))
+						found.add(`${file}\0\0(unhandled error)`);
+				},
 			},
-		},
-	);
-	try {
-		for (const key of junitFailures(await Bun.file(report).text())) failures.add(key);
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
-	} finally {
-		await fs.rm(report, { force: true });
-	}
-	if (result.code === null) throw new Error(`${label} timed out:\n${tailLines(result.output, 25)}`);
-	if (result.code !== 0 && failures.size === 0)
-		throw new Error(
-			`${label} failed without attributable test failures (exit ${result.code}):\n${tailLines(result.output, 25)}`,
 		);
+		try {
+			for (const key of junitFailures(await Bun.file(report).text())) found.add(key);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		} finally {
+			await fs.rm(report, { force: true });
+		}
+		if (result.code === null) throw new Error(`${label} timed out:\n${tailLines(result.output, 25)}`);
+		if (result.code !== 0 && found.size === 0)
+			throw new Error(
+				`${label} failed without attributable test failures (exit ${result.code}):\n${tailLines(result.output, 25)}`,
+			);
+		for (const key of found) failures.add(key);
+	}
 	if (failures.size) session.say(`  ${failures.size} failing`);
 	return failures;
 }
