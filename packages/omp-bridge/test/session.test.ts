@@ -8,6 +8,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { DiscordModeRequestError } from "@oh-my-pi/pi-utils/discord-client";
 import {
+	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
 	type ModeDelivery,
 	type ModeEnrollment,
@@ -65,7 +66,7 @@ function marker(delivery: ModeDelivery): AgentMessage {
 	} as AgentMessage;
 }
 
-async function fixture(options: { timers?: boolean; saved?: boolean } = {}) {
+async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: number } = {}) {
 	const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-session-"));
 	const root = await fs.realpath(temporary);
 	cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
@@ -139,7 +140,16 @@ async function fixture(options: { timers?: boolean; saved?: boolean } = {}) {
 	let connects = 0;
 	let mode: BridgeSession;
 	const snapshot = (items: ModeDelivery[] = [...deliveries.values()]): ModeSnapshot =>
-		structuredClone({ group, session, lease, peers: [peer], deliveries: items, answers: [], gatewayConnected: true });
+		structuredClone({
+			group,
+			session,
+			lease,
+			peers: [peer],
+			deliveries: items,
+			answers: [],
+			gatewayConnected: true,
+			...(options.maxReply === undefined ? {} : { maxReply: options.maxReply }),
+		});
 	const connect = async (): Promise<BridgeConnection> => {
 		connects++;
 		await connectHook?.();
@@ -567,7 +577,26 @@ describe("BridgeSession admission and attribution", () => {
 		expect(f.publications).toEqual(["explicit owner update"]);
 	});
 
-	test("non-stop terminal results never publish and UTF-8 final text is bounded without reasoning", async () => {
+	test("final text uses the broker's advertised reply bound and still truncates beyond it", async () => {
+		const f = await fixture({ maxReply: DISCORD_MODE_MAX_REPLY });
+		await f.mode.on();
+		const long = "界".repeat(8000);
+		const first = f.queue();
+		await f.mode.poll();
+		await f.end(first, long);
+		f.state.idle = true;
+		const second = f.queue();
+		await f.mode.poll();
+		await f.end(second, "界".repeat(DISCORD_MODE_MAX_REPLY));
+		expect(f.publications).toHaveLength(2);
+		expect(f.publications[0]).toBe(long);
+		expect(Buffer.byteLength(f.publications[1]!)).toBeLessThanOrEqual(DISCORD_MODE_MAX_REPLY);
+		expect(Buffer.byteLength(f.publications[1]!)).toBeGreaterThan(DISCORD_MODE_MAX_TEXT);
+		expect(f.publications[1]).toEndWith("\n[response truncated]");
+		expect(f.publications[1]).not.toContain("\ufffd");
+	});
+
+	test("non-stop terminal results never publish and brokers without a reply bound keep the text bound", async () => {
 		const f = await fixture();
 		await f.mode.on();
 		const failed = f.queue();

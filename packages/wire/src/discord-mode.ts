@@ -3,6 +3,8 @@ export const DISCORD_MODE_DAEMON_NAME = "haiso-discord";
 export const DISCORD_MODE_READY = "Haiso Discord mode ready";
 export const DISCORD_MODE_PROTOCOL = 2;
 export const DISCORD_MODE_MAX_TEXT = 12_000;
+/** UTF-8 byte bound for a final reply receipt; worst-case JSON escaping (2x) still fits one IPC frame. */
+export const DISCORD_MODE_MAX_REPLY = 96 * 1024;
 export const DISCORD_MODE_MAX_PENDING = 32;
 export const DISCORD_MODE_MAX_SESSIONS = 128;
 export const DISCORD_MODE_MAX_FRAME = 256 * 1024;
@@ -121,6 +123,8 @@ export interface ModeSnapshot {
 	deliveries: ModeDelivery[];
 	answers: ModeDialogAnswer[];
 	gatewayConnected: boolean;
+	/** Final-reply receipt byte bound; absent from older brokers, which accept only DISCORD_MODE_MAX_TEXT. */
+	maxReply?: number;
 }
 export type ModeRequest =
 	| { op: "retire"; eventId: string }
@@ -219,7 +223,10 @@ export interface DiscordPort {
 	createChannel(categoryId: string, name: string, marker: string): Promise<RemoteChannel>;
 	rename(id: string, name: string): Promise<void>;
 	move(id: string, categoryId: string): Promise<void>;
+	/** Owner reports and notices; chunked into ordinary messages. */
 	publish(channelId: string, text: string, key: string): Promise<void>;
+	/** Final owner reply; one message, long text attached in full. */
+	reply(channelId: string, text: string, key: string): Promise<void>;
 	status(
 		channelId: string,
 		text: string,

@@ -132,9 +132,11 @@ truncated; a remote structured ask with too many projected options remains local
 Only attributable remote-turn final text and explicit reports are published.
 Replies and reports contain the message itself, without delivery-ID headers or
 tracking-hash footers. Delivery and status-card identity remain internal.
-Thinking, tool output, and unrelated local conversation are not mirrored. Final
-responses over 12,000 UTF-8 bytes are explicitly marked as truncated; the original
-remains in the native session. The `discord` tool lets enrolled agents list
+Thinking, tool output, and unrelated local conversation are not mirrored. A final
+response longer than one Discord message (2,000 characters) is posted once as a
+preview plus the full text in `haiso-reply.md`; replies over 96 KiB are marked as
+truncated (12,000 bytes with a broker from an older build). Reports stay at 12,000
+bytes. The original always remains in the native session. The `discord` tool lets enrolled agents list
 same-project peers, send peer data, and publish deliberate reports. Local peer
 messages do not round-trip through Discord and continue if a Discord resource
 disappears. Peer input never grants owner approval.

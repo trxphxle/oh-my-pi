@@ -14,6 +14,7 @@ import {
 	type DiscordSessionEngine,
 } from "../../src/discord-mode/session";
 import {
+	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
 	type ModeDelivery,
 	type ModeDialog,
@@ -217,6 +218,10 @@ async function fixture() {
 		setSession(patch: Partial<ModeSession>) {
 			snapshot = { ...snapshot, session: { ...snapshot.session, ...patch } };
 		},
+		/** Broker-advertised final-reply bound; old brokers omit it. */
+		setMaxReply(maxReply: number | undefined) {
+			snapshot = { ...snapshot, maxReply };
+		},
 		/** Broker state reset: the UUID is no longer enrolled. */
 		forget() {
 			forgotten = true;
@@ -361,7 +366,7 @@ describe("native Discord session routing", () => {
 		expect((await f.completed).text).toBeUndefined();
 	});
 
-	test("bounds Unicode final output in UTF8 bytes without broken characters", async () => {
+	test("an older broker without maxReply keeps the 12000-byte bound without broken characters", async () => {
 		const f = await fixture();
 		await f.enroll();
 		f.queue(f.delivery());
@@ -371,6 +376,27 @@ describe("native Discord session routing", () => {
 		expect(Buffer.byteLength(result)).toBeLessThanOrEqual(DISCORD_MODE_MAX_TEXT);
 		expect(result).not.toContain("�");
 		expect(result).toEndWith("[response truncated]");
+	});
+
+	test("a broker advertising maxReply receives long final output whole, bounded by this build", async () => {
+		const f = await fixture();
+		f.setMaxReply(DISCORD_MODE_MAX_REPLY * 4);
+		await f.enroll();
+		f.queue(f.delivery());
+		await f.mode.poll();
+		const long = "界".repeat(DISCORD_MODE_MAX_TEXT); // 36000 bytes: over the report bound, under maxReply
+		f.finish(long);
+		expect((await f.completed).text).toBe(long);
+
+		const g = await fixture();
+		g.setMaxReply(DISCORD_MODE_MAX_REPLY * 4);
+		await g.enroll();
+		g.queue(g.delivery());
+		await g.mode.poll();
+		g.finish("x".repeat(DISCORD_MODE_MAX_REPLY + 10));
+		const bounded = (await g.completed).text!;
+		expect(Buffer.byteLength(bounded)).toBeLessThanOrEqual(DISCORD_MODE_MAX_REPLY);
+		expect(bounded).toEndWith("[response truncated]");
 	});
 
 	test("status and registration never execute broker-held queued work", async () => {

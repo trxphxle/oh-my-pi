@@ -14,6 +14,7 @@ import {
 	withDiscordDeletionLock,
 } from "../../src/discord-mode/retirement-events";
 import { startDiscordModeServer } from "../../src/discord-mode/server";
+import { DISCORD_MODE_MAX_REPLY, DISCORD_MODE_MAX_TEXT } from "@oh-my-pi/pi-wire/discord-mode";
 import type {
 	ChannelInspection,
 	DiscordPort,
@@ -36,7 +37,7 @@ const config = { guildId: "100", ownerId: "200", botToken: "offline-fixture-only
 class FixtureDiscord implements DiscordPort {
 	handlers: DiscordPortHandlers | undefined;
 	readonly channels = new Map<string, RemoteChannel>();
-	readonly publications: Array<{ channelId: string; text: string; key: string }> = [];
+	readonly publications: Array<{ kind: "publish" | "reply"; channelId: string; text: string; key: string }> = [];
 	readonly cards = new Map<string, { id: string; text: string; connectionId?: string }>();
 	readonly legacyCards = new Set<string>();
 	readonly dialogs = new Map<string, ModeDialog>();
@@ -133,7 +134,14 @@ class FixtureDiscord implements DiscordPort {
 		}
 	}
 	async publish(channelId: string, text: string, key: string): Promise<void> {
-		this.publications.push({ channelId, text, key });
+		this.publications.push({ kind: "publish", channelId, text, key });
+		if (this.failNextPublish) {
+			this.failNextPublish = false;
+			throw new Error("response lost after remote publication");
+		}
+	}
+	async reply(channelId: string, text: string, key: string): Promise<void> {
+		this.publications.push({ kind: "reply", channelId, text, key });
 		if (this.failNextPublish) {
 			this.failNextPublish = false;
 			throw new Error("response lost after remote publication");
@@ -1105,10 +1113,10 @@ describe("durable Discord mode broker", () => {
 			};
 			await broker.request(completedReport);
 			await broker.request(completedReport);
-			expect(port.publications.map(item => item.text)).toEqual([
-				"actual result",
-				"Cannot make that change.",
-				"The requested review is complete.",
+			expect(port.publications.map(item => [item.kind, item.text])).toEqual([
+				["reply", "actual result"],
+				["reply", "Cannot make that change."],
+				["publish", "The requested review is complete."],
 			]);
 			const report: ModeRequest = {
 				op: "report",
@@ -1139,6 +1147,55 @@ describe("durable Discord mode broker", () => {
 			await expect(broker.request({ ...report, lease: lease(resumedSession) })).rejects.toThrow();
 			expect(port.publications.length).toBe(4);
 		} finally {
+			await broker.close();
+		}
+	});
+
+	it("accepts final replies beyond the report bound, routes them to one reply, and keeps reports bounded", async () => {
+		using temporary = TempDir.createSync("@discord-broker-long-reply-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		const socketPath = path.join(root, "ipc.sock");
+		const token = "offline-long-reply-fixture-token-123456";
+		const server = await startDiscordModeServer({ broker, socketPath, token });
+		const client = await connectDiscordModeAt(socketPath, token);
+		try {
+			const a = await client.request(registration(root, "long"));
+			expect(a.maxReply).toBe(DISCORD_MODE_MAX_REPLY);
+			const complete = async (text: string, via: { request(input: ModeRequest): Promise<ModeSnapshot> }) => {
+				await port.owner(a, "write a long answer");
+				const polled = await via.request({ op: "poll", lease: lease(a), busy: false, pendingInput: false });
+				expect(polled.maxReply).toBe(DISCORD_MODE_MAX_REPLY);
+				return via.request({
+					op: "receipt",
+					lease: lease(a),
+					deliveryId: polled.deliveries[0]!.id,
+					state: "completed",
+					text,
+				});
+			};
+			await complete("x".repeat(DISCORD_MODE_MAX_TEXT + 1), broker);
+			// Worst-case JSON escaping doubles every byte; the whole receipt must still cross authenticated IPC.
+			const longest = '"'.repeat(DISCORD_MODE_MAX_REPLY);
+			await complete(longest, client);
+			await expect(complete(`${longest}x`, broker)).rejects.toThrow("text/byte limits");
+			await expect(
+				broker.request({
+					op: "report",
+					lease: lease(a),
+					requestId: "long-report",
+					text: "x".repeat(DISCORD_MODE_MAX_TEXT + 1),
+				}),
+			).rejects.toThrow("text/byte limits");
+			expect(port.publications.map(item => [item.kind, item.text.length])).toEqual([
+				["reply", DISCORD_MODE_MAX_TEXT + 1],
+				["reply", DISCORD_MODE_MAX_REPLY],
+			]);
+		} finally {
+			await client.close();
+			await server.close();
 			await broker.close();
 		}
 	});

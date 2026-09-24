@@ -14,6 +14,7 @@ import {
 	DISCORD_MODE_MAX_FRAME,
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_SESSIONS,
+	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
 	type BindingState,
 	type ChannelInspection,
@@ -58,6 +59,12 @@ const Text = type("string")
 	.atMostLength(DISCORD_MODE_MAX_TEXT)
 	.matching(/^[^\x00-\x08\x0b\x0c\x0e-\x1f]*$/)
 	.narrow(value => Buffer.byteLength(value) <= DISCORD_MODE_MAX_TEXT);
+/** Final reply receipts only; everything else stays within Text. */
+const ReplyText = type("string")
+	.atLeastLength(1)
+	.atMostLength(DISCORD_MODE_MAX_REPLY)
+	.matching(/^[^\x00-\x08\x0b\x0c\x0e-\x1f]*$/)
+	.narrow(value => Buffer.byteLength(value) <= DISCORD_MODE_MAX_REPLY);
 const Label = type("string")
 	.atLeastLength(1)
 	.atMostLength(100)
@@ -100,7 +107,7 @@ const RequestShape = type.or(
 		lease: LeaseShape,
 		deliveryId: Id,
 		state: "'accepted' | 'completed' | 'rejected'",
-		"text?": Text,
+		"text?": ReplyText,
 		"+": "reject",
 	},
 	{ op: "'resolve-delivery'", lease: LeaseShape, requestId: RequestId, deliveryId: Id, "+": "reject" },
@@ -981,7 +988,7 @@ export class DiscordModeBroker {
 			delivery.state = input.state;
 			try {
 				if (input.text !== undefined)
-					await this.#external(() => this.#port.publish(session.channelId!, input.text!, key), session);
+					await this.#external(() => this.#port.reply(session.channelId!, input.text!, key), session);
 				if (input.state !== "accepted")
 					this.#journal.deliveries = this.#journal.deliveries.filter(item => item.id !== delivery.id);
 			} catch (error) {
@@ -1755,6 +1762,7 @@ export class DiscordModeBroker {
 			deliveries: [],
 			answers: [],
 			gatewayConnected: this.#gateway,
+			maxReply: DISCORD_MODE_MAX_REPLY,
 		};
 	}
 

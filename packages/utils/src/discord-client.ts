@@ -7,6 +7,7 @@ import {
 	DISCORD_MODE_MAX_FRAME,
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_SESSIONS,
+	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
 	DISCORD_MODE_PROTOCOL,
 	type DiscordModeInfo,
@@ -74,7 +75,10 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 			return (
 				identifier(value.deliveryId) &&
 				["accepted", "completed", "rejected"].includes(String(value.state)) &&
-				(value.text === undefined || text(value.text, DISCORD_MODE_MAX_TEXT, true))
+				(value.text === undefined ||
+					// UTF-16 length never exceeds UTF-8 bytes, so the length check is a cheap prefilter.
+					(text(value.text, DISCORD_MODE_MAX_REPLY, true) &&
+						Buffer.byteLength(value.text) <= DISCORD_MODE_MAX_REPLY))
 			);
 		case "resolve-delivery":
 			return identifier(value.requestId) && identifier(value.deliveryId);
@@ -280,7 +284,9 @@ function snapshot(value: unknown): value is ModeSnapshot {
 				typeof item.id === "string" &&
 				typeof item.cancelled === "boolean" &&
 				(item.value === undefined || typeof item.value === "string" || typeof item.value === "boolean"),
-		)
+		) &&
+		(value.maxReply === undefined ||
+			(typeof value.maxReply === "number" && Number.isSafeInteger(value.maxReply) && value.maxReply > 0))
 	);
 }
 

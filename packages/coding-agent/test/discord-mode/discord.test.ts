@@ -30,7 +30,7 @@ import {
 } from "discord.js";
 import { DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
 import { DiscordAdapter } from "../../src/discord-mode/discord";
-import type { DiscordPortHandlers } from "@oh-my-pi/pi-wire/discord-mode";
+import { DISCORD_MODE_MAX_REPLY, type DiscordPortHandlers } from "@oh-my-pi/pi-wire/discord-mode";
 
 const GUILD = "100000000000000001";
 const OWNER = "100000000000000002";
@@ -1126,6 +1126,40 @@ describe("Discord mode gateway adapter (offline)", () => {
 			expect(payload.enforceNonce).toBe(true);
 			expect(payload.embeds).toBeUndefined();
 		}
+	});
+
+	it("posts a long final reply once as a line-aligned preview with the exact full text attached", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const lines = ["```ts", ...Array.from({ length: 39 }, (_, index) => `${index}`.padEnd(99, "x"))];
+		const text = `${lines.join("\n")}\n界`;
+		await f.adapter.reply(CHANNEL, text, "receipt-1");
+		await f.adapter.reply(CHANNEL, text, "receipt-1");
+		expect(f.sent).toHaveLength(1);
+		const payload = f.sent[0]!;
+		// The last line break within 1800 chars ends line 18; an opened code fence is closed before the note.
+		expect(payload.content).toBe(`${lines.slice(0, 18).join("\n")}\n\`\`\`\n\n… full reply attached (4 KB)`);
+		expect(payload.content!.length).toBeLessThanOrEqual(2_000);
+		expect(payload.files).toHaveLength(1);
+		const attachment = payload.files![0] as AttachmentBuilder;
+		expect(attachment.name).toBe("haiso-reply.md");
+		expect(Buffer.from(attachment.attachment as Buffer).equals(Buffer.from(text, "utf8"))).toBe(true);
+		expect(payload.allowedMentions).toEqual({ parse: [], repliedUser: false });
+		expect(payload.enforceNonce).toBe(true);
+	});
+
+	it("posts a short final reply as one plain message and refuses empty or oversized replies", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const text = "y".repeat(2_000);
+		await f.adapter.reply(CHANNEL, text, "receipt-short");
+		await expect(f.adapter.reply(CHANNEL, "  ", "receipt-empty")).rejects.toThrow("text limit");
+		await expect(
+			f.adapter.reply(CHANNEL, "z".repeat(DISCORD_MODE_MAX_REPLY + 1), "receipt-oversized"),
+		).rejects.toThrow("text limit");
+		expect(f.sent).toHaveLength(1);
+		expect(f.sent[0]!.content).toBe(text);
+		expect(f.sent[0]!.files).toBeUndefined();
 	});
 
 	it("refuses nonce, channel, author, and webhook mismatches even when a matching post exists in history", async () => {

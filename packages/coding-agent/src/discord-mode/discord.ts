@@ -34,6 +34,7 @@ import {
 import { DiscordModeError } from "./broker";
 import { discordCategoryName, discordChannelName } from "./names";
 import {
+	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
 	type ChannelInspection,
 	type DiscordModeConfig,
@@ -56,6 +57,7 @@ const CARD_LIMIT = 256;
 const DIALOG_LIMIT = 256;
 const PENDING_SEND_LIMIT = 32;
 const SEND_CONFIRMATION_MS = 1_500;
+const REPLY_PREVIEW = 1_800;
 const READ_PERMISSIONS = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
 const WRITE_PERMISSIONS = READ_PERMISSIONS | PermissionFlagsBits.SendMessages;
 const BOT_PERMISSIONS = WRITE_PERMISSIONS | PermissionFlagsBits.AttachFiles | PermissionFlagsBits.EmbedLinks;
@@ -116,6 +118,24 @@ function chunks(text: string): string[] {
 		offset = end;
 	}
 	return result;
+}
+
+/** One-message reply: short text inline; long text as a line-aligned preview plus the full attachment. */
+function replyPayload(text: string): Pick<MessageCreateOptions, "content" | "files"> {
+	if (text.length <= 2_000) return { content: text };
+	const lineEnd = text.lastIndexOf("\n", REPLY_PREVIEW);
+	const aligned = lineEnd >= REPLY_PREVIEW / 2;
+	let end = aligned ? lineEnd : REPLY_PREVIEW;
+	if (/[\uDC00-\uDFFF]/.test(text[end]!)) end--;
+	let preview = text.slice(0, end).trimEnd();
+	if (!aligned) preview += "…";
+	// An unbalanced fence would swallow the attachment note into a code block.
+	if ((preview.match(/```/g)?.length ?? 0) % 2 === 1) preview += "\n```";
+	const size = Math.ceil(Buffer.byteLength(text) / 1024);
+	return {
+		content: `${preview}\n\n… full reply attached (${size} KB)`,
+		files: [new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "haiso-reply.md" })],
+	};
 }
 
 /** A single gateway client; native sessions and durable routing remain in the broker. */
@@ -722,6 +742,16 @@ export class DiscordAdapter implements DiscordPort {
 			const parts = chunks(text);
 			for (const [index, content] of parts.entries())
 				await this.#send(channel, `${operation}:${index + 1}/${parts.length}`, { content });
+		});
+	}
+
+	reply(channelId: string, text: string, key: string): Promise<void> {
+		if (!text.trim() || Buffer.byteLength(text) > DISCORD_MODE_MAX_REPLY)
+			return Promise.reject(new Error("Discord reply exceeds its text limit."));
+		const operation = `${PREFIX}reply:${digest(`${channelId}:${key}`)}`;
+		return this.#once(operation, async () => {
+			const channel = await this.#textChannel(channelId);
+			await this.#send(channel, operation, replyPayload(text));
 		});
 	}
 

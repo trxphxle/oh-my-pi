@@ -16,6 +16,7 @@ import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-pr
 import { describeDiscordMode, type DiscordModePresentation } from "./presentation";
 import {
 	DISCORD_MODE_MAX_PENDING,
+	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
 	type ModeDelivery,
 	type ModeDialog,
@@ -787,10 +788,12 @@ export class DiscordModeSession {
 				.filter(part => part.type === "text")
 				.map(part => part.text)
 				.join("\n");
+			// Old brokers omit maxReply and keep the report bound; never exceed this build's own limit.
+			const limit = Math.min(this.#snapshot?.maxReply ?? DISCORD_MODE_MAX_TEXT, DISCORD_MODE_MAX_REPLY);
 			const suffix = "\n[response truncated]";
 			text =
-				Buffer.byteLength(final) > DISCORD_MODE_MAX_TEXT
-					? truncateHeadBytes(final, DISCORD_MODE_MAX_TEXT - Buffer.byteLength(suffix)).text + suffix
+				Buffer.byteLength(final) > limit
+					? truncateHeadBytes(final, limit - Buffer.byteLength(suffix)).text + suffix
 					: final;
 		}
 		this.#active = undefined;

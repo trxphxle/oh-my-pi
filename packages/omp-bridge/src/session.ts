@@ -7,6 +7,7 @@ import { connectExistingDiscordMode, DiscordModeRequestError } from "@oh-my-pi/p
 import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	DISCORD_MODE_MAX_PENDING,
+	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
 	type ModeDelivery,
 	type ModeLease,
@@ -237,9 +238,9 @@ function userBoundary(message: AgentMessage): boolean {
 	return value.role === "user" || (value.role === "custom" && value.attribution === "user");
 }
 
-/** Collect only public text, without first materializing an unbounded model response. */
-function finalText(message: Extract<AgentMessage, { role: "assistant" }>): string | undefined {
-	const bytes = new Uint8Array(DISCORD_MODE_MAX_TEXT + 1);
+/** Collect only public text within `max` UTF-8 bytes, without first materializing an unbounded model response. */
+function finalText(message: Extract<AgentMessage, { role: "assistant" }>, max: number): string | undefined {
+	const bytes = new Uint8Array(max + 1);
 	const encoder = new TextEncoder();
 	let offset = 0;
 	let first = true;
@@ -256,7 +257,7 @@ function finalText(message: Extract<AgentMessage, { role: "assistant" }>): strin
 		first = false;
 		const encoded = encoder.encodeInto(part.text, bytes.subarray(offset));
 		offset += encoded.written;
-		if (encoded.read < part.text.length || offset > DISCORD_MODE_MAX_TEXT) {
+		if (encoded.read < part.text.length || offset > max) {
 			truncated = true;
 			break;
 		}
@@ -264,7 +265,7 @@ function finalText(message: Extract<AgentMessage, { role: "assistant" }>): strin
 	let suffix = "";
 	if (truncated) {
 		suffix = "\n[response truncated]";
-		offset = Math.min(offset, DISCORD_MODE_MAX_TEXT - Buffer.byteLength(suffix));
+		offset = Math.min(offset, max - Buffer.byteLength(suffix));
 		while (offset > 0 && bytes[offset]! >= 0x80 && bytes[offset]! < 0xc0) offset--;
 	}
 	const text = new TextDecoder().decode(bytes.subarray(0, offset)) + suffix;
@@ -698,12 +699,14 @@ export class BridgeSession {
 		}
 		const state = this.host.getState();
 		if (state.pendingInput || state.draft || state.pendingMessages) active.contaminated = true;
+		// Older brokers omit maxReply and accept only MAX_TEXT; never exceed this build's own bound.
+		const max = Math.min(attachment.snapshot.maxReply ?? DISCORD_MODE_MAX_TEXT, DISCORD_MODE_MAX_REPLY);
 		const text =
 			active.delivery.source === "owner" &&
 			!active.contaminated &&
 			!active.reported &&
 			assistant?.stopReason === "stop"
-				? finalText(assistant)
+				? finalText(assistant, max)
 				: undefined;
 		await this.#complete(attachment, active, text);
 	}

@@ -6,6 +6,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	DISCORD_MODE_MAX_FRAME,
+	DISCORD_MODE_MAX_REPLY,
+	DISCORD_MODE_MAX_TEXT,
 	DISCORD_MODE_PROTOCOL,
 	type ModeRequest,
 	type ModeSnapshot,
@@ -340,6 +342,36 @@ describe("protocol-only Discord attachment", () => {
 		cleanups.push(() => client.close());
 		await expect(client.request(request)).rejects.toMatchObject({ outcome: "unknown" });
 		expect(server.effects).toBe(1);
+	});
+
+	it("sends final-reply receipts up to the reply byte bound while reports keep the text bound", async () => {
+		const root = await directory();
+		const server = await endpoint(root);
+		const result = { ...snapshot, maxReply: DISCORD_MODE_MAX_REPLY };
+		server.respond = () => Response.json({ protocol: DISCORD_MODE_PROTOCOL, ok: true, result });
+		const client = await connectExistingDiscordMode(root);
+		cleanups.push(() => client.close());
+		const receipt = (text: string): ModeRequest => ({
+			op: "receipt",
+			lease: request.lease,
+			deliveryId: "delivery-1",
+			state: "completed",
+			text,
+		});
+		// Worst-case JSON escaping of the largest reply still fits one frame.
+		const longest = await client.request(receipt('"'.repeat(DISCORD_MODE_MAX_REPLY)));
+		expect(longest.maxReply).toBe(DISCORD_MODE_MAX_REPLY);
+		expect(server.effects).toBe(1);
+		// The bound is UTF-8 bytes, not UTF-16 units.
+		for (const text of ["x".repeat(DISCORD_MODE_MAX_REPLY + 1), "界".repeat(DISCORD_MODE_MAX_REPLY / 3 + 1)])
+			await expect(client.request(receipt(text))).rejects.toMatchObject({ outcome: "not-started" });
+		await expect(client.request({ ...request, text: "x".repeat(DISCORD_MODE_MAX_TEXT + 1) })).rejects.toMatchObject({
+			outcome: "not-started",
+		});
+		expect(server.effects).toBe(1);
+		server.respond = () =>
+			Response.json({ protocol: DISCORD_MODE_PROTOCOL, ok: true, result: { ...snapshot, maxReply: -1 } });
+		await expect(client.request(request)).rejects.toMatchObject({ outcome: "unknown" });
 	});
 
 	it("keeps a ping-only supervisor lease alive until close, then fails closed without reconnecting", async () => {
