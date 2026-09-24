@@ -689,13 +689,17 @@ function junitFailures(xml: string): Set<string> {
 	return failures;
 }
 
-/** Run a package's bun tests and return failing test keys; throws when failures cannot be attributed. */
+/**
+ * Run a package's bun tests and return failing test keys; throws when failures cannot be attributed.
+ * Full suites run in parallel; re-runs of failing files run serially so contention flakes drop out.
+ */
 async function runSuite(
 	session: Session,
 	label: string,
 	cwd: string,
 	targets: string[],
 	env: NodeJS.ProcessEnv,
+	parallel: boolean,
 ): Promise<Set<string>> {
 	session.say(`• ${label}`);
 	const report = path.join(env.TMPDIR ?? os.tmpdir(), `junit-${crypto.randomUUID()}.xml`);
@@ -706,8 +710,7 @@ async function runSuite(
 		[
 			process.execPath,
 			"test",
-			`--parallel=${width}`,
-			"--only-failures",
+			...(parallel ? [`--parallel=${width}`, "--only-failures"] : []),
 			"--reporter=junit",
 			`--reporter-outfile=${report}`,
 			...targets,
@@ -741,6 +744,11 @@ async function runSuite(
 	return failures;
 }
 
+/** `./file` targets for the test files named in failure keys (`file\0describe\0test`). */
+function testFiles(keys: Set<string>): string[] {
+	return [...new Set([...keys].map(key => `./${key.split("\0")[0]}`))];
+}
+
 /**
  * Run upstream suites of every package the fork touches; failures block only when they do not also
  * fail on the pure upstream tag.
@@ -766,8 +774,12 @@ async function upstreamSuites(
 			))
 		)
 			continue;
-		const keys = await runSuite(session, `Upstream suite: packages/${pkg}`, root, ["./test"], env);
-		if (keys.size) failing.push({ pkg, keys });
+		const keys = await runSuite(session, `Upstream suite: packages/${pkg}`, root, ["./test"], env, true);
+		if (!keys.size) continue;
+		// Parallel runs flake under contention; keep only failures that reproduce when run alone.
+		const again = await runSuite(session, `Re-run failing: packages/${pkg}`, root, testFiles(keys), env, false);
+		const confirmed = new Set([...keys].filter(key => again.has(key)));
+		if (confirmed.size) failing.push({ pkg, keys: confirmed });
 	}
 	if (!failing.length) return;
 	const total = failing.reduce((sum, entry) => sum + entry.keys.size, 0);
@@ -798,11 +810,9 @@ async function upstreamSuites(
 		for (const { pkg, keys } of failing) {
 			const root = path.join(baseline, "packages", pkg);
 			const files: string[] = [];
-			for (const file of new Set([...keys].map(key => key.split("\0")[0]!))) {
-				if (await exists(path.join(root, file))) files.push(`./${file}`);
-			}
+			for (const file of testFiles(keys)) if (await exists(path.join(root, file))) files.push(file);
 			const upstream = files.length
-				? await runSuite(session, `Baseline suite: packages/${pkg}`, root, files, env)
+				? await runSuite(session, `Baseline suite: packages/${pkg}`, root, files, env, false)
 				: new Set<string>();
 			for (const key of keys) {
 				if (!upstream.has(key)) blocking.push(`packages/${pkg}/${key.split("\0").filter(Boolean).join(" › ")}`);
