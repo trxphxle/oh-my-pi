@@ -68,6 +68,8 @@ export interface ModeDeletionEvent {
 	phase: "prepared" | "committed";
 	createdAt: number;
 }
+/** Owner @mention policy for one session; absent means `needs-you`. */
+export type ModeNotify = "all" | "needs-you" | "off";
 export interface ModeSession {
 	id: string;
 	groupId: string;
@@ -82,6 +84,7 @@ export interface ModeSession {
 	pendingInput: boolean;
 	state: BindingState;
 	retirement?: ModeRetirement;
+	notify?: ModeNotify;
 }
 export interface ModeEnrollment {
 	group: ModeGroup;
@@ -190,9 +193,10 @@ export interface ModeControlRequest {
 	id: string;
 	channelId: string;
 	ownerId: string;
-	action: "status" | "stop" | "queue" | "cancel" | "steer";
+	action: "status" | "stop" | "queue" | "cancel" | "steer" | "notify";
 	connectionId?: string;
 	deliveryId?: string;
+	notify?: ModeNotify;
 }
 export interface DiscordPortHandlers {
 	ownerMessage(input: {
@@ -223,10 +227,10 @@ export interface DiscordPort {
 	createChannel(categoryId: string, name: string, marker: string): Promise<RemoteChannel>;
 	rename(id: string, name: string): Promise<void>;
 	move(id: string, categoryId: string): Promise<void>;
-	/** Owner reports and notices; chunked into ordinary messages. */
+	/** Owner reports and notices; chunked into ordinary messages, never mentions. */
 	publish(channelId: string, text: string, key: string): Promise<void>;
-	/** Final owner reply; one message, long text attached in full. */
-	reply(channelId: string, text: string, key: string): Promise<void>;
+	/** Final owner reply; one message, long text attached in full. `mention` pings the owner. */
+	reply(channelId: string, text: string, key: string, options?: { mention?: boolean }): Promise<void>;
 	status(
 		channelId: string,
 		text: string,
@@ -235,7 +239,8 @@ export interface DiscordPort {
 		messageId?: string,
 		existingOnly?: boolean,
 	): Promise<string>;
-	showDialog(channelId: string, dialog: ModeDialog): Promise<void>;
+	/** `mention` pings the owner; the broker decides per session notify mode. */
+	showDialog(channelId: string, dialog: ModeDialog, options?: { mention?: boolean }): Promise<void>;
 	endDialog(channelId: string, dialogId: string): Promise<void>;
 	retire(channelId: string, sessionId: string, policy: ModeRetirementPolicy): Promise<void>;
 }

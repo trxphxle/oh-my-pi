@@ -1,9 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
+import { DISCORD_MODE_LONG_TURN_MS, DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
 import { connectDiscordModeAt } from "@oh-my-pi/pi-utils/discord-client";
 import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import {
@@ -37,10 +37,17 @@ const config = { guildId: "100", ownerId: "200", botToken: "offline-fixture-only
 class FixtureDiscord implements DiscordPort {
 	handlers: DiscordPortHandlers | undefined;
 	readonly channels = new Map<string, RemoteChannel>();
-	readonly publications: Array<{ kind: "publish" | "reply"; channelId: string; text: string; key: string }> = [];
+	readonly publications: Array<{
+		kind: "publish" | "reply";
+		channelId: string;
+		text: string;
+		key: string;
+		mention: boolean;
+	}> = [];
 	readonly cards = new Map<string, { id: string; text: string; connectionId?: string }>();
 	readonly legacyCards = new Set<string>();
 	readonly dialogs = new Map<string, ModeDialog>();
+	readonly shownDialogs: Array<{ title: string; mention: boolean }> = [];
 	readonly inaccessible = new Set<string>();
 	creates = 0;
 	statusCreates = 0;
@@ -134,14 +141,14 @@ class FixtureDiscord implements DiscordPort {
 		}
 	}
 	async publish(channelId: string, text: string, key: string): Promise<void> {
-		this.publications.push({ kind: "publish", channelId, text, key });
+		this.publications.push({ kind: "publish", channelId, text, key, mention: false });
 		if (this.failNextPublish) {
 			this.failNextPublish = false;
 			throw new Error("response lost after remote publication");
 		}
 	}
-	async reply(channelId: string, text: string, key: string): Promise<void> {
-		this.publications.push({ kind: "reply", channelId, text, key });
+	async reply(channelId: string, text: string, key: string, options?: { mention?: boolean }): Promise<void> {
+		this.publications.push({ kind: "reply", channelId, text, key, mention: options?.mention === true });
 		if (this.failNextPublish) {
 			this.failNextPublish = false;
 			throw new Error("response lost after remote publication");
@@ -173,8 +180,9 @@ class FixtureDiscord implements DiscordPort {
 		if (confirmation === "lost") throw new Error("response lost after remote status publication");
 		return confirmation === "invalid" ? "not-a-message-id" : card.id;
 	}
-	async showDialog(channelId: string, dialog: ModeDialog): Promise<void> {
+	async showDialog(channelId: string, dialog: ModeDialog, options?: { mention?: boolean }): Promise<void> {
 		this.dialogs.set(channelId, structuredClone(dialog));
+		this.shownDialogs.push({ title: dialog.title, mention: options?.mention === true });
 	}
 	async endDialog(channelId: string, dialogId: string): Promise<void> {
 		if (this.dialogs.get(channelId)?.id === dialogId) this.dialogs.delete(channelId);
@@ -1782,4 +1790,150 @@ describe("durable Discord mode broker", () => {
 			await broker.close();
 		}
 	}, 20_000);
+});
+
+describe("owner mention policy", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	/** Mocks the clock forward by at least `ms`, polling so the lease stays live across the gap. */
+	async function elapse(broker: DiscordModeBroker, session: ModeSnapshot, ms: number): Promise<void> {
+		let now = Date.now();
+		const until = now + ms;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		while (now < until) {
+			now = Math.min(now + 30_000, until);
+			await poll(broker, session, true);
+		}
+	}
+
+	async function ownerTurn(
+		broker: DiscordModeBroker,
+		port: FixtureDiscord,
+		session: ModeSnapshot,
+		reply: string,
+		duration = 0,
+	): Promise<void> {
+		await port.owner(session, `please: ${reply}`);
+		const delivery = (await poll(broker, session)).deliveries[0]!;
+		if (duration) await elapse(broker, session, duration);
+		await broker.request({
+			op: "receipt",
+			lease: lease(session),
+			deliveryId: delivery.id,
+			state: "completed",
+			text: reply,
+		});
+	}
+
+	function showDialog(broker: DiscordModeBroker, session: ModeSnapshot, id: string): Promise<ModeSnapshot> {
+		return broker.request({ op: "dialog", lease: lease(session), dialog: { id, kind: "confirm", title: id } });
+	}
+
+	it("pings once per needs-you exchange; concurrent and re-rendered dialogs stay silent", async () => {
+		using temporary = TempDir.createSync("@discord-mention-dialogs-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "dialogs"));
+			await showDialog(broker, session, "first");
+			await showDialog(broker, session, "concurrent");
+			await broker.request({ op: "dialog-end", lease: lease(session), dialogId: "first" });
+			await broker.request({ op: "dialog-end", lease: lease(session), dialogId: "concurrent" });
+			// A structured ask re-renders its next select right after the previous one ends.
+			await showDialog(broker, session, "rerender");
+			await broker.request({ op: "dialog-end", lease: lease(session), dialogId: "rerender" });
+			await elapse(broker, session, 30_000);
+			await showDialog(broker, session, "later");
+			expect(port.shownDialogs).toEqual([
+				{ title: "first", mention: true },
+				{ title: "concurrent", mention: false },
+				{ title: "rerender", mention: false },
+				{ title: "later", mention: true },
+			]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("pings needs-you final replies only after a long owner turn and never for reports", async () => {
+		using temporary = TempDir.createSync("@discord-mention-replies-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "replies"));
+			await ownerTurn(broker, port, session, "quick answer");
+			await ownerTurn(broker, port, session, "almost long answer", DISCORD_MODE_LONG_TURN_MS - 1_000);
+			await ownerTurn(broker, port, session, "long answer", DISCORD_MODE_LONG_TURN_MS);
+			await broker.request({ op: "report", lease: lease(session), requestId: "report", text: "progress report" });
+			expect(port.publications.map(item => [item.kind, item.text, item.mention])).toEqual([
+				["reply", "quick answer", false],
+				["reply", "almost long answer", false],
+				["reply", "long answer", true],
+				["publish", "progress report", false],
+			]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("pings every final reply in all mode and nothing in off mode", async () => {
+		using temporary = TempDir.createSync("@discord-mention-modes-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "modes"));
+			expect((await port.control(session, "notify", { notify: "all" })).text).toStartWith("Notifications: all.");
+			await ownerTurn(broker, port, session, "quick answer in all");
+			await port.control(session, "notify", { notify: "off" });
+			await showDialog(broker, session, "silent-approval");
+			await ownerTurn(broker, port, session, "long answer in off", DISCORD_MODE_LONG_TURN_MS);
+			expect(port.publications.map(item => [item.text, item.mention])).toEqual([
+				["quick answer in all", true],
+				["long answer in off", false],
+			]);
+			expect(port.shownDialogs).toEqual([{ title: "silent-approval", mention: false }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("sets /session notify while disconnected and keeps it across restart and re-register", async () => {
+		using temporary = TempDir.createSync("@discord-mention-persist-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const storePath = path.join(root, "private", "state.json");
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "persisted");
+			const session = await broker.request(input);
+			expect(session.session.notify).toBeUndefined();
+			expect((await port.control(session, "status")).text).toContain("Notifications: needs-you");
+			await expect(port.control(session, "notify")).rejects.toThrow("Invalid session control");
+			await expect(port.control(session, "status", { notify: "off" })).rejects.toThrow("Invalid session control");
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			// Restart revoked the lease; the preference is still owner-controllable.
+			await port.control(session, "notify", { notify: "off" });
+			expect((await port.control(session, "status")).text).toContain("Notifications: off");
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			const reconnected = await broker.request(resumed(input));
+			expect(reconnected.session.notify).toBe("off");
+			await showDialog(broker, reconnected, "after-reconnect");
+			expect(port.shownDialogs).toEqual([{ title: "after-reconnect", mention: false }]);
+		} finally {
+			await broker.close();
+		}
+	});
 });

@@ -43,6 +43,7 @@ import {
 	type ModeControlRequest,
 	type ModeControlResult,
 	type ModeDialog,
+	type ModeNotify,
 	type ModeRetirementPolicy,
 	type RemoteChannel,
 } from "@oh-my-pi/pi-wire/discord-mode";
@@ -120,9 +121,9 @@ function chunks(text: string): string[] {
 	return result;
 }
 
-/** One-message reply: short text inline; long text as a line-aligned preview plus the full attachment. */
-function replyPayload(text: string): Pick<MessageCreateOptions, "content" | "files"> {
-	if (text.length <= 2_000) return { content: text };
+/** One-message reply: short text inline; long text as a line-aligned preview plus the full attachment. `reserve` leaves room for a mention prefix. */
+function replyPayload(text: string, reserve = 0): Pick<MessageCreateOptions, "content" | "files"> {
+	if (text.length <= 2_000 - reserve) return { content: text };
 	const lineEnd = text.lastIndexOf("\n", REPLY_PREVIEW);
 	const aligned = lineEnd >= REPLY_PREVIEW / 2;
 	let end = aligned ? lineEnd : REPLY_PREVIEW;
@@ -331,6 +332,22 @@ export class DiscordAdapter implements DiscordPort {
 			.addSubcommand(command => command.setName("status").setDescription("Show the bound session's current state"))
 			.addSubcommand(command => command.setName("stop").setDescription("Request a stop of the current turn"))
 			.addSubcommand(command => command.setName("queue").setDescription("Inspect queued owner messages"))
+			.addSubcommand(command =>
+				command
+					.setName("notify")
+					.setDescription("Choose when Haiso mentions you in this session's channel")
+					.addStringOption(option =>
+						option
+							.setName("mode")
+							.setDescription("When to mention you")
+							.setRequired(true)
+							.addChoices(
+								{ name: "all — input requests and every final reply", value: "all" },
+								{ name: "needs-you — input requests and replies after long turns", value: "needs-you" },
+								{ name: "off — never mention", value: "off" },
+							),
+					),
+			)
 			.toJSON();
 		const current = guildCommands.find(command => owned(command) && command.name === "session");
 		const registered = current
@@ -698,7 +715,8 @@ export class DiscordAdapter implements DiscordPort {
 		}
 	}
 
-	async #send(channel: TextChannel, key: string, payload: MessageCreateOptions): Promise<Message> {
+	/** `mention` prefixes the owner ping and allows exactly that one user mention; everything else never pings. */
+	async #send(channel: TextChannel, key: string, payload: MessageCreateOptions, mention = false): Promise<Message> {
 		this.#requireGuild();
 		const nonce = digest(key).slice(0, 24);
 		if (this.#pendingSends.size >= PENDING_SEND_LIMIT || this.#pendingSends.has(nonce))
@@ -715,9 +733,10 @@ export class DiscordAdapter implements DiscordPort {
 		try {
 			return await channel.send({
 				...payload,
+				...(mention ? { content: `${this.#mentionPrefix()}${payload.content ?? ""}` } : {}),
 				nonce,
 				enforceNonce: true,
-				allowedMentions: MENTIONS,
+				allowedMentions: mention ? { parse: [], users: [this.#config.ownerId], repliedUser: false } : MENTIONS,
 			});
 		} catch {
 			// A matching live gateway event can prove a POST succeeded despite a lost REST response.
@@ -733,6 +752,10 @@ export class DiscordAdapter implements DiscordPort {
 		}
 	}
 
+	#mentionPrefix(): string {
+		return `<@${this.#config.ownerId}> `;
+	}
+
 	publish(channelId: string, text: string, key: string): Promise<void> {
 		if (!text.trim() || text.length > DISCORD_MODE_MAX_TEXT)
 			return Promise.reject(new Error("Discord report exceeds its text limit."));
@@ -745,13 +768,14 @@ export class DiscordAdapter implements DiscordPort {
 		});
 	}
 
-	reply(channelId: string, text: string, key: string): Promise<void> {
+	reply(channelId: string, text: string, key: string, options?: { mention?: boolean }): Promise<void> {
 		if (!text.trim() || Buffer.byteLength(text) > DISCORD_MODE_MAX_REPLY)
 			return Promise.reject(new Error("Discord reply exceeds its text limit."));
 		const operation = `${PREFIX}reply:${digest(`${channelId}:${key}`)}`;
+		const mention = options?.mention === true;
 		return this.#once(operation, async () => {
 			const channel = await this.#textChannel(channelId);
-			await this.#send(channel, operation, replyPayload(text));
+			await this.#send(channel, operation, replyPayload(text, mention ? this.#mentionPrefix().length : 0), mention);
 		});
 	}
 
@@ -907,7 +931,7 @@ export class DiscordAdapter implements DiscordPort {
 		});
 	}
 
-	async showDialog(channelId: string, dialog: ModeDialog): Promise<void> {
+	async showDialog(channelId: string, dialog: ModeDialog, options?: { mention?: boolean }): Promise<void> {
 		const token = digest(`${channelId}:${dialog.id}`).slice(0, 32);
 		const existing = this.#dialogs.get(token);
 		if (existing) {
@@ -942,12 +966,17 @@ export class DiscordAdapter implements DiscordPort {
 			const channel = await this.#textChannel(channelId);
 			let message = (await this.#findMessages(channel, new Set([marker]))).get(marker);
 			if (!message) {
-				message = await this.#send(channel, marker, {
-					content:
-						"Native session input. Read the attached FULL prompt before answering. Controls answer the original session; a local answer may win first. Input/editor limit: 4000 characters.",
-					files: [new AttachmentBuilder(Buffer.from(full, "utf8"), { name: "native-input.txt" })],
-					components: this.#dialogComponents(token, dialog),
-				});
+				message = await this.#send(
+					channel,
+					marker,
+					{
+						content:
+							"Native session input. Read the attached FULL prompt before answering. Controls answer the original session; a local answer may win first. Input/editor limit: 4000 characters.",
+						files: [new AttachmentBuilder(Buffer.from(full, "utf8"), { name: "native-input.txt" })],
+						components: this.#dialogComponents(token, dialog),
+					},
+					options?.mention === true,
+				);
 			} else {
 				await message.edit({ embeds: [], allowedMentions: MENTIONS });
 			}
@@ -1099,12 +1128,16 @@ export class DiscordAdapter implements DiscordPort {
 		let action: ModeControlRequest["action"];
 		let connectionId: string | undefined;
 		let deliveryId: string | undefined;
+		let notify: ModeNotify | undefined;
 		if (interaction.isChatInputCommand()) {
 			const subcommand = interaction.options.getSubcommand(false);
+			const mode = subcommand === "notify" ? interaction.options.getString("mode", false) : null;
+			if (mode === "all" || mode === "needs-you" || mode === "off") notify = mode;
 			if (
 				interaction.commandId !== this.#sessionCommandId ||
 				interaction.commandGuildId !== this.#config.guildId ||
-				(subcommand !== "status" && subcommand !== "stop" && subcommand !== "queue")
+				(subcommand !== "status" && subcommand !== "stop" && subcommand !== "queue" && subcommand !== "notify") ||
+				(subcommand === "notify" && !notify)
 			) {
 				await this.#reply(
 					interaction,
@@ -1175,6 +1208,7 @@ export class DiscordAdapter implements DiscordPort {
 				action,
 				...(connectionId ? { connectionId } : {}),
 				...(deliveryId ? { deliveryId } : {}),
+				...(notify ? { notify } : {}),
 			});
 			await this.#reply(interaction, result, interaction.channelId!);
 		} catch (error) {

@@ -99,11 +99,17 @@ command is needed. Queued-message acknowledgments offer **Send as guidance** and
 
 | Discord command | Behavior |
 | --- | --- |
-| `/session status` | Show the channel's session connection, activity, pending input, and queue counts. |
+| `/session status` | Show the channel's session connection, activity, pending input, queue counts, and notification mode. |
 | `/session stop` | Request cancellation of the current turn, not rollback or process shutdown. |
 | `/session queue` | Inspect waiting owner messages; select one to view its full text and available actions. |
+| `/session notify mode:<all \| needs-you \| off>` | Choose when this session @mentions you (default `needs-you`); works while disconnected and persists. |
 | `!steer <message>` | Send guidance to active work. |
 | `!abort` | Request the same turn cancellation as `/session stop`. |
+
+Mentions ping only the configured owner. `needs-you` pings when a session opens
+an approval or question (once per exchange, not per re-render) and when a reply
+arrives for a message that took 2 minutes or more. `all` also pings every reply;
+`off` never pings. Reports, status cards, acknowledgments, and peer traffic never ping.
 
 Only queued, non-held owner messages in the current connection can be cancelled
 or promoted to guidance. Dispatched work cannot be changed through queue controls;

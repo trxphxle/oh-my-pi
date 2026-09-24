@@ -382,14 +382,14 @@ function fixture() {
 		return { event: event as unknown as Interaction, responses, modals, payloads, acknowledgements };
 	}
 
-	function slash(subcommand: string, overrides: Record<string, unknown> = {}) {
+	function slash(subcommand: string, overrides: Record<string, unknown> = {}, strings: Record<string, string> = {}) {
 		return interaction("", {
 			commandName: "session",
 			commandId: [...guildCommands.values()].find(
 				command => command.name === "session" && command.type === ApplicationCommandType.ChatInput,
 			)?.id,
 			commandGuildId: GUILD,
-			options: { getSubcommand: () => subcommand },
+			options: { getSubcommand: () => subcommand, getString: (name: string) => strings[name] ?? null },
 			isChatInputCommand: () => true,
 			isButton: () => false,
 			isMessageComponent: () => false,
@@ -509,7 +509,15 @@ describe("Discord mode gateway adapter (offline)", () => {
 		const session = [...f.guildCommands.values()].find(command => command.name === "session")!;
 		expect(session.id).toBe(oldSession.id);
 		expect(session.default_member_permissions).toBeNull();
-		expect(session.options?.map(option => option.name)).toEqual(["status", "stop", "queue"]);
+		expect(session.options?.map(option => option.name)).toEqual(["status", "stop", "queue", "notify"]);
+		const notify = session.options?.find(option => option.name === "notify");
+		const mode = notify && "options" in notify ? notify.options?.[0] : undefined;
+		expect(mode && { name: mode.name, required: mode.required }).toEqual({ name: "mode", required: true });
+		expect(mode && "choices" in mode ? mode.choices?.map(choice => choice.value) : undefined).toEqual([
+			"all",
+			"needs-you",
+			"off",
+		]);
 		expect(f.commandRequests.slice(0, 2).map(request => request.method)).toEqual(["GET", "GET"]);
 		expect(f.client.rest.put).not.toHaveBeenCalled();
 
@@ -604,6 +612,47 @@ describe("Discord mode gateway adapter (offline)", () => {
 		expect(request.responses[0]).toContain("uncertain");
 		expect(request.responses[0]).not.toContain("private-token");
 		expect(request.payloads[0]?.allowedMentions).toEqual({ parse: [], repliedUser: false });
+	});
+
+	it("routes /session notify with its mode to the broker and refuses unknown modes", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const unknown = f.slash("notify", {}, { mode: "loud" });
+		f.client.emit(Events.InteractionCreate, unknown.event);
+		await settleEvents();
+		expect(f.controls).toEqual([]);
+		expect(unknown.responses[0]).toContain("outdated");
+		const request = f.slash("notify", {}, { mode: "off" });
+		f.client.emit(Events.InteractionCreate, request.event);
+		await settleEvents();
+		expect(
+			f.controls.map(({ channelId, ownerId, action, notify }) => ({ channelId, ownerId, action, notify })),
+		).toEqual([{ channelId: CHANNEL, ownerId: OWNER, action: "notify", notify: "off" }]);
+		expect(request.acknowledgements).toEqual([{ flags: MessageFlags.Ephemeral }]);
+	});
+
+	it("mentions exactly the owner on flagged replies and dialogs, keeping replies within one 2000-character message", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const ownerOnly = { parse: [], users: [OWNER], repliedUser: false };
+		await f.adapter.reply(CHANNEL, "short answer", "receipt-short", { mention: true });
+		// Fits inline without the ping; the prefix pushes it to preview plus attachment.
+		const full = "y".repeat(2_000);
+		await f.adapter.reply(CHANNEL, full, "receipt-full", { mention: true });
+		await f.adapter.showDialog(CHANNEL, { id: "approve", kind: "confirm", title: "Approve?" }, { mention: true });
+		await f.adapter.reply(CHANNEL, "quiet answer", "receipt-quiet", { mention: false });
+		const [short, long, dialog, quiet] = f.sent;
+		expect(short!.content).toBe(`<@${OWNER}> short answer`);
+		expect(long!.content!.startsWith(`<@${OWNER}> y`)).toBe(true);
+		expect(long!.content!.length).toBeLessThanOrEqual(2_000);
+		expect(long!.files).toHaveLength(1);
+		const attachment = long!.files![0] as AttachmentBuilder;
+		expect(Buffer.from(attachment.attachment as Buffer).toString("utf8")).toBe(full);
+		expect(dialog!.content!.startsWith(`<@${OWNER}> Native session input.`)).toBe(true);
+		expect((dialog!.files![0] as AttachmentBuilder).name).toBe("native-input.txt");
+		for (const payload of [short, long, dialog]) expect(payload!.allowedMentions).toEqual(ownerOnly);
+		expect(quiet!.content).toBe("quiet answer");
+		expect(quiet!.allowedMentions).toEqual({ parse: [], repliedUser: false });
 	});
 
 	it("preserves the full held queue without actionable controls when no generation is live", async () => {

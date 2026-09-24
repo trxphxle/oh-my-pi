@@ -30,6 +30,7 @@ import {
 	type ModeGroup,
 	type ModeLease,
 	type ModeRequest,
+	type ModeNotify,
 	type ModeSession,
 	type ModeSnapshot,
 	type RemoteChannel,
@@ -44,6 +45,16 @@ const MAX_DELIVERIES = 2048;
 const MAX_BACKLOG = 256;
 const MAX_DIALOGS = 8;
 const EFFECT_TIMEOUT_MS = 20_000;
+/** A final reply to an owner turn at least this old pings in `needs-you` mode. */
+export const DISCORD_MODE_LONG_TURN_MS = 120_000;
+/** A dialog opening this soon after the session's previous one ended continues that exchange; no new ping. */
+const DIALOG_MENTION_GRACE_MS = 5_000;
+const Notify = type("'all' | 'needs-you' | 'off'");
+const NOTIFY_DESCRIPTIONS: Record<ModeNotify, string> = {
+	all: "You are mentioned for input requests and every final reply.",
+	"needs-you": "You are mentioned for input requests and for final replies to turns that took 2 minutes or longer.",
+	off: "You are never mentioned; messages still arrive silently.",
+};
 const Id = type("string").matching(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 const RemoteId = type("string").matching(/^\d{1,22}$/);
 const RequestId = type("string")
@@ -171,6 +182,7 @@ const SessionShape = type({
 	seenAt: Timestamp,
 	uncertain: "boolean",
 	"retirement?": RetirementShape,
+	"notify?": Notify,
 	"+": "reject",
 });
 const DeliveryShape = type({
@@ -238,9 +250,10 @@ const ControlShape = type({
 	id: RequestId,
 	channelId: RemoteId,
 	ownerId: RemoteId,
-	action: "'status' | 'stop' | 'queue' | 'cancel' | 'steer'",
+	action: "'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify'",
 	"connectionId?": Id,
 	"deliveryId?": Id,
+	"notify?": Notify,
 	"+": "reject",
 });
 const RemoteAnswerShape = type({
@@ -275,6 +288,8 @@ export class DiscordModeBroker {
 	#timer: NodeJS.Timeout | undefined;
 	#reconcilePending = false;
 	#cursor = 0;
+	/** Last dialog end per session; volatile debounce for re-rendered asks, lost on restart by design. */
+	#dialogEnded = new Map<string, number>();
 
 	constructor(options: { config: DiscordModeConfig; storePath: string; port: DiscordPort }) {
 		RemoteId.assert(options.config.guildId);
@@ -988,7 +1003,13 @@ export class DiscordModeBroker {
 			delivery.state = input.state;
 			try {
 				if (input.text !== undefined)
-					await this.#external(() => this.#port.reply(session.channelId!, input.text!, key), session);
+					await this.#external(
+						() =>
+							this.#port.reply(session.channelId!, input.text!, key, {
+								mention: this.#replyMention(session, delivery, input.state),
+							}),
+						session,
+					);
 				if (input.state !== "accepted")
 					this.#journal.deliveries = this.#journal.deliveries.filter(item => item.id !== delivery.id);
 			} catch (error) {
@@ -1078,7 +1099,8 @@ export class DiscordModeBroker {
 				(input.deliveryId !== undefined &&
 					input.action !== "queue" &&
 					input.action !== "cancel" &&
-					input.action !== "steer")
+					input.action !== "steer") ||
+				(input.action === "notify") !== (input.notify !== undefined)
 			)
 				throw new Error("Invalid control fields");
 		} catch {
@@ -1108,6 +1130,12 @@ export class DiscordModeBroker {
 			(input.connectionId !== session.connectionId || !session.enabled || !session.connected)
 		)
 			throw new DiscordModeError("Session control belongs to a stale connection; use the current session controls.");
+		if (input.action === "notify") {
+			session.notify = input.notify!;
+			await this.#persist();
+			await this.#cards(this.#group(session.groupId));
+			return { text: `Notifications: ${input.notify}. ${NOTIFY_DESCRIPTIONS[input.notify!]}` };
+		}
 		const readOnly = input.action === "status" || input.action === "queue";
 		if (readOnly) await this.#cards(this.#group(session.groupId));
 		if (input.action === "status")
@@ -1187,6 +1215,7 @@ export class DiscordModeBroker {
 			throw new DiscordModeError("Session has eight pending dialogs; resolve existing local dialogs first.");
 		this.#checkPayload(Buffer.byteLength(JSON.stringify(input.dialog)));
 		await this.#perform(key, input, async () => {
+			const mention = this.#dialogMention(session);
 			this.#journal.dialogs.push({
 				sessionId: session.id,
 				connectionId: session.connectionId,
@@ -1196,13 +1225,31 @@ export class DiscordModeBroker {
 			await this.#persist();
 			await this.#external(
 				() =>
-					this.#port.showDialog(session.channelId!, {
-						...input.dialog,
-						id: digest([session.id, session.connectionId, input.dialog.id]),
-					}),
+					this.#port.showDialog(
+						session.channelId!,
+						{ ...input.dialog, id: digest([session.id, session.connectionId, input.dialog.id]) },
+						{ mention },
+					),
 				session,
 			);
 		});
+	}
+
+	/** Needs-you ping only when this dialog starts a new exchange; re-renders and concurrent dialogs stay silent. */
+	#dialogMention(session: Session): boolean {
+		if ((session.notify ?? "needs-you") === "off") return false;
+		if (this.#journal.dialogs.some(item => item.sessionId === session.id)) return false;
+		const ended = this.#dialogEnded.get(session.id);
+		return ended === undefined || Date.now() - ended >= DIALOG_MENTION_GRACE_MS;
+	}
+
+	/** Final owner-turn replies ping in `all` mode, or in `needs-you` once the owner waited at least LONG_TURN_MS. */
+	#replyMention(session: Session, delivery: Delivery, state: "accepted" | "completed" | "rejected"): boolean {
+		if (delivery.source !== "owner" || state !== "completed") return false;
+		const notify = session.notify ?? "needs-you";
+		return (
+			notify === "all" || (notify === "needs-you" && Date.now() - delivery.createdAt >= DISCORD_MODE_LONG_TURN_MS)
+		);
 	}
 
 	async #answer(raw: Parameters<DiscordPortHandlers["answer"]>[0]): Promise<string> {
@@ -1241,6 +1288,7 @@ export class DiscordModeBroker {
 	}
 
 	async #endDialog(session: Session, dialogId: string): Promise<void> {
+		const before = this.#journal.dialogs.length;
 		this.#journal.dialogs = this.#journal.dialogs.filter(
 			item =>
 				!(
@@ -1249,6 +1297,7 @@ export class DiscordModeBroker {
 					item.dialog.id === dialogId
 				),
 		);
+		if (this.#journal.dialogs.length !== before) this.#dialogEnded.set(session.id, Date.now());
 		await this.#persist();
 		if (!session.channelId || !this.#gateway || session.state !== "ready") return;
 		await this.#perform(
@@ -1687,7 +1736,7 @@ export class DiscordModeBroker {
 			else if (delivery.state === "accepted" || delivery.state === "dispatched") active++;
 			else if (delivery.state === "unknown") uncertain++;
 		}
-		return `Haiso · ${session.label}\nSession ${session.id}\nProject ${this.#group(session.groupId).name}\n${this.#sessionActivity(session)} · ${session.state}\nQueued ${queued} · active ${active} · uncertain ${uncertain}`;
+		return `Haiso · ${session.label}\nSession ${session.id}\nProject ${this.#group(session.groupId).name}\n${this.#sessionActivity(session)} · ${session.state}\nQueued ${queued} · active ${active} · uncertain ${uncertain}\nNotifications: ${session.notify ?? "needs-you"}`;
 	}
 
 	async #cards(group: Group): Promise<void> {

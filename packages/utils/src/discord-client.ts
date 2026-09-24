@@ -235,6 +235,10 @@ function session(value: unknown): value is ModeSession {
 		["enabled", "connected", "busy", "pendingInput"].every(key => typeof value[key] === "boolean") &&
 		binding(value.state) &&
 		(value.channelId === undefined || typeof value.channelId === "string") &&
+		(value.notify === undefined ||
+			value.notify === "all" ||
+			value.notify === "needs-you" ||
+			value.notify === "off") &&
 		(value.retirement === undefined ||
 			(retirement(value.retirement) &&
 				record(value.retirement) &&
