@@ -24,6 +24,8 @@ export function describeDiscordMode(options: {
 	enabled: boolean;
 	snapshot?: ModeSnapshot;
 	transportAvailable?: boolean;
+	/** Why automatic reconnect stopped; absent while reconnect is still automatic. */
+	reconnectBlocked?: string;
 	intakeHeld?: boolean;
 	pendingInput?: boolean;
 	working?: boolean;
@@ -52,12 +54,14 @@ export function describeDiscordMode(options: {
 	) {
 		state = "disconnected";
 		title = "Discord ON · DISCONNECTED";
-		detail =
-			!options.transportAvailable || !snapshot
-				? "Cannot reach the local bridge. Local work continues; turn off, then on to reconnect."
+		const fallback = "If it stays disconnected, turn off, then on.";
+		detail = options.reconnectBlocked
+			? `${options.reconnectBlocked} Automatic reconnect stopped; turn off, then on to reconnect.`
+			: !options.transportAvailable || !snapshot
+				? `Cannot reach the local bridge. Local work continues; reconnecting automatically. ${fallback}`
 				: !snapshot.gatewayConnected
 					? "Discord is unavailable. Check the network or bot access; local work continues."
-					: "This session lost its connection. Turn off, then on to reconnect.";
+					: `This session lost its connection; reconnecting automatically. ${fallback}`;
 	} else if (snapshot.group.state !== "ready" || snapshot.session.state !== "ready") {
 		state = "repair";
 		title = "Discord ON · NEEDS REPAIR";

@@ -227,7 +227,7 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 							ctx.showStatus(formatStatus(await mode.status(), mode.presentation), { dim: false });
 						} catch {
 							throw new Error(
-								"Discord connection may be unavailable or its lease revoked. Use /discord off, then /discord on to explicitly reconnect. Unknown work is never replayed; inspect /discord reconcile after reconnecting.",
+								"Discord connection may be unavailable or its lease revoked. Reconnect is automatic; if it stays disconnected, use /discord off, then /discord on. Unknown work is never replayed; inspect /discord reconcile after reconnecting.",
 							);
 						}
 						return;

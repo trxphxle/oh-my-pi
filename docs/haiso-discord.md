@@ -153,7 +153,7 @@ disappears. Peer input never grants owner approval.
 | `/discord repair` | Explicitly create a replacement, adopt a selected resource ID, or reconcile the retained binding. Group repair reuses surviving channels. Queued work stays held unless explicitly resumed. |
 | `/discord reconcile` | Inspect an uncertain operation and explicitly clear its fence without replaying it or claiming success. |
 | Session switch/fork/branch/disposal | Revoke the previous connection before identity changes. Re-enroll explicitly; the same saved session can reuse its channel. |
-| Lost/expired broker lease | Inspect status; use `/discord off`, then `/discord on` to establish a fresh connection. Unknown work remains fenced. |
+| Lost/expired broker lease (sleep, stall, broker restart) | Reconnects automatically with backoff (2s up to 60s) to the same channel. Held or uncertain messages stay fenced and are reported once; resume them with `/discord repair` / `/discord reconcile`. Auto-reconnect stops (use `/discord off`, then `/discord on`) if the enrollment is gone, the session was turned off or rebound elsewhere, or another process holds its connection. |
 | Permanent native session deletion | Retire the binding and pending input; retain Discord history by default, or delete the exact bound channel after an explicit local choice. |
 
 Transport reconnects do not replay uncertain prompts, approvals, publications, or

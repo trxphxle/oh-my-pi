@@ -121,6 +121,21 @@ export interface DiscordSessionOptions {
 const sessions = new WeakMap<DiscordSessionEngine, DiscordModeSession>();
 const enrolledFiles = new Map<string, DiscordModeSession>();
 
+const RECONNECT_BASE_MS = 2_000;
+const RECONNECT_MAX_MS = 60_000;
+/** A register whose response was lost may still own a lease until expiry; never mistake it for a foreign owner. */
+const MAX_ATTEMPTED_CONNECTIONS = 16;
+/**
+ * Service mismatches (the `DiscordModeClient.probe` config/protocol errors) need an explicit owner decision; every
+ * other reconnect failure is retried with backoff.
+ */
+const MANUAL_RECONNECT_FAILURE = /configuration differs|protocol does not match/;
+
+/** The broker's stored form: canonical directory plus basename. */
+async function canonicalSessionFile(file: string): Promise<string> {
+	return path.join(await canonicalProjectDir(path.dirname(file)), path.basename(file));
+}
+
 /** Existing engine owns every turn. This adapter only routes authorized deliveries and attributable output. */
 export class DiscordModeSession {
 	#client?: DiscordSessionClient;
@@ -131,7 +146,15 @@ export class DiscordModeSession {
 	#transportAvailable = false;
 	#journal?: DiscordReceiptJournal;
 	#epoch = 0;
+	/** Lease swaps keep the epoch (local dialogs, subscription, journal) but fence every older lease's results. */
+	#generation = 0;
 	#polling = false;
+	/** Monotonic deadline, set while a reconnect is due or in flight; polls on the dead lease are skipped until then. */
+	#reconnectAt?: number;
+	#reconnectDelay = RECONNECT_BASE_MS;
+	/** Why automatic reconnect stopped; only an explicit off/on (or a working lease) clears it. */
+	#reconnectBlocked?: string;
+	#attemptedConnections = new Set<string>();
 	#timer?: NodeJS.Timeout;
 	#unsubscribe?: () => void;
 	#queue: ModeDelivery[] = [];
@@ -173,6 +196,7 @@ export class DiscordModeSession {
 			enabled: this.enabled,
 			snapshot: this.#snapshot,
 			transportAvailable: this.#transportAvailable,
+			reconnectBlocked: this.#reconnectBlocked,
 			intakeHeld: this.#intakeHeld,
 			pendingInput: this.pendingInput,
 			working: this.engine.isStreaming || this.#options.isWorking?.(),
@@ -268,6 +292,10 @@ export class DiscordModeSession {
 		this.#localDialogs = 0;
 		this.#transportAvailable = false;
 		this.#queue = [];
+		this.#reconnectAt = undefined;
+		this.#reconnectDelay = RECONNECT_BASE_MS;
+		this.#reconnectBlocked = undefined;
+		this.#attemptedConnections.clear();
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		clearTimeout(this.#timer);
@@ -355,18 +383,25 @@ export class DiscordModeSession {
 			await this.off();
 			return;
 		}
+		// A lost lease never recovers by polling it again; wait out the reconnect backoff instead.
+		if (this.#reconnectAt !== undefined && performance.now() < this.#reconnectAt) return;
 		this.#polling = true;
 		const epoch = this.#epoch;
+		const generation = this.#generation;
 		try {
+			if (this.#reconnectAt !== undefined) {
+				await this.#reconnect(epoch);
+				return;
+			}
 			await this.#request({
 				op: "poll",
 				lease: this.#requireLease(),
 				busy: this.#busy(),
 				pendingInput: this.pendingInput,
 			});
-			if (epoch === this.#epoch && this.enabled && !this.#intakeHeld) await this.#drain(epoch);
+			if (this.#current(epoch, generation) && !this.#intakeHeld) await this.#drain(epoch, generation);
 		} catch {
-			if (epoch === this.#epoch) {
+			if (epoch === this.#epoch && generation === this.#generation) {
 				this.#dialogs.unavailable();
 				this.#transportAvailable = false;
 				this.#renderStatus();
@@ -374,6 +409,144 @@ export class DiscordModeSession {
 		} finally {
 			this.#polling = false;
 		}
+	}
+
+	/**
+	 * Re-lease the same enrolled conversation after its lease was lost (sleep, stall, broker restart). Never registers
+	 * an unknown session (that would create a channel), never replays work, and never goes through off/on, which would
+	 * drop local dialog state, the engine subscription, and the receipt journal.
+	 */
+	async #reconnect(epoch: number): Promise<void> {
+		const identity = this.#identity;
+		const file = this.#sessionFile;
+		const previous = this.#lease;
+		const generation = this.#generation;
+		if (!identity || !file || !previous) return;
+		if (this.engine.sessionFile !== file) {
+			this.#blockReconnect("This session's file changed since it was shared with Discord.");
+			return;
+		}
+		const live = () => this.#current(epoch, generation) && this.engine.sessionFile === file;
+		let client: DiscordSessionClient | undefined;
+		try {
+			// A fresh connection also restarts a broker that exited.
+			client = await (this.#options.connect ?? connectDiscordMode)();
+			if (!live()) return;
+			const projectDir = await canonicalProjectDir(this.engine.sessionManager.getCwd());
+			const enrollment = await client.lookup(projectDir, identity);
+			if (!live()) return;
+			const retained = enrollment?.session;
+			if (!enrollment || retained?.id !== identity) {
+				this.#blockReconnect(
+					"Discord no longer has this session's enrollment; reconnecting would create a new channel.",
+				);
+				return;
+			}
+			if (retained.retirement) {
+				await this.off();
+				this.#options.notify?.("This conversation was deleted from Discord; Discord mode is off.");
+				return;
+			}
+			if (!retained.enabled) {
+				this.#blockReconnect("Discord mode was turned off for this session elsewhere.");
+				return;
+			}
+			const sameFile = (await canonicalSessionFile(retained.sessionFile)) === (await canonicalSessionFile(file));
+			if (!live()) return;
+			if (!sameFile) {
+				this.#blockReconnect("Discord binds this session to a different session file.");
+				return;
+			}
+			const ours = retained.connectionId === previous.connectionId;
+			if (retained.connected && !ours && !this.#attemptedConnections.has(retained.connectionId)) {
+				this.#blockReconnect("Another process holds this session's Discord connection.");
+				return;
+			}
+			// Lookup never expires leases, so ours may still be live behind a dead or flaky transport.
+			let snapshot =
+				retained.connected && ours
+					? await client.request({ op: "status", lease: previous }).catch(() => undefined)
+					: undefined;
+			if (!live()) return;
+			let lease = previous;
+			if (!snapshot) {
+				const connectionId = crypto.randomUUID();
+				this.#attemptedConnections.add(connectionId);
+				if (this.#attemptedConnections.size > MAX_ATTEMPTED_CONNECTIONS)
+					this.#attemptedConnections.delete(this.#attemptedConnections.values().next().value!);
+				snapshot = await client.request({
+					op: "register",
+					requestId: crypto.randomUUID(),
+					sessionId: identity,
+					sessionFile: file,
+					projectDir,
+					connectionId,
+					label: retained.label,
+					groupName: enrollment.group.name,
+				});
+				if (!snapshot.lease) throw new Error("Discord broker did not grant a session lease.");
+				if (!live()) {
+					await client.request({ op: "off", lease: snapshot.lease }).catch(() => {});
+					return;
+				}
+				lease = snapshot.lease;
+			}
+			const replaced = this.#client;
+			this.#client = client;
+			client = replaced === client ? undefined : replaced;
+			this.#reconnectAt = undefined;
+			this.#reconnectDelay = RECONNECT_BASE_MS;
+			this.#attemptedConnections.clear();
+			if (lease === previous) {
+				this.#applySnapshot(snapshot);
+				return;
+			}
+			this.#lease = lease;
+			this.#generation++;
+			// Old-generation deliveries are unknown or held on the broker now; the journal already fences reinjection.
+			this.#queue = [];
+			this.#active = undefined;
+			this.#dialogs.unavailable();
+			this.#applySnapshot(snapshot);
+		} catch (error) {
+			if (!live()) return;
+			const message = error instanceof Error ? error.message : String(error);
+			if (MANUAL_RECONNECT_FAILURE.test(message)) this.#blockReconnect(message);
+			else this.#backoff();
+			return;
+		} finally {
+			await client?.close().catch(() => {});
+		}
+		// Only a fresh registration reaches here. Surface broker-held work once; it is never resumed automatically.
+		const generationAfter = this.#generation;
+		let held: number;
+		try {
+			const status = await this.status();
+			held = status.deliveries.filter(item => item.state === "queued" || item.state === "unknown").length;
+		} catch {
+			return; // #request already re-armed the reconnect backoff.
+		}
+		if (held && this.#current(epoch, generationAfter))
+			this.#options.notify?.(
+				`Discord reconnected; ${held} held or uncertain message(s) need /discord repair or /discord reconcile.`,
+			);
+	}
+
+	#backoff(): void {
+		this.#reconnectAt = performance.now() + this.#reconnectDelay;
+		this.#reconnectDelay = Math.min(this.#reconnectDelay * 2, RECONNECT_MAX_MS);
+	}
+
+	#blockReconnect(reason: string): void {
+		this.#reconnectAt = undefined;
+		this.#reconnectBlocked = reason;
+		this.#transportAvailable = false;
+		this.#renderStatus();
+		this.#options.notify?.(`${reason} Automatic Discord reconnect stopped; use /discord off, then /discord on.`);
+	}
+
+	#current(epoch: number, generation: number): boolean {
+		return epoch === this.#epoch && generation === this.#generation && this.enabled;
 	}
 
 	#schedulePoll(): void {
@@ -397,16 +570,23 @@ export class DiscordModeSession {
 	async #request(input: ModeRequest): Promise<ModeSnapshot> {
 		const client = this.#client;
 		const epoch = this.#epoch;
+		const generation = this.#generation;
 		if (!client || !this.enabled) throw new Error("Discord mode is off for this session.");
 		try {
 			const snapshot = await client.request(input);
-			if (epoch !== this.#epoch || !this.enabled)
-				throw new Error("Discord session lease changed; result discarded.");
+			if (!this.#current(epoch, generation)) throw new Error("Discord session lease changed; result discarded.");
+			if (input.op === "poll" || input.op === "status") {
+				// A working lease needs no reconnect.
+				this.#reconnectAt = undefined;
+				this.#reconnectDelay = RECONNECT_BASE_MS;
+				this.#reconnectBlocked = undefined;
+			}
 			this.#applySnapshot(snapshot, input.op === "poll");
 			return snapshot;
 		} catch (error) {
-			if (epoch === this.#epoch && this.enabled && (input.op === "poll" || input.op === "status")) {
+			if (this.#current(epoch, generation) && (input.op === "poll" || input.op === "status")) {
 				this.#transportAvailable = false;
+				if (this.#reconnectAt === undefined && this.#reconnectBlocked === undefined) this.#backoff();
 				this.#renderStatus();
 			}
 			throw error;
@@ -456,15 +636,16 @@ export class DiscordModeSession {
 
 	async #receipt(delivery: ModeDelivery, state: "accepted" | "completed" | "rejected", text?: string): Promise<void> {
 		const epoch = this.#epoch;
+		const generation = this.#generation;
 		const lease = this.#requireLease();
 		await this.#journal?.save({ id: delivery.id, state });
-		if (epoch !== this.#epoch || !this.enabled) return;
+		if (!this.#current(epoch, generation)) return;
 		await this.#request({ op: "receipt", lease, deliveryId: delivery.id, state, text });
 	}
 
-	async #drain(epoch: number): Promise<void> {
+	async #drain(epoch: number, generation: number): Promise<void> {
 		if (!this.#snapshot?.session.enabled) return;
-		while (epoch === this.#epoch && this.enabled && this.#queue.length) {
+		while (this.#current(epoch, generation) && this.#queue.length) {
 			const remoteReady =
 				this.#snapshot.gatewayConnected &&
 				this.#snapshot.session.state === "ready" &&
@@ -477,7 +658,7 @@ export class DiscordModeSession {
 			if (this.#journal?.has(delivery.id)) continue;
 			try {
 				await this.#journal?.save({ id: delivery.id, state: "attempted" });
-				if (epoch !== this.#epoch || !this.enabled) return;
+				if (!this.#current(epoch, generation)) return;
 				if (delivery.source !== "owner" && delivery.kind !== "message") {
 					await this.#receipt(delivery, "rejected");
 					continue;
@@ -491,11 +672,11 @@ export class DiscordModeSession {
 					continue;
 				}
 				await this.#receipt(delivery, "accepted");
-				if (epoch !== this.#epoch || !this.enabled) return;
+				if (!this.#current(epoch, generation)) return;
 				if (delivery.kind === "abort") {
 					if (this.#active) this.#active.contaminated = true;
 					await this.engine.abort({ reason: "Discord owner requested abort" });
-					if (epoch === this.#epoch && this.enabled) await this.#receipt(delivery, "completed");
+					if (this.#current(epoch, generation)) await this.#receipt(delivery, "completed");
 					continue;
 				}
 				const content =
@@ -521,7 +702,7 @@ export class DiscordModeSession {
 				if (delivery.kind === "steer" && this.engine.isStreaming) {
 					if (this.#active) this.#active.contaminated = true;
 					await this.engine.promptCustomMessage(message, { streamingBehavior: "steer" });
-					if (epoch === this.#epoch && this.enabled) await this.#receipt(delivery, "completed");
+					if (this.#current(epoch, generation)) await this.#receipt(delivery, "completed");
 					continue;
 				}
 				this.#active = {
@@ -542,7 +723,7 @@ export class DiscordModeSession {
 				);
 				return;
 			} catch {
-				if (epoch === this.#epoch) {
+				if (epoch === this.#epoch && generation === this.#generation) {
 					this.#intakeHeld = true;
 					this.#options.notify?.(
 						"Discord intake outcome uncertain; no automatic replay. Inspect /discord status, then /discord reconcile before explicitly resuming queued work.",

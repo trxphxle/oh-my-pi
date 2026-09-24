@@ -18,8 +18,10 @@ import {
 	type ModeDelivery,
 	type ModeDialog,
 	type ModeRequest,
+	type ModeSession,
 	type ModeSnapshot,
 } from "@oh-my-pi/pi-wire/discord-mode";
+import { DiscordModeRequestError } from "@oh-my-pi/pi-utils/discord-client";
 import type { AgentSessionEvent } from "../../src/session/agent-session-events";
 import { normalizeCustomMessagePayload } from "../../src/session/messages";
 import { executeBuiltinSlashCommand } from "../../src/slash-commands/builtin-registry";
@@ -30,6 +32,21 @@ afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 	vi.restoreAllMocks();
 });
+
+interface FakeClock {
+	advance(ms: number): void;
+}
+
+/** Reconnect backoff reads the monotonic clock; tests advance it explicitly instead of sleeping. */
+function fakeClock(): FakeClock {
+	let now = performance.now();
+	vi.spyOn(performance, "now").mockImplementation(() => now);
+	return {
+		advance(ms) {
+			now += ms;
+		},
+	};
+}
 
 function assistant(text: string): AssistantMessage {
 	return {
@@ -64,9 +81,13 @@ async function fixture() {
 	const messages: AgentMessage[] = [];
 	const requests: ModeRequest[] = [];
 	const pending: ModeDelivery[] = [];
+	const notices: string[] = [];
 	const completed = Promise.withResolvers<Extract<ModeRequest, { op: "receipt" }>>();
 	let pollGate: Promise<ModeSnapshot> | undefined;
 	let statusDeliveries: ModeDelivery[] = [];
+	let connects = 0;
+	let connectFailure: Error | undefined;
+	let forgotten = false;
 	let snapshot: ModeSnapshot = {
 		group: { id: crypto.randomUUID(), projectDir: root, name: "Project", state: "ready", categoryId: "100" },
 		session: {
@@ -131,14 +152,23 @@ async function fixture() {
 		},
 	};
 	const client: DiscordSessionClient = {
-		lookup: async () => ({ group: snapshot.group, session: snapshot.session }),
+		lookup: async () => (forgotten ? undefined : { group: snapshot.group, session: snapshot.session }),
 		close: async () => {},
 		request: async input => {
 			requests.push(input);
+			// Like the broker, a lease only authorizes the live connection generation.
+			if (
+				"lease" in input &&
+				(!snapshot.session.connected || input.lease.connectionId !== snapshot.session.connectionId)
+			)
+				throw new DiscordModeRequestError(
+					"unknown",
+					"Session lease is invalid, expired, or revoked; reconnect explicitly. Discord mode did not confirm the result; outcome may be unknown. Inspect status before retrying.",
+				);
 			if (input.op === "register")
 				snapshot = {
 					...snapshot,
-					session: { ...snapshot.session, id: input.sessionId, connectionId: input.connectionId },
+					session: { ...snapshot.session, id: input.sessionId, connectionId: input.connectionId, connected: true },
 					lease: { sessionId: input.sessionId, connectionId: input.connectionId, token: "private-lease" },
 				};
 			if (input.op === "receipt" && input.state === "completed") completed.resolve(input);
@@ -149,7 +179,16 @@ async function fixture() {
 			};
 		},
 	};
-	const mode = new DiscordModeSession(engine, { connect: async () => client, receiptRoot: root, pollIntervalMs: 0 });
+	const mode = new DiscordModeSession(engine, {
+		connect: async () => {
+			connects++;
+			if (connectFailure) throw connectFailure;
+			return client;
+		},
+		receiptRoot: root,
+		pollIntervalMs: 0,
+		notify: text => notices.push(text),
+	});
 	cleanups.push(() => mode.off());
 	return {
 		root,
@@ -161,7 +200,27 @@ async function fixture() {
 		customs,
 		messages,
 		requests,
+		notices,
 		completed: completed.promise,
+		registers() {
+			return requests.filter(
+				(request): request is Extract<ModeRequest, { op: "register" }> => request.op === "register",
+			);
+		},
+		connects() {
+			return connects;
+		},
+		failConnect(error: Error | undefined) {
+			connectFailure = error;
+		},
+		/** Broker-side session state as the next lookup, poll, or status sees it. */
+		setSession(patch: Partial<ModeSession>) {
+			snapshot = { ...snapshot, session: { ...snapshot.session, ...patch } };
+		},
+		/** Broker state reset: the UUID is no longer enrolled. */
+		forget() {
+			forgotten = true;
+		},
 		async enroll() {
 			await mode.on("Project", "Session");
 		},
@@ -244,7 +303,8 @@ test("reconnects a saved Discord binding without asking to name a new channel", 
 });
 
 describe("native Discord session routing", () => {
-	test("connection loss stays visible across local activity until a fresh poll confirms recovery", async () => {
+	test("connection loss stays visible until a backed-off probe confirms the still-live lease", async () => {
+		const clock = fakeClock();
 		const f = await fixture();
 		await f.enroll();
 		const gate = Promise.withResolvers<ModeSnapshot>();
@@ -263,6 +323,13 @@ describe("native Discord session routing", () => {
 				session: { ...f.snapshot().session, state: "missing" },
 			}),
 		);
+		await f.mode.poll();
+		expect(f.mode.presentation.state).toBe("disconnected");
+		clock.advance(2_000);
+		await f.mode.poll();
+		// The lease never lapsed: recovery keeps it rather than revoking in-flight work with a new registration.
+		expect(f.registers()).toHaveLength(1);
+		expect(f.mode.presentation.state).toBe("connected");
 		await f.mode.poll();
 		expect(f.mode.presentation.state).toBe("repair");
 		f.deferPoll(Promise.resolve(f.snapshot()));
@@ -406,6 +473,164 @@ describe("native Discord session routing", () => {
 		expect(f.customs).toHaveLength(1);
 		f.finish("Local peer final");
 		expect((await f.completed).text).toBeUndefined();
+	});
+});
+
+describe("native Discord lease reconnect", () => {
+	/** First poll observes the lost lease; the next poll after the initial backoff reconnects. */
+	async function reconnectAfterLoss(mode: DiscordModeSession, clock: FakeClock) {
+		await mode.poll();
+		expect(mode.presentation.state).toBe("disconnected");
+		clock.advance(2_000);
+		await mode.poll();
+	}
+
+	test("a lost lease re-registers the retained enrollment once and keeps local dialogs and intake", async () => {
+		const clock = fakeClock();
+		const f = await fixture();
+		await f.enroll();
+		const endDialog = f.mode.beginLocalDialog();
+		f.setSession({ connected: false, label: "Renamed in Discord" });
+		await reconnectAfterLoss(f.mode, clock);
+		const [enrolled, reconnected] = f.registers();
+		expect(f.registers()).toHaveLength(2);
+		// Retained names from lookup: the broker reuses the existing channel; nothing asks for a new one.
+		expect(reconnected).toMatchObject({ sessionId: f.state.id, label: "Renamed in Discord", groupName: "Project" });
+		expect(reconnected!.connectionId).not.toBe(enrolled!.connectionId);
+		expect(f.mode.enabled).toBe(true);
+		expect(f.mode.presentation.state).toBe("connected");
+		expect(f.mode.pendingInput).toBe(true);
+		expect(f.notices).toEqual([]);
+
+		await f.mode.poll();
+		expect(f.requests.filter(request => request.op === "poll").at(-1)).toMatchObject({
+			lease: { connectionId: reconnected!.connectionId },
+			pendingInput: true,
+		});
+		endDialog();
+		expect(f.mode.pendingInput).toBe(false);
+		f.queue(f.delivery());
+		await f.mode.poll();
+		expect(f.prompts).toHaveLength(1);
+	});
+
+	test("a forgotten enrollment is never registered again, which would create a new channel", async () => {
+		const clock = fakeClock();
+		const f = await fixture();
+		await f.enroll();
+		f.setSession({ connected: false });
+		f.forget();
+		await reconnectAfterLoss(f.mode, clock);
+		expect(f.registers()).toHaveLength(1);
+		expect(f.mode.enabled).toBe(true);
+		expect(f.mode.presentation.state).toBe("disconnected");
+		expect(f.notices).toHaveLength(1);
+		clock.advance(60_000);
+		await f.mode.poll();
+		expect(f.connects()).toBe(2);
+		expect(f.registers()).toHaveLength(1);
+	});
+
+	test("a foreign live connection is never displaced", async () => {
+		const clock = fakeClock();
+		const f = await fixture();
+		await f.enroll();
+		f.setSession({ connectionId: crypto.randomUUID() });
+		await reconnectAfterLoss(f.mode, clock);
+		expect(f.registers()).toHaveLength(1);
+		expect(f.mode.enabled).toBe(true);
+		expect(f.mode.presentation.state).toBe("disconnected");
+		expect(f.notices).toHaveLength(1);
+		clock.advance(60_000);
+		await f.mode.poll();
+		expect(f.connects()).toBe(2);
+		expect(f.registers()).toHaveLength(1);
+	});
+
+	test("a retired conversation turns Discord off instead of reconnecting", async () => {
+		const clock = fakeClock();
+		const f = await fixture();
+		await f.enroll();
+		f.setSession({
+			connected: false,
+			retirement: { eventId: crypto.randomUUID(), policy: "retain", deletedAt: 1, state: "done" },
+		});
+		await reconnectAfterLoss(f.mode, clock);
+		expect(f.registers()).toHaveLength(1);
+		expect(f.mode.enabled).toBe(false);
+		expect(f.mode.presentation.state).toBe("off");
+	});
+
+	test("held and uncertain work after reconnect is reported once and never resumed", async () => {
+		const clock = fakeClock();
+		const f = await fixture();
+		await f.enroll();
+		const running = f.delivery();
+		f.queue(running);
+		await f.mode.poll();
+		expect(f.prompts).toHaveLength(1);
+		// Dispatched while the engine is busy, so it waits locally behind the running turn.
+		const waiting = f.delivery();
+		f.queue(waiting);
+		await f.mode.poll();
+		// Revocation made both dispatched deliveries unknown and held a queued message.
+		f.setSession({ connected: false });
+		f.statusDeliveries([
+			{ ...running, state: "unknown" },
+			{ ...waiting, state: "unknown" },
+			f.delivery({ state: "queued" }),
+		]);
+		await reconnectAfterLoss(f.mode, clock);
+		expect(f.registers()).toHaveLength(2);
+		expect(f.notices).toHaveLength(1);
+		expect(f.notices[0]).toMatch(/\b3\b/);
+		expect(f.mode.presentation.state).toBe("held");
+
+		// The old-generation turn still finishes locally but is never published, and waiting work never runs.
+		f.finish("Late result");
+		await f.mode.poll();
+		await f.mode.poll();
+		expect(f.requests.filter(request => request.op === "receipt" && request.state === "completed")).toEqual([]);
+		expect(f.requests.some(request => request.op === "repair")).toBe(false);
+		expect(f.prompts).toHaveLength(1);
+		expect(f.notices).toHaveLength(1);
+	});
+
+	test("transport failures back off exponentially, register once, and reset the backoff on success", async () => {
+		const clock = fakeClock();
+		const f = await fixture();
+		await f.enroll();
+		f.setSession({ connected: false });
+		f.failConnect(
+			new DiscordModeRequestError(
+				"not-started",
+				"Discord mode socket is unavailable or unsafe; the request was not sent.",
+			),
+		);
+		await f.mode.poll();
+		const attempts: number[] = [];
+		for (const step of [1_999, 1, 1_000, 3_000, 7_999, 1]) {
+			clock.advance(step);
+			await f.mode.poll();
+			attempts.push(f.connects());
+		}
+		// Enrollment connected once; retries land at 2s, then 4s and 8s after each failure.
+		expect(attempts).toEqual([1, 2, 2, 3, 3, 4]);
+		// The dead lease is not polled while a reconnect is pending.
+		expect(f.requests.filter(request => request.op === "poll")).toHaveLength(1);
+		f.failConnect(undefined);
+		clock.advance(15_999);
+		await f.mode.poll();
+		expect(f.registers()).toHaveLength(1);
+		clock.advance(1);
+		await f.mode.poll();
+		expect(f.registers()).toHaveLength(2);
+		await f.mode.poll();
+		expect(f.mode.presentation.state).toBe("connected");
+
+		f.setSession({ connected: false });
+		await reconnectAfterLoss(f.mode, clock);
+		expect(f.registers()).toHaveLength(3);
 	});
 });
 
