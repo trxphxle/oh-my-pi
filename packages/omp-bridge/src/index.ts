@@ -274,18 +274,15 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 		},
 	});
 
-	const z = pi.zod;
-	const parameters = z.object({
-		action: z
-			.enum(["peers", "send", "report"])
-			.describe("List attached peers, send peer data, or publish an explicit report"),
-		recipientId: z.string().optional().describe("Exact peer ID from peers; required for send"),
-		text: z
-			.string()
-			.min(1)
-			.max(DISCORD_MODE_MAX_TEXT)
-			.optional()
-			.describe("Message or report text; required for send/report (maximum 12000 UTF-8 bytes)"),
+	// Native omptype schema (like the in-app discord tool); zod-compat schemas trip an
+	// order-dependent variance check against registerTool's TSchema constraint in tsgo.
+	const type = pi.arktype;
+	const parameters = type({
+		action: type("'peers' | 'send' | 'report'").describe(
+			"List attached peers, send peer data, or publish an explicit report",
+		),
+		"recipientId?": type("string").describe("Exact peer ID from peers; required for send"),
+		"text?": type("string").describe("Message or report text; required for send/report (maximum 12000 UTF-8 bytes)"),
 	});
 	pi.registerTool({
 		name: TOOL_NAME,
@@ -296,7 +293,7 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 		approval: args =>
 			args !== null && typeof args === "object" && "action" in args && args.action === "peers" ? "read" : "write",
 		parameters,
-		async execute(toolCallId, params: typeof parameters._output, signal, _onUpdate, ctx) {
+		async execute(toolCallId, params: typeof parameters.infer, signal, _onUpdate, ctx) {
 			await useContext(ctx);
 			if (!session?.enabled) throw new Error("Bridge is off. The local owner must use /bridge on.");
 			if (signal?.aborted) throw new Error("Bridge action cancelled before dispatch.");

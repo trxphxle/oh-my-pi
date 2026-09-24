@@ -9,7 +9,7 @@ import type {
 	ExtensionContext,
 	ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
-import * as z from "@oh-my-pi/omptype/zod";
+import { type } from "@oh-my-pi/omptype";
 import type { ModeDelivery, ModeRequest, ModeSnapshot } from "@oh-my-pi/pi-wire/discord-mode";
 import { BRIDGE_MESSAGE_SOURCE, BRIDGE_OWNER_MESSAGE_TYPE, BRIDGE_PEER_MESSAGE_TYPE } from "../src/host";
 import { installBridge } from "../src/index";
@@ -148,7 +148,7 @@ async function fixture(saved = true) {
 	} as unknown as ExtensionCommandContext;
 	// All methods and state are fixture-local; no SDK module or global is patched.
 	const pi = {
-		zod: z,
+		arktype: type,
 		on(event: string, handler: Handler) {
 			const existing = handlers.get(event) ?? [];
 			existing.push(handler);
