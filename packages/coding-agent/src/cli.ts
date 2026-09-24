@@ -18,6 +18,7 @@ import type * as WorkerThreads from "node:worker_threads";
 import type { MessagePort } from "node:worker_threads";
 import type { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { CliConfig, CommandMetadata } from "@oh-my-pi/pi-utils/cli";
+import type * as RuntimeEnvironment from "@oh-my-pi/pi-utils/env";
 import type * as Postmortem from "@oh-my-pi/pi-utils/postmortem";
 import {
 	APP_NAME,
@@ -35,6 +36,8 @@ import {
 	COMPUTER_WORKER_ARG,
 	DAEMON_BROKER_WORKER_ARG,
 	DISCORD_MODE_WORKER_ARG,
+	HAISO_RELEASE_PROBE_ARG,
+	HAISO_UPDATE_WORKER_ARG,
 	LSP_MUX_WORKER_ARG,
 	STATS_ACTIVITY_WORKER_ARG,
 	TERMINAL_OUTPUT_WORKER_ARG,
@@ -42,6 +45,7 @@ import {
 import type * as JsProcessEntry from "./eval/js/process-entry";
 import type * as DiscordWorker from "./discord-mode/worker";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
+import type * as HaisoUpdater from "./haiso-update/engine";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -187,6 +191,23 @@ const TTS_WORKER_ARG = "__omp_worker_tts";
 const MNEMOPI_EMBED_WORKER_ARG = "__omp_worker_mnemopi_embed";
 
 async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
+	if (arg === HAISO_RELEASE_PROBE_ARG) {
+		const { isCompiledBinary }: typeof RuntimeEnvironment = require("@oh-my-pi/pi-utils/env.js");
+		process.stdout.write(
+			`${JSON.stringify({
+				bunVersion: Bun.version,
+				executable: process.execPath,
+				compiled: isCompiledBinary(),
+				brokerNamespace: process.env.HAISO_DAEMON_NAMESPACE,
+			})}\n`,
+		);
+		return true;
+	}
+	if (arg === HAISO_UPDATE_WORKER_ARG) {
+		const { runHaisoUpdateWorker }: typeof HaisoUpdater = require("./haiso-update/engine");
+		await runHaisoUpdateWorker();
+		return true;
+	}
 	if (arg === DISCORD_MODE_WORKER_ARG) {
 		const { startDiscordModeWorker }: typeof DiscordWorker = require("./discord-mode/worker");
 		await startDiscordModeWorker();
@@ -592,6 +613,10 @@ export async function runCli(argv: string[]): Promise<void> {
 			process.stderr.write(`error: ${resolved.error}\n`);
 			process.exitCode = 1;
 			return;
+		}
+		if (isProcessEntry && resolved.argv[0] === "launch") {
+			const { scheduleHaisoUpdate }: typeof HaisoUpdater = require("./haiso-update/engine");
+			scheduleHaisoUpdate();
 		}
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
 	} finally {

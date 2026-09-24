@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ptree } from "@oh-my-pi/pi-utils";
+import { postmortem, ptree } from "@oh-my-pi/pi-utils";
 import { SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
 import { DiscordModeBroker } from "./broker";
 import {
@@ -158,6 +158,7 @@ export async function smokeTestDiscordModeWorker(): Promise<void> {
 	}
 }
 
+// The fallback entry must not impose top-level await on the compiled CLI's require graph.
 if (import.meta.main) {
-	await startDiscordModeWorker();
+	void startDiscordModeWorker().catch(postmortem.fatal);
 }

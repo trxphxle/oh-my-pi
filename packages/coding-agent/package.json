@@ -1,7 +1,7 @@
 {
 	"name": "@oh-my-pi/pi-coding-agent",
-	"version": "18.2.6",
-	"description": "Haiso coding agent, based on OMP with opt-in Discord session access",
+	"version": "18.3.0",
+	"description": "Coding agent CLI with read, bash, edit, write tools and session management",
 	"keywords": [
 		"agent",
 		"ai",
@@ -15,7 +15,7 @@
 		"url": "https://github.com/trxphxle/oh-my-pi/issues"
 	},
 	"license": "MIT",
-	"author": "Stencil Labs, Inc.",
+	"author": { "name": "Stencil Labs, Inc.", "url": "https://stencil.so" },
 	"contributors": [
 		"Mario Zechner"
 	],
@@ -237,6 +237,10 @@
 		"./extensibility/custom-commands/bundled/review": {
 			"types": "./src/extensibility/custom-commands/bundled/review/index.ts",
 			"import": "./src/extensibility/custom-commands/bundled/review/index.ts"
+		},
+		"./extensibility/custom-commands/bundled/annotate": {
+			"types": "./src/extensibility/custom-commands/bundled/annotate/index.ts",
+			"import": "./src/extensibility/custom-commands/bundled/annotate/index.ts"
 		},
 		"./extensibility/custom-tools": {
 			"types": "./src/extensibility/custom-tools/index.ts",
@@ -462,13 +466,13 @@
 			"types": "./src/tools/index.ts",
 			"import": "./src/tools/index.ts"
 		},
-		"./tools/hub": {
-			"types": "./src/tools/hub/index.ts",
-			"import": "./src/tools/hub/index.ts"
+		"./tools/jfind": {
+			"types": "./src/tools/jfind/index.ts",
+			"import": "./src/tools/jfind/index.ts"
 		},
-		"./tools/hub/*": {
-			"types": "./src/tools/hub/*.ts",
-			"import": "./src/tools/hub/*.ts"
+		"./tools/jfind/*": {
+			"types": "./src/tools/jfind/*.ts",
+			"import": "./src/tools/jfind/*.ts"
 		},
 		"./tools/*": {
 			"types": "./src/tools/*.ts",
@@ -545,6 +549,7 @@
 		"@opentelemetry/sdk-metrics": "catalog:",
 		"@opentelemetry/sdk-trace-base": "catalog:",
 		"@opentelemetry/sdk-trace-node": "catalog:",
+		"axe-core": "4.13.0",
 		"discord.js": "catalog:",
 		"puppeteer-core": "catalog:"
 	},

@@ -4,18 +4,18 @@
  * Handles `omp update` to check for and install updates.
  * Uses the installer that owns the active omp executable when it can be detected.
  */
-import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { $env, $which, APP_DISPLAY_NAME, APP_NAME, compareVersions, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
+import { $env, $which, APP_NAME, compareVersions, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
 import { settings } from "../config/settings";
 import { theme } from "@oh-my-pi/pi-tui/theme";
+import { type HaisoUpdateRequest, runHaisoUpdate } from "../haiso-update/engine";
 import {
 	isTimeoutError,
 	isUnsupportedProxyError,
@@ -354,7 +354,7 @@ export async function downloadVerifiedBinary(options: VerifiedBinaryDownloadOpti
 		throw new Error(`Download failed: ${response.statusText}`);
 	}
 
-	const hash = createHash("sha256");
+	const hash = new Bun.SHA256();
 	let size = 0;
 	const verifier = new Transform({
 		transform(chunk, _encoding, callback) {
@@ -2064,22 +2064,40 @@ export async function runUpdateCommand(opts: {
 	force: boolean;
 	check: boolean;
 	channel?: UpdateChannel;
+	stage?: boolean;
+	apply?: string;
+	rollback?: boolean;
+	status?: boolean;
+	auto?: "on" | "off";
+	reviewed?: boolean;
 }): Promise<void> {
-	// Haiso is maintained from its source checkout. Never route its launcher
-	// through OMP's official registry, installer, or package-manager takeover.
+	// Haiso integrates upstream into its own verified releases; it must never
+	// enter OMP's package-manager or official binary replacement paths.
 	if (APP_NAME !== "omp") {
-		console.log(`${APP_NAME}/${VERSION}`);
-		console.log(`${APP_DISPLAY_NAME} is a source-checkout fork; automatic application updates are disabled.`);
-		console.log("No application update was checked or installed.");
-		console.log("");
-		console.log(`To update, open the ${APP_DISPLAY_NAME} source checkout and preserve your local changes first.`);
-		console.log("Fetch and review upstream OMP changes, then merge or rebase them manually,");
-		console.log(`resolve conflicts while retaining ${APP_DISPLAY_NAME} changes, install checkout dependencies,`);
-		console.log(
-			`and verify the checkout before restarting ${APP_DISPLAY_NAME}. Rebuild native dependencies if needed.`,
+		if (opts.channel === "canary") throw new Error("Haiso updates support stable upstream releases only.");
+		const action: HaisoUpdateRequest["action"] = opts.check
+			? "check"
+			: opts.stage
+				? "stage"
+				: opts.apply
+					? "apply"
+					: opts.rollback
+						? "rollback"
+						: opts.status
+							? "status"
+							: opts.auto !== undefined
+								? "auto"
+								: "update";
+		await runHaisoUpdate(
+			{
+				action,
+				candidateId: opts.apply,
+				enabled: opts.auto === undefined ? undefined : opts.auto === "on",
+				reviewed: opts.reviewed,
+				force: opts.force,
+			},
+			line => console.log(line),
 		);
-		console.log("Do not run the official OMP installer or a global npm/bun update for this fork.");
-		console.log(`Plugin updates remain available with: ${APP_NAME} update --plugins`);
 		return;
 	}
 	console.log(chalk.dim(`Current version: ${VERSION}`));
@@ -2186,26 +2204,4 @@ export async function runUpdateCommand(opts: {
 		console.error(chalk.red(`Update failed: ${err}`));
 		process.exit(1);
 	}
-}
-
-/**
- * Print update command help.
- */
-export function printUpdateHelp(): void {
-	console.log(`${chalk.bold(`${APP_NAME} update`)} - Source-checkout update guidance
-
-${chalk.bold("Usage:")}
-  ${APP_NAME} update [options]
-
-${chalk.bold("Options:")}
-  -l, --plugins   Update installed plugins (does not update ${APP_DISPLAY_NAME})
-  -c, --check     Show manual source update guidance; no remote version check
-  -f, --force     Show guidance; automatic application replacement is disabled
-  --canary        Show guidance; upstream channel switching is disabled
-  --stable        Show guidance; upstream channel switching is disabled
-
-${chalk.bold("Examples:")}
-  ${APP_NAME} update              Show manual source-checkout update guidance
-  ${APP_NAME} update --plugins    Update installed plugins only
-`);
 }

@@ -1,6 +1,6 @@
 # Haiso coding agent
 
-Core implementation of Haiso, based on OMP 18.2.6. The internal package name remains `@oh-my-pi/pi-coding-agent` for source compatibility; the installed command is `haiso`.
+Core implementation of Haiso, tracking stable OMP releases. The internal package name remains `@oh-my-pi/pi-coding-agent` for source compatibility; the installed command is `haiso`. See the [guarded update and rollback guide](../../README.md#install-and-update-this-fork).
 
 For installation, setup, provider configuration, model roles, slash commands, and full CLI reference, see:
 - [Monorepo README (local)](../../README.md)

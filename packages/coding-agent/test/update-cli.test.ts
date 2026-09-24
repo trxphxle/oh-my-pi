@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, type Mock, spyOn, vi } from "bun:test";
-import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -92,15 +91,12 @@ describe("update command plugin dispatch", () => {
 		expect(updateSpy).not.toHaveBeenCalled();
 	});
 
-	it("keeps normal update flags on the app updater path", async () => {
-		const pluginSpy = spyOn(pluginCli, "runPluginCommand").mockResolvedValue(undefined);
-		const updateSpy = spyOn(updateCli, "runUpdateCommand").mockResolvedValue(undefined);
+	it("rejects mixed application/plugin operations instead of choosing one silently", async () => {
+		await expect(new Update(["--stage", "--plugins"], TEST_CONFIG).run()).rejects.toThrow();
+	});
 
-		const command = new Update(["--check", "--force"], TEST_CONFIG);
-		await command.run();
-
-		expect(updateSpy).toHaveBeenCalledWith({ force: true, check: true, channel: undefined });
-		expect(pluginSpy).not.toHaveBeenCalled();
+	it("requires an exact activation or rollback for compatibility review", async () => {
+		await expect(new Update(["--reviewed"], TEST_CONFIG).run()).rejects.toThrow();
 	});
 });
 
@@ -970,7 +966,7 @@ describe("update-cli release binary integrity", () => {
 	const binaryName = "omp-linux-x64";
 	const url = `https://github.com/can1357/oh-my-pi/releases/download/${tag}/${binaryName}`;
 	const content = "verified binary";
-	const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+	const digest = `sha256:${Bun.SHA256.hash(content, "hex")}`;
 
 	function releaseAsset(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 		return {
@@ -1133,7 +1129,7 @@ describe("update-cli release binary integrity", () => {
 				url,
 				targetPath,
 				expectedSize: Buffer.byteLength(content),
-				expectedDigest: `sha256:${createHash("sha256").update("different binary").digest("hex")}`,
+				expectedDigest: `sha256:${Bun.SHA256.hash("different binary", "hex")}`,
 				fetchImpl,
 			}),
 		).rejects.toThrow("digest mismatch");
@@ -1145,9 +1141,7 @@ describe("update-cli release binary integrity", () => {
 		const targetPath = path.join(dir, binaryName);
 		const installed = `#!/bin/sh\necho ${APP_NAME}/17.0.8\n`;
 		const altered = `#!/bin/sh\necho ${APP_NAME}/17.1.2\n`;
-		const expectedDigest = `sha256:${createHash("sha256")
-			.update("x".repeat(Buffer.byteLength(altered)))
-			.digest("hex")}`;
+		const expectedDigest = `sha256:${Bun.SHA256.hash("x".repeat(Buffer.byteLength(altered)), "hex")}`;
 		await Bun.write(targetPath, installed);
 		await fs.chmod(targetPath, 0o755);
 
@@ -1460,7 +1454,7 @@ describe("update-cli script-shim takeover", () => {
 	const url = `https://github.com/can1357/oh-my-pi/releases/download/v${version}/${binaryName}`;
 
 	function makeFetch(content: string, prerelease = false): (input: string | URL | Request) => Promise<Response> {
-		const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+		const digest = `sha256:${Bun.SHA256.hash(content, "hex")}`;
 		return async (input: string | URL | Request): Promise<Response> => {
 			const requestUrl = String(input);
 			if (requestUrl.startsWith("https://api.github.com/")) {
@@ -1676,7 +1670,7 @@ describe("update-cli concurrent binary updates", () => {
 	const binaryName = "omp-linux-x64";
 	const url = `https://github.com/can1357/oh-my-pi/releases/download/v${version}/${binaryName}`;
 	const payload = Buffer.alloc(2048, 0x41);
-	const digest = `sha256:${createHash("sha256").update(payload).digest("hex")}`;
+	const digest = `sha256:${Bun.SHA256.hash(payload, "hex")}`;
 
 	function metadata(): Response {
 		return Response.json({

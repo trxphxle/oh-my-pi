@@ -33,6 +33,10 @@ export const collabHelp = {
 		"List active local Collab host metadata without URLs; use collab link <instanceId|pid> to retrieve a control link (--view for view-only)",
 } satisfies CommandMetadata;
 
+export const clipHelp = {
+	description: "Upload a /record recording to live.omp.sh as a public clip and print its URL",
+} satisfies CommandMetadata;
+
 export const commitHelp = { description: "Generate a commit message and update changelogs" } satisfies CommandMetadata;
 
 export const completionsHelp = {
@@ -64,10 +68,18 @@ export const gitHelp = {
 	description: "Interactive fullscreen git UI: split diff viewer, staging sidebar, and commit composer",
 } satisfies CommandMetadata;
 
+export const findHelp = {
+	description: "Semantic search: describe a behavior, get the files and line ranges that implement it",
+} satisfies CommandMetadata;
+
 export const grepHelp = { description: "Test grep tool" } satisfies CommandMetadata;
 
 export const grievancesHelp = {
 	description: "View, clean, or push reported tool issues (auto-QA grievances)",
+} satisfies CommandMetadata;
+
+export const loginHelp = {
+	description: "Log in to a model provider (terminal counterpart of /login)",
 } satisfies CommandMetadata;
 
 export const imagesHelp = {
@@ -83,6 +95,10 @@ export const joinHelp = { description: "Join a shared collab session (same as /j
 export const modelsHelp = { description: "List, search, and refresh available models" } satisfies CommandMetadata;
 
 export const pluginHelp = { description: "Manage plugins (install, uninstall, list, etc.)" } satisfies CommandMetadata;
+
+export const playHelp = {
+	description: "Replay a /record session recording in the terminal (space pauses, q quits)",
+} satisfies CommandMetadata;
 
 export const psHelp = {
 	description: "List and control daemon-supervised background processes (logs, stop, kill, restart)",
@@ -111,6 +127,10 @@ export const setupHelp = {
 
 export const shellHelp = { description: "Interactive shell console" } satisfies CommandMetadata;
 
+export const skillHelp = {
+	description: "Install, search, publish, and manage skills on the Skillshare registry (skills.omp.sh)",
+} satisfies CommandMetadata;
+
 export const sshHelp = { description: "Manage SSH host configurations" } satisfies CommandMetadata;
 
 export const statsHelp = { description: "View usage statistics" } satisfies CommandMetadata;
@@ -125,12 +145,16 @@ export const tinyModelsHelp = {
 
 export const tokenHelp = { description: "Get the API key or OAuth token for a provider" } satisfies CommandMetadata;
 
+export const toksHelp = {
+	description: "Count a file or text with every embedded offline tokenizer (OpenAI, Claude, Qwen, …)",
+} satisfies CommandMetadata;
+
 export const ttsrHelp = {
 	description: "Inspect and test Time-Traveling Stream Rules (TTSR)",
 } satisfies CommandMetadata;
 
 export const updateHelp = {
-	description: "Show source-checkout update guidance or update installed plugins",
+	description: "Check, stage, and activate guarded Haiso updates, or update plugins",
 } satisfies CommandMetadata;
 
 export const usageHelp = {

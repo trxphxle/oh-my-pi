@@ -759,11 +759,6 @@ export function getWorktreeDir(segment: string): string {
 	return path.join(getWorktreesDir(), segment);
 }
 
-/** Get the GPU cache path (~/.omp/gpu_cache.json). */
-export function getGpuCachePath(): string {
-	return dirs.rootSubdir("gpu_cache.json", "cache");
-}
-
 /**
  * Get the GitHub view cache database path (~/.omp/cache/github-cache.db).
  * Honors the `OMP_GITHUB_CACHE_DB` env var when set so tests can isolate the
@@ -989,6 +984,13 @@ export function getTinyWorkerRuntimeDir(): string {
 	return dirs.rootSubdir(path.join("run", "tiny"), "state");
 }
 
+/** Keep old brokers alive while incompatible Haiso releases acquire separate scopes. */
+function daemonScopeKey(scope: string): string {
+	const identity =
+		APP_NAME === "omp" ? scope : `${APP_NAME}\0${process.env.HAISO_DAEMON_NAMESPACE || VERSION}\0${scope}`;
+	return Bun.hash.wyhash(identity).toString(16).padStart(16, "0");
+}
+
 /** Root directory containing every per-project daemon runtime scope (~/.omp/run/daemons; XDG default: $XDG_STATE_HOME/omp/run/daemons). */
 export function getDaemonRuntimeRoot(): string {
 	return dirs.rootSubdir(path.join("run", "daemons"), "state");
@@ -996,7 +998,7 @@ export function getDaemonRuntimeRoot(): string {
 
 /** Get the daemon runtime directory for a project (~/.omp/run/daemons/<hash>; XDG default: $XDG_STATE_HOME/omp/run/daemons/<hash>). */
 export function getDaemonRuntimeDir(projectDir: string): string {
-	const key = Bun.hash.wyhash(path.resolve(projectDir)).toString(16).padStart(16, "0");
+	const key = daemonScopeKey(path.resolve(projectDir));
 	return path.join(getDaemonRuntimeRoot(), key);
 }
 
@@ -1010,7 +1012,8 @@ export function getGlobalDaemonRuntimeDir(service: string): string {
 	if (!/^[a-z0-9][a-z0-9._-]*$/i.test(service)) {
 		throw new Error(`Invalid global daemon service name: ${JSON.stringify(service)}`);
 	}
-	return path.join(getGlobalDaemonRuntimeRoot(), service);
+	const key = APP_NAME === "omp" ? service : `${APP_NAME}-${daemonScopeKey(service)}`;
+	return path.join(getGlobalDaemonRuntimeRoot(), key);
 }
 
 /** Get the provider in-flight root directory (~/.omp/run/provider-inflight; XDG default: $XDG_STATE_HOME/omp/run/provider-inflight). */

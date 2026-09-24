@@ -1,14 +1,14 @@
 # Haiso
 
 Haiso is a personal fork of [Oh My Pi](https://github.com/can1357/oh-my-pi),
-based on OMP **18.2.6** (`78b753124d11f8dd3ae73e2524125890ff7c977e`).
+tracking stable upstream releases; `haiso update --status` shows the installed version and exact upstream commit.
 It retains the upstream coding engine, tools, providers, and session model, with
 Haiso's opt-in Discord session controls and its own application identity.
 
 Use **`haiso`** for this fork. An existing **`omp`** command remains the separate
-official installation. The package namespaces and `.omp` configuration/history
-locations remain compatible so this transition does not discard existing logins
-or conversations. Haiso is not an official OMP release.
+official installation. Package namespaces and `.omp` configuration/history
+locations are intentionally retained. Shared-state migrations are compatibility-gated;
+switching executables does not reverse them. Haiso is not an official OMP release.
 
 - [Discord setup, controls, and recovery](packages/coding-agent/README.md#haiso-discord-mode-personal-fork)
 - [Changelog](packages/coding-agent/CHANGELOG.md)
@@ -19,24 +19,23 @@ uses the `omp` executable, use `haiso` for this fork; `.omp` paths and protocol
 identifiers intentionally keep their existing names. Do not use upstream
 installers to update Haiso.
 
-## Install this fork
+## Install and update this fork
 
-The source launcher requires a prepared checkout (dependencies and matching
-native bindings) and a standalone Bun runtime. It preserves the caller's working
-directory and forwards normal CLI arguments:
+Haiso runs a verified compiled executable, not a mutable development checkout.
+`~/.local/bin/haiso` selects an immutable release under
+`~/.local/share/haiso/`; the active `fork` symlink is switched atomically.
+Each release retains its matching standalone Bun, frozen fork patch, upstream
+commit, artifact hashes, and compatibility fingerprints. Existing processes and
+their workers remain pinned to their original executable.
 
-```sh
-bun scripts/install-haiso.ts --runtime "$(command -v bun)"
-```
-
-An existing `haiso` launcher is replaced only with explicit `--replace-legacy`.
-The installer validates the copied runtime and this source entry before publishing
-the command; it does not replace `omp`, copy a legacy application, or delete user
-projects/configuration/history.
-
-The default command is `~/.local/bin/haiso`, with its independent runtime under
-`~/.local/share/haiso/fork/`. Keep this checkout in place: the launcher runs its
-source, not a bundled copy of the repository.
+Bootstrap installation is a maintainer operation: build a reviewed candidate
+with matching dependencies/native bindings, freeze its complete patch against
+the official upstream commit, and compute its compatibility fingerprints with
+`computeCompatibility` in `packages/coding-agent/src/haiso-update/compatibility.ts`.
+Supply those artifacts and pins to the installer; `bun scripts/install-haiso.ts --help`
+lists the required arguments. An existing launcher or mutable source install
+requires explicit `--replace-legacy`. Do not use the upstream global installer,
+`bun setup`, or `bun link` to install this fork: they can target official OMP.
 
 ```sh
 haiso --version
@@ -48,11 +47,44 @@ From an already-running old/source-launched session, exit normally before using
 `haiso --resume` to reopen the same conversation. Do not run two writers against
 one saved session.
 
-`haiso update` explains the manual source-update procedure; automatic application
-updates are disabled so the official OMP installer cannot overwrite this fork.
-`haiso update --plugins` still updates plugins.
+```sh
+haiso update --check           # Discover the latest official stable tag and commit
+haiso update --stage           # Integrate, build, test, and retain a candidate
+haiso update --status          # Inspect current release and held candidates
+haiso update --apply ID        # Activate the exact verified candidate shown by status
+haiso update --auto on         # Opt into guarded checks on subsequent launches
+haiso update --auto off
+haiso update --rollback        # Switch to a retained compatible compiled release
+haiso update --plugins        # Plugin updates remain separate
+```
 
-Runtime setup and source build details: [development guide](packages/coding-agent/DEVELOPMENT.md).
+Plain `haiso update` stages and activates only a compatible verified candidate.
+`--force` retries failed staging or rebuilds the same pinned release without
+weakening checks. Automatic mode is off until enabled, checks at most daily on
+managed launches, and uses one updater at a time. It never edits the developer
+checkout or replaces `omp`. Git, public GitHub/npm access, the pinned Bun runtime,
+and the platform build/signing tools must be available.
+
+Conflicts, failed verification, changed candidate bytes, or a changed active
+release stop activation. Minor/major transitions and state/broker fingerprint
+changes remain held for review. After inspecting the migration and affected
+profiles, `--apply ID --reviewed` acknowledges that compatibility transition;
+it cannot bypass failed checks. Generic service brokers use protocol-specific
+scopes, and extracted native addons use release-specific caches. Existing
+Discord connections retain their recorded supervisor lease instead of moving
+to a new service broker.
+
+Rollback changes only executable selection, disables automatic updates, and
+never restores databases or restarts brokers. Changed compatibility requires
+`--rollback --reviewed`; assess whether older code can still read the current
+state. Legacy mutable source installs are preserved but are not rollback
+targets. In particular, OMP 18.3 renames SingularityAPI credential providers,
+and older Haiso cannot interpret all migrated settings selectors.
+
+Updater records and logs live beside `fork` in `fork-update/`. It retains at
+most four staged candidates and stops before accumulating eight releases.
+Cleanup is manual: never remove the active release or one used by a running
+process. Build details: [development guide](packages/coding-agent/DEVELOPMENT.md).
 
 ### Optional connector for official OMP
 
@@ -177,6 +209,8 @@ Other agents shell out to rg, grep, find, and bash. On many machines those binar
 ### 10 · Code review with priorities and a verdict
 
 Get a clear verdict on whether the change ships, with every issue ranked P0 through P3 and scored for confidence. /review spawns dedicated reviewer subagents that sweep branches, single commits, or uncommitted work in parallel. You tackle what blocks release first; nothing important hides in a wall of prose.
+
+Want to steer the review yourself? `/annotate code-review` opens the diff so you can pin notes to lines before the reviewers run. `/annotate` also takes the latest reply, a session message, a file, or quoted text and pastes your notes into the prompt. See [`/annotate`](docs/slash-command-internals.md#12-bundled-command-note-annotate).
 
 ### 11 · Hashline: edit by content hash
 
@@ -313,7 +347,7 @@ Auth tags below: `oauth` signs in with your provider account, `plan` routes thro
 
 Direct APIs and gateways. Mix providers per role.
 
-Anthropic `oauth` · OpenAI · OpenAI Codex `oauth` · Google Gemini · Google Vertex · Google Antigravity `oauth` · xAI · SuperGrok `oauth` · DeepSeek · Mistral · Groq · Cerebras · Fireworks · Together · Baseten · DeepInfra · Hugging Face · NVIDIA · Meta · Amazon Bedrock · Azure OpenAI · SiliconFlow · GMI Cloud · CoreWeave · Sakana AI · Command Code · Charm Hyper · OpenRouter · Synthetic · Vercel AI Gateway · Cloudflare AI Gateway · Wafer Serverless
+Anthropic `oauth` · OpenAI · OpenAI Codex `oauth` · Google Gemini · Google Vertex · Google Antigravity `oauth` · xAI · SuperGrok `oauth` · DeepSeek · Mistral · Groq · Cerebras · Fireworks · Together · Baseten · DeepInfra · Hugging Face · NVIDIA · Meta · Amazon Bedrock · Azure OpenAI · SiliconFlow · GMI Cloud · CoreWeave · Sakana AI · Command Code · Charm Hyper · StepFun · OpenRouter · Synthetic · Vercel AI Gateway · Cloudflare AI Gateway · Wafer Serverless
 
 ### Coding plans
 
@@ -355,7 +389,7 @@ modelRoles:
 
 ### Four knobs that make routing useful
 
-- **Custom providers** — Declare anything that speaks `openai-completions`, `openai-responses`, `openai-codex-responses`, `azure-openai-responses`, `anthropic-messages`, `bedrock-converse-stream`, `google-generative-ai`, `google-gemini-cli`, or `google-vertex` in `~/.omp/agent/models.yml`.
+- **Custom providers** — Declare anything that speaks `openai-completions`, `openai-responses`, `openai-codex-responses`, `azure-openai-responses`, `anthropic-messages`, `bedrock-converse-stream`, `google-generative-ai`, `google-gemini-cli`, `google-vertex`, `typesafe`, or `openrouter-decisions` (the two judge APIs) in `~/.omp/agent/models.yml`.
 - **Fallback chains** — Per-role or per-model chains under `retry.fallbackChains`. When the primary throws 429s or hits a quota wall, the next entry takes the rest of the turn — restored on cooldown.
 - **Path-scoped models** — Scope `enabledModels` and `disabledProviders` entries to a `path:` prefix to pin a different model set on one repo without touching the global config. Scoped entries cover the path and everything under it.
 - **Round-robin credentials** — Stack API keys per provider and the runtime rotates with session affinity and per-credential backoff. Useful when one key would burn its quota by lunch.
@@ -622,7 +656,7 @@ For architecture and contribution guidelines, see [packages/coding-agent/DEVELOP
 | **[@oh-my-pi/omptype](packages/omptype)**                                     | ArkType-compatible schema validation with lazy JIT compilation              |
 | **[@oh-my-pi/pi-utils](packages/utils)**                                      | Shared utilities (logging, streams, dirs/env/process helpers)               |
 | **[@oh-my-pi/pi-wire](packages/wire)**                                        | Shared collab live-session protocol types and relay constants               |
-| **[@oh-my-pi/pi-mnemopi](packages/mnemopi)**                                  | Local SQLite memory engine for Oh My Pi agents                              |
+| **[@oh-my-pi/pi-mnemopi](packages/mnemopi)**                                  | Local SQLite memory engine for omp agents                                   |
 | **[@oh-my-pi/snapcompact](packages/snapcompact)**                             | Bitmap-frame context compression package and SQuAD eval suite               |
 | **[@oh-my-pi/browser-relay](packages/browser-relay)**                         | Chrome extension that lets the Eval browser API drive your existing tabs    |
 | **[@oh-my-pi/pi-metaharness](packages/metaharness)**                          | Unified benchmark runners, Harbor run storage, REST/SSE API, live dashboard |
@@ -662,11 +696,12 @@ component-local notices for attribution and additional terms.
 
 © 2025 Mario Zechner  
 © 2025-2026 Can Bölük  
-© 2026 Stencil Labs, Inc.
+© 2026 [Stencil Labs, Inc.](https://stencil.so)
 
 _made for terminals that stay open_
 
 - [omp.sh](https://omp.sh)
+- [Stencil Labs](https://stencil.so)
 - [GitHub](https://github.com/can1357/oh-my-pi)
 - [Changelog](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/CHANGELOG.md)
 - [npm](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent)

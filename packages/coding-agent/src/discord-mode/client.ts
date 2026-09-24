@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { getGlobalDaemonRuntimeDir } from "@oh-my-pi/pi-utils";
 import {
+	connectExistingDiscordMode,
 	DiscordModeClient,
 	readDiscordModeToken,
 	discordModeSocketIsStale,
@@ -19,7 +20,12 @@ import {
 	discordModePaths,
 	loadDiscordModeConfig,
 } from "./config";
-import { ensurePrivateDirectory, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
+import {
+	createPrivateJson,
+	ensurePrivateDirectory,
+	readPrivateJson,
+	writePrivateJson,
+} from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	DISCORD_MODE_DAEMON_NAME,
 	DISCORD_MODE_READY,
@@ -38,6 +44,27 @@ export async function connectDiscordMode(): Promise<DiscordModeClient> {
 	const paths = discordModePaths();
 	await ensurePrivateDirectory(paths.root);
 	const configKey = discordModeConfigKey(config);
+	const descriptorPath = path.join(paths.root, "connector.json");
+	const adoptConnector = async (): Promise<DiscordModeClient | undefined> => {
+		if ((await readPrivateJson(descriptorPath, 8192)) === undefined) return undefined;
+		if (paths.socketPath !== path.join(paths.root, "ipc.sock"))
+			throw new Error("Discord mode connector does not describe the configured socket; nothing was replaced.");
+		const client = await connectExistingDiscordMode(paths.root);
+		try {
+			await client.probe(configKey);
+			return client;
+		} catch (error) {
+			await client.close();
+			throw error;
+		}
+	};
+	if (
+		(await inspectDiscordModeSocket(paths.socketPath)) === "present" &&
+		!(await discordModeSocketIsStale(paths.socketPath))
+	) {
+		const live = await adoptConnector();
+		if (live) return live;
+	}
 	const scope = createHash("sha256")
 		.update(await canonicalProjectDir(paths.root))
 		.digest("hex")
@@ -45,15 +72,18 @@ export async function connectDiscordMode(): Promise<DiscordModeClient> {
 	const service = `haiso-discord-${scope}`;
 	const supervisor = await daemonClientForGlobal(service);
 	await supervisor.request({ op: "ping" });
-	const adopt = async (managed: boolean): Promise<DiscordModeClient | undefined> => {
+	const adopt = async (managed: boolean, started = false): Promise<DiscordModeClient | undefined> => {
 		if ((await inspectDiscordModeSocket(paths.socketPath)) === "missing") return undefined;
+		if (!started) {
+			const live = await adoptConnector();
+			if (live) return live;
+		}
 		const token = await readDiscordModeToken(paths.tokenPath);
 		if (!token)
 			throw new Error("Discord mode socket exists without its private authentication file; nothing was replaced.");
 		const client = new DiscordModeClient(paths.socketPath, token);
 		try {
 			await client.probe(configKey);
-			const descriptorPath = path.join(paths.root, "connector.json");
 			const runtimeDir = await canonicalProjectDir(getGlobalDaemonRuntimeDir(service));
 			const descriptor: DiscordModeConnector = {
 				version: 1,
@@ -68,7 +98,15 @@ export async function connectDiscordMode(): Promise<DiscordModeClient> {
 						}
 					: {}),
 			};
-			await writePrivateJson(descriptorPath, descriptor);
+			if (started) {
+				await writePrivateJson(descriptorPath, descriptor);
+			} else if (!(await createPrivateJson(descriptorPath, descriptor))) {
+				// A concurrent publisher owns the durable lease; never overwrite it.
+				await client.close();
+				const live = await adoptConnector();
+				if (!live) throw new Error("Discord mode connector changed during attachment; nothing was replaced.");
+				return live;
+			}
 			return client;
 		} catch (error) {
 			await client.close();
@@ -125,7 +163,7 @@ export async function connectDiscordMode(): Promise<DiscordModeClient> {
 			// Only startup is retried. A concurrently registered worker may have won; no operation is replayed.
 			continue;
 		}
-		const live = await adopt(true);
+		const live = await adopt(true, true);
 		if (live) return live;
 	}
 	throw new Error("Discord mode service did not become ready; no existing service was stopped or restarted.");

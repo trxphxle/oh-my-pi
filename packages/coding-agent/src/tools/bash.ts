@@ -43,6 +43,8 @@ import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
+import { startService, type ServiceReady } from "../launch/services";
+import { isFindEnabled } from "./jfind";
 import { formatArtifactErrorNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { resolveInlineByteCapBudget } from "./output-meta";
@@ -53,7 +55,6 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
-const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
 	"\n": true,
 	"\r": true,
@@ -305,30 +306,64 @@ async function saveBashOriginalArtifact(session: ToolSession, originalText: stri
 const BASH_TIMEOUT_DESCRIPTION = `timeout in seconds; 0 disables the command deadline; nonzero values are clamped to ${TOOL_TIMEOUTS.bash.min}-${TOOL_TIMEOUTS.bash.max}`;
 
 const bashSchemaBase = type({
-	command: type("string").describe("command to execute"),
-	"env?": type({ "[string]": "string" }).describe("extra env vars"),
+	command: type("string"),
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
-	"cwd?": type("string").describe("working directory"),
-	"pty?": type("boolean").describe("run in pty mode"),
+	"cwd?": "string",
+	"pty?": "boolean",
 });
 
 const bashSchemaWithAsync = type({
 	command: "string",
-	"env?": { "[string]": "string" },
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
 	"cwd?": "string",
 	"pty?": "boolean",
-	"async?": type("boolean").describe("run in background"),
+	"async?": "boolean",
 });
 
-type BashToolSchema = typeof bashSchemaBase | typeof bashSchemaWithAsync;
+const bashSchemaWithService = type({
+	command: "string",
+	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
+	"cwd?": "string",
+	"pty?": "boolean",
+	"name?": "string <= 48",
+	"ready?": type({
+		"log?": "string",
+		"port?": "number",
+		"host?": "string",
+		"timeout?": "number",
+	}),
+	"env?": type.record("string", "string"),
+});
+
+const bashSchemaWithAsyncAndService = type({
+	command: "string",
+	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
+	"cwd?": "string",
+	"pty?": "boolean",
+	"async?": "boolean",
+	"name?": "string <= 48",
+	"ready?": type({
+		"log?": "string",
+		"port?": "number",
+		"host?": "string",
+		"timeout?": "number",
+	}),
+	"env?": type.record("string", "string"),
+});
+
+type BashToolSchema =
+	| typeof bashSchemaBase
+	| typeof bashSchemaWithAsync
+	| typeof bashSchemaWithService
+	| typeof bashSchemaWithAsyncAndService;
 
 export interface BashToolInput {
 	command: string;
-	env?: Record<string, string>;
 	timeout?: number;
 	cwd?: string;
-
+	name?: string;
+	ready?: ServiceReady;
+	env?: Record<string, string>;
 	async?: boolean;
 	pty?: boolean;
 }
@@ -393,18 +428,6 @@ class TerminalSnapshotDecoder {
 	}
 }
 
-function normalizeBashEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {
-	if (!env || Object.keys(env).length === 0) return undefined;
-	const normalized: Record<string, string> = {};
-	for (const [key, value] of Object.entries(env)) {
-		if (!BASH_ENV_NAME_PATTERN.test(key)) {
-			throw new ToolError(`Invalid bash env name: ${key}`);
-		}
-		normalized[key] = value;
-	}
-	return normalized;
-}
-
 function formatTimeoutClampNotice(
 	requestedTimeoutSec: number,
 	effectiveTimeoutSec: number,
@@ -423,7 +446,7 @@ function formatTimeoutClampNotice(
  *
  * Executes bash commands with optional timeout and working directory.
  */
-export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSchemaWithAsync, BashToolDetails> {
+export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly name = "bash";
 	/** Bash resolves `skill://` URIs in commands and working directories. */
 	readonly readsSkillUris = true;
@@ -530,12 +553,15 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			hasAstEdit: isToolActive("ast_edit", this.session.settings.get("astEdit.enabled")),
 			hasGrep: isToolActive("grep", this.session.settings.get("grep.enabled")),
 			hasGlob: isToolActive("glob", this.session.settings.get("glob.enabled")),
+			hasFind: this.session.isToolActive?.("find") ?? isFindEnabled(this.session),
 			hasRead: isToolActive("read", true),
+			// Frozen at the last prompt rebuild (managed sessions). SDK consumers
+			// building a bare ToolSession lack the rebuild lifecycle, so fall back
+			// to the derived form (skillful && skills) instead of dropping the hint.
 			hasSkills:
-				// `skillful: false` removes the system-prompt catalog and must also
-				// strip the provider-side `skill://` hint, matching sdk.ts:3186.
-				this.session.settings.get("skillful") && (this.session.skills?.length ?? 0) > 0,
-			hasLaunch: isToolActive("hub", this.session.settings.get("launch.enabled")),
+				(this.session.skillHintVisible ??
+					(this.session.settings.get("skillful") && (this.session.skills?.length ?? 0) > 0)) === true,
+			hasLaunch: this.#launchEnabled,
 			hasEval: isToolActive("eval", evalBackends.python || evalBackends.js),
 			hasShellBuiltins: !shellBuiltinsDisabled(this.session.settings),
 			isWindows: process.platform === "win32",
@@ -549,11 +575,14 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		args.pty === true ? "exclusive" : "shared";
 	readonly strict = true;
 	readonly #asyncEnabled: boolean;
+	readonly #launchEnabled: boolean;
 	readonly #autoBackgroundEnabled: boolean;
 	readonly #autoBackgroundThresholdMs: number;
 
 	constructor(private readonly session: ToolSession) {
 		this.#asyncEnabled = this.session.settings.get("async.enabled");
+		this.#launchEnabled =
+			this.session.settings.get("launch.enabled") === true && (this.session.isToolActive?.("bash") ?? true);
 		this.#autoBackgroundEnabled = this.session.settings.get("bash.autoBackground.enabled");
 		this.#autoBackgroundThresholdMs = Math.max(
 			0,
@@ -561,7 +590,13 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				this.session.settings.get("bash.autoBackground.thresholdMs") ?? DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 			),
 		);
-		this.parameters = this.#asyncEnabled ? bashSchemaWithAsync : bashSchemaBase;
+		this.parameters = this.#launchEnabled
+			? this.#asyncEnabled
+				? bashSchemaWithAsyncAndService
+				: bashSchemaWithService
+			: this.#asyncEnabled
+				? bashSchemaWithAsync
+				: bashSchemaBase;
 	}
 
 	#formatResultOutput(result: BashResult | BashInteractiveResult): string {
@@ -742,10 +777,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		timeoutSec: number | undefined;
 		requestedTimeoutSec?: number;
 		notices?: readonly string[];
-
-		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
-		forwardUpdates: boolean;
+		/** A foreground wait races the job: updates stream to the caller and the row stays hidden until promoted. */
+		foreground: boolean;
 	}): ManagedBashJobHandle {
 		const manager = this.session.asyncJobManager;
 		if (!manager) {
@@ -755,7 +789,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const label = options.command.length > 120 ? `${options.command.slice(0, 117)}...` : options.command;
 		let latestText = "";
 		let latestProgressDetails: BashProgressDetails | undefined;
-		let forwardUpdates = options.forwardUpdates;
+		let forwardUpdates = options.foreground;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
 
 		const jobId = manager.register(
@@ -771,13 +805,15 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
-						env: options.resolvedEnv,
 						artifactPath,
 						artifactId,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							latestText = tailBuffer.text();
-							void reportProgress(latestText, { async: { state: "running", jobId, type: "bash" } });
+							void reportProgress(latestText, {
+								output: latestText,
+								async: { state: "running", jobId, type: "bash" },
+							});
 						},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
@@ -823,6 +859,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			},
 			{
 				ownerId: this.session.getAgentId?.() ?? undefined,
+				foreground: options.foreground,
 				onProgress: async text => {
 					latestText = text;
 					if (!forwardUpdates) return;
@@ -846,21 +883,12 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 	async execute(
 		_toolCallId: string,
-		{
-			command: rawCommand,
-			env: rawEnv,
-			timeout: rawTimeout = 300,
-			cwd,
-
-			async: asyncRequested = false,
-			pty = false,
-		}: BashToolInput,
+		{ command: rawCommand, timeout: rawTimeout, cwd, name, ready, env, async: asyncRequested, pty }: BashToolInput,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
 		let command = rawCommand;
-		const env = normalizeBashEnv(rawEnv);
 
 		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
 		// cwd parameter. The scanner captures only a single path token and defers
@@ -874,6 +902,13 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				command = cd.rest;
 			}
 		}
+		if (name !== undefined) {
+			if (!this.#launchEnabled) throw new ToolError("Service launch is disabled in this session.");
+			if (asyncRequested !== undefined || rawTimeout !== undefined)
+				throw new ToolError("Service mode does not accept async or timeout; use ready.timeout for readiness.");
+		} else if (ready !== undefined || env !== undefined) {
+			throw new ToolError("ready and env require a service name.");
+		}
 		if (asyncRequested && !this.#asyncEnabled) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
@@ -882,7 +917,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// leading `cd ... &&` wrappers do not hide either shell-navigation rules
 		// or the dedicated-tool command that follows the directory change.
 		if (this.session.settings.get("bashInterceptor.enabled")) {
-			const rules = this.session.settings.getBashInterceptorRules();
+			const rules = this.session.settings.getBashInterceptorRules().filter(rule => !name || rule.tool !== "bash");
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
 			for (const commandToCheck of commandsToCheck) {
 				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand);
@@ -911,20 +946,6 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			},
 		};
 		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs: true });
-		const resolvedEnv = env
-			? Object.fromEntries(
-					await Promise.all(
-						Object.entries(env).map(async ([key, value]) => [
-							key,
-							await expandInternalUrls(value, {
-								...internalUrlOptions,
-								ensureLocalParentDirs: true,
-								noEscape: true,
-							}),
-						]),
-					),
-				)
-			: undefined;
 
 		// Resolve protocol URLs (skill://, agent://, etc.) in extracted cwd.
 		// Bare skill:// URIs resolve to the skill directory here: the result must
@@ -953,9 +974,46 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
 
+		if (name !== undefined) {
+			const service = await startService(
+				this.session,
+				{
+					name,
+					command,
+					cwd: commandCwd,
+					pty: pty ?? true,
+					env,
+					ready,
+				},
+				signal,
+			);
+			const daemon = service.daemon;
+			const lines = [
+				`${daemon.name}: ${daemon.state}${daemon.pid === undefined ? "" : ` pid=${daemon.pid}`}${daemon.readyAt === undefined ? "" : " ready"}`,
+			];
+			if (service.readyTimedOut)
+				lines.push(
+					`NOT ready — readiness timed out after ${ready?.timeout ?? 30}s; process state: ${daemon.state}.`,
+				);
+			if (daemon.exitReason) lines.push(`Reason: ${daemon.exitReason}`);
+			if (service.log) lines.push(service.log);
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: {
+					service: {
+						name,
+						state: daemon.state,
+						ready: daemon.readyAt !== undefined || daemon.state === "running",
+						timedOut: service.readyTimedOut,
+						pid: daemon.pid,
+					},
+				},
+			};
+		}
+
 		// A timeout of 0 is an explicit long-running-command contract: the user
 		// must still cancel the call or job, but OMP does not impose a deadline.
-		const requestedTimeoutSec = rawTimeout;
+		const requestedTimeoutSec = rawTimeout ?? 300;
 		const timeoutDisabled = requestedTimeoutSec === 0;
 		const maxTimeout = this.session.settings.get("tools.maxTimeout");
 		const timeoutSec = timeoutDisabled ? undefined : clampTimeout("bash", requestedTimeoutSec, maxTimeout);
@@ -977,10 +1035,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				timeoutSec,
 				requestedTimeoutSec,
 				notices: pendingNotices,
-
-				resolvedEnv,
 				onUpdate,
-				forwardUpdates: false,
+				foreground: false,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1015,10 +1071,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				timeoutSec,
 				requestedTimeoutSec,
 				notices: pendingNotices,
-
-				resolvedEnv,
 				onUpdate,
-				forwardUpdates: !startBackgrounded,
+				foreground: !startBackgrounded,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
@@ -1026,10 +1080,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					notices: pendingNotices,
 				});
 			}
-			// Suppress the completion delivery up front so a job finishing while we
-			// foreground-wait cannot also be injected by the delivery loop. Lifted
-			// via resumeDeliveries() if we end up backgrounding after all.
-			autoBgManager.acknowledgeDeliveries([job.jobId]);
+			// The job was registered as foreground-backed: hidden from listings and
+			// delivery-suppressed until backgroundJob() promotes it, so a command
+			// finishing within the wait never surfaces as a background job.
 			const waitResult = await raceJobSettlement(
 				job.completion,
 				autoBackgroundWaitMs,
@@ -1037,17 +1090,20 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				ctx?.toolCall?.steeringSignal,
 			);
 			if (waitResult.kind === "completed") {
+				autoBgManager.releaseForegroundJob(job.jobId);
 				return waitResult.result;
 			}
 			if (waitResult.kind === "failed") {
+				autoBgManager.releaseForegroundJob(job.jobId);
 				throw waitResult.error;
 			}
 			if (waitResult.kind === "aborted") {
 				autoBgManager.cancel(job.jobId);
+				autoBgManager.releaseForegroundJob(job.jobId);
 				throw new ToolAbortError(job.getLatestText() || "Command aborted");
 			}
 			job.stopUpdates();
-			autoBgManager.resumeDeliveries([job.jobId]);
+			autoBgManager.backgroundJob(job.jobId);
 			// "steer": a queued user/peer message arrived mid-wait — background
 			// the command (it keeps running) so the message injects promptly.
 			const notices =
@@ -1064,7 +1120,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// that bypass `executeBash` — the ACP client terminal and the PTY. The
 		// `executeBash` branch below is intentionally excluded: it runs its own
 		// preflight internally, so routing the pre-applied command there too
-		// would double-apply the unset prefix and re-merge the env. No
+		// would double-apply the unset prefix. No
 		// `commandPrefix` here: ACP applies the shell prefix via
 		// `wrapShellLineForClientTerminal`, and the PTY path never wrapped one.
 		// `callerTimeoutMs` clamps the direnv load to a positive command timeout
@@ -1072,9 +1128,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// the executeBash branch so a cold `.envrc` can't outlast a short call.
 		const backendPreflight =
 			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) ||
-			canUseInteractiveBashPty(pty, ctx)
+			canUseInteractiveBashPty(pty === true, ctx)
 				? await applyDirenvPreflight(command, commandCwd, {
-						callerEnv: resolvedEnv,
 						signal,
 						timeoutMs: this.session.settings.get("bash.direnvLoadTimeoutMs"),
 						callerTimeoutMs: timeoutMs,
@@ -1144,10 +1199,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			signal?.addEventListener("abort", onAbortSignal, { once: true });
 
 			try {
-				// direnv-transformed command (carries any `unset -v` prefix) + merged
-				// env; falls back to the raw command/env when direnv is off/absent.
+				// direnv-transformed command (carries any `unset -v` prefix) + direnv
+				// env; falls back to the raw command when direnv is off/absent.
 				const bridgeCommand = backendPreflight?.command ?? command;
-				const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
+				const bridgeEnv = backendPreflight?.env;
 				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
 				const createP = clientBridge.createTerminal({
 					command: shellSpawn.command,
@@ -1351,7 +1406,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// Allocate artifact for truncated output storage
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 
-		const interactiveUi = canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
+		const interactiveUi = canUseInteractiveBashPty(pty === true, ctx) ? ctx?.ui : undefined;
 		if (pty && !interactiveUi) {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
@@ -1359,25 +1414,23 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					// PTY bypasses executeBash, so feed it the direnv-transformed
-					// command + merged env (backendPreflight is defined whenever this
+					// command + direnv env (backendPreflight is defined whenever this
 					// branch runs, since both gate on canUseInteractiveBashPty).
 					command: backendPreflight?.command ?? command,
 					cwd: commandCwd,
 					timeoutMs,
 					signal,
-					env: backendPreflight?.env ?? resolvedEnv,
+					env: backendPreflight?.env,
 					artifactPath,
 					artifactId,
 				})
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command + resolvedEnv here so the unset prefix / env merge is not
-				// applied twice.
+				// command here so the unset prefix is not applied twice.
 				await executeBash(command, {
 					cwd: commandCwd,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					timeout: timeoutMs ?? 0,
 					signal,
-					env: resolvedEnv,
 					artifactPath,
 					artifactId,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
