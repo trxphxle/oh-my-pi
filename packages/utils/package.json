@@ -51,7 +51,8 @@
 		"fmt": "oxfmt --no-error-on-unmatched-pattern 'src/**/*.{ts,tsx}' '{test,bench,examples,scripts}/**/*.ts' '*.ts'"
 	},
 	"dependencies": {
-		"@oh-my-pi/pi-natives": "catalog:"
+		"@oh-my-pi/pi-natives": "catalog:",
+		"@oh-my-pi/pi-wire": "catalog:"
 	},
 	"devDependencies": {
 		"@types/bun": "catalog:"

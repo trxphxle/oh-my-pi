@@ -1,7 +1,8 @@
 import { logger } from "@oh-my-pi/pi-utils";
-import { connectDiscordMode, type DiscordModeClient } from "./client";
+import type { DiscordModeClient } from "@oh-my-pi/pi-utils/discord-client";
+import { connectDiscordMode } from "./client";
 import { discordModePaths } from "./config";
-import type { ModeRetirementPolicy } from "./protocol";
+import type { ModeRetirementPolicy } from "@oh-my-pi/pi-wire/discord-mode";
 import {
 	assertDiscordDeletionNativeIdentity,
 	commitDiscordDeletionEvent,

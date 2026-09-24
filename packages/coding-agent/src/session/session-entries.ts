@@ -8,7 +8,7 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
-import type { ModeRetirementPolicy } from "../discord-mode/protocol";
+import type { ModeRetirementPolicy } from "@oh-my-pi/pi-wire/discord-mode";
 import type { CompactionMethod } from "./compaction-methods";
 
 export const CURRENT_SESSION_VERSION = 3;

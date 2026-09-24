@@ -1,7 +1,7 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { discordModeSessionForFile } from "../discord-mode/session";
-import { DISCORD_MODE_MAX_TEXT } from "../discord-mode/protocol";
+import { DISCORD_MODE_MAX_TEXT } from "@oh-my-pi/pi-wire/discord-mode";
 import discordDescription from "../prompts/tools/discord.md" with { type: "text" };
 import type { ToolSession } from "./index";
 

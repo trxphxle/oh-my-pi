@@ -12,7 +12,7 @@ import { canonicalProjectDir } from "../launch/paths";
 import { connectDiscordMode } from "./client";
 import { discordModePaths } from "./config";
 import { DiscordDialogs, type DiscordDialogResult } from "./dialog";
-import { readPrivateJson, writePrivateJson } from "./private-files";
+import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import { describeDiscordMode, type DiscordModePresentation } from "./presentation";
 import {
 	DISCORD_MODE_MAX_PENDING,
@@ -23,7 +23,7 @@ import {
 	type ModeLease,
 	type ModeRequest,
 	type ModeSnapshot,
-} from "./protocol";
+} from "@oh-my-pi/pi-wire/discord-mode";
 
 export interface DiscordSessionClient {
 	request(input: ModeRequest): Promise<ModeSnapshot>;

@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "../../src/discord-mode/private-files";
-import type { ModeDeletionBinding, ModeDeletionEvent } from "../../src/discord-mode/protocol";
+import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
+import type { ModeDeletionBinding, ModeDeletionEvent } from "@oh-my-pi/pi-wire/discord-mode";
 import { deleteSessionWithDiscord, resumeDiscordRetirements } from "../../src/discord-mode/retirement";
 import {
 	commitDiscordDeletionEvent,

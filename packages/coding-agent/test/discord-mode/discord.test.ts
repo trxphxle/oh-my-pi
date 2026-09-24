@@ -30,7 +30,7 @@ import {
 } from "discord.js";
 import { DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
 import { DiscordAdapter } from "../../src/discord-mode/discord";
-import type { DiscordPortHandlers } from "../../src/discord-mode/protocol";
+import type { DiscordPortHandlers } from "@oh-my-pi/pi-wire/discord-mode";
 
 const GUILD = "100000000000000001";
 const OWNER = "100000000000000002";

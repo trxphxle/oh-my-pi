@@ -3,7 +3,7 @@ import type {
 	ExtensionAskDialogResult,
 	ExtensionAskDialogResultItem,
 } from "../extensibility/extensions";
-import type { ModeDialog, ModeDialogAnswer } from "./protocol";
+import type { ModeDialog, ModeDialogAnswer } from "@oh-my-pi/pi-wire/discord-mode";
 
 export type DiscordDialogResult = { kind: "answered"; value: string | boolean | undefined } | { kind: "unavailable" };
 

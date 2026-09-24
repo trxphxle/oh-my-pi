@@ -44,7 +44,7 @@ import {
 	type ModeDialog,
 	type ModeRetirementPolicy,
 	type RemoteChannel,
-} from "./protocol";
+} from "@oh-my-pi/pi-wire/discord-mode";
 
 const MENTIONS = { parse: [] as never[], repliedUser: false };
 const PREFIX = "haiso:";

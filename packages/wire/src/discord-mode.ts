@@ -7,6 +7,24 @@ export const DISCORD_MODE_MAX_PENDING = 32;
 export const DISCORD_MODE_MAX_SESSIONS = 128;
 export const DISCORD_MODE_MAX_FRAME = 256 * 1024;
 
+/** Private attachment identity; stable across service restarts, never model-visible. */
+export interface DiscordModeInfo {
+	protocol: typeof DISCORD_MODE_PROTOCOL;
+	instanceId: string;
+	configKey: string;
+}
+
+/** Published only after native authenticated adoption of an existing account service. */
+export interface DiscordModeConnector {
+	version: 1;
+	configKey: string;
+	supervisor?: {
+		endpoint: string;
+		tokenPath: string;
+		projectDir: string;
+	};
+}
+
 export interface DiscordModeConfig {
 	botToken: string;
 	guildId: string;

@@ -54,6 +54,20 @@ updates are disabled so the official OMP installer cannot overwrite this fork.
 
 Runtime setup and source build details: [development guide](packages/coding-agent/DEVELOPMENT.md).
 
+### Optional connector for official OMP
+
+Keep the official `omp` executable and load only the optional bridge extension:
+
+```sh
+bun packages/omp-bridge/scripts/build.ts
+omp --extension /absolute/path/to/oh-my-pi/packages/omp-bridge/dist/index.js --resume
+```
+
+In the resumed OMP conversation, run `/bridge on` to attach to the already-configured,
+running Haiso broker. No Haiso system prompt, bot-token setup, or model settings are
+loaded into OMP. The extension is off by default and adds one `bridge` tool only
+while attached. See [connector setup and limits](packages/coding-agent/README.md#optional-official-omp-connector).
+
 
 ### Shell completions
 

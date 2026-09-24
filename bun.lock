@@ -206,6 +206,18 @@
         "wrap-ansi": "10.0.0",
       },
     },
+    "packages/omp-bridge": {
+      "name": "@haiso/omp-bridge",
+      "version": "18.2.6",
+      "devDependencies": {
+        "@oh-my-pi/omptype": "workspace:*",
+        "@oh-my-pi/pi-agent-core": "workspace:*",
+        "@oh-my-pi/pi-coding-agent": "workspace:*",
+        "@oh-my-pi/pi-utils": "workspace:*",
+        "@oh-my-pi/pi-wire": "workspace:*",
+        "@types/bun": "catalog:",
+      },
+    },
     "packages/omptype": {
       "name": "@oh-my-pi/omptype",
       "version": "18.2.6",
@@ -304,6 +316,7 @@
       "version": "18.2.6",
       "dependencies": {
         "@oh-my-pi/pi-natives": "catalog:",
+        "@oh-my-pi/pi-wire": "catalog:",
       },
       "devDependencies": {
         "@types/bun": "catalog:",
@@ -478,6 +491,8 @@
     "@emnapi/runtime": ["@emnapi/runtime@1.11.2", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-kyOl3X0DuTiT1h2ft8r2fYO8JYtU9a9Xis/zBSiGArNaagCOWx90N1k2wxp18czFDH+OgcWGb5ZP/XMt3dcyPA=="],
 
     "@emnapi/wasi-threads": ["@emnapi/wasi-threads@1.2.1", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-uTII7OYF+/Mes/MrcIOYp5yOtSMLBWSIoLPpcgwipoiKbli6k322tcoFsxoIIxPDqW01SQGAgko4EzZi2BNv2w=="],
+
+    "@haiso/omp-bridge": ["@haiso/omp-bridge@workspace:packages/omp-bridge"],
 
     "@huggingface/blake3-jit": ["@huggingface/blake3-jit@0.0.2", "", {}, "sha512-Bq7B5qabyjrJfhBsl85Jd2QBtf+HzRD7h7A9GfN2lzrrsABhOa5evVPgzoCTxR7Ub0QFj7YDK1YkYRWBU25+2w=="],
 

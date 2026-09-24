@@ -3,11 +3,17 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { connectDiscordModeAt, DiscordModeRequestError } from "../../src/discord-mode/client";
+import {
+	connectDiscordModeAt,
+	connectExistingDiscordMode,
+	DiscordModeRequestError,
+	DISCORD_MODE_AUTH_HEADER,
+	DISCORD_MODE_CONFIG_HEADER,
+} from "@oh-my-pi/pi-utils/discord-client";
 import { parseDiscordModeConfig } from "../../src/discord-mode/config";
-import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "../../src/discord-mode/private-files";
-import { DISCORD_MODE_MAX_FRAME, DISCORD_MODE_PROTOCOL, type ModeRequest } from "../../src/discord-mode/protocol";
-import { DISCORD_MODE_AUTH_HEADER, startDiscordModeServer } from "../../src/discord-mode/server";
+import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
+import { DISCORD_MODE_MAX_FRAME, DISCORD_MODE_PROTOCOL, type ModeRequest } from "@oh-my-pi/pi-wire/discord-mode";
+import { startDiscordModeServer } from "../../src/discord-mode/server";
 import { ensureDiscordModeToken, smokeTestDiscordModeWorker } from "../../src/discord-mode/worker";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -221,6 +227,58 @@ describe("Discord authenticated Unix transport", () => {
 		cleanups.push(() => client.close());
 		await expect(client.probe("account-b")).rejects.toThrow();
 		await client.probe("account-a");
+	});
+
+	it("attaches the standalone connector to the native server without reading account configuration", async () => {
+		const root = await directory();
+		const socketPath = path.join(root, "ipc.sock");
+		const token = randomBytes(32).toString("base64url");
+		let calls = 0;
+		const server = await startDiscordModeServer({
+			socketPath,
+			token,
+			configKey: "native-account",
+			broker: {
+				async request() {
+					calls++;
+					return {
+						group: { id: "group-1", projectDir: root, name: "Project", state: "ready" as const },
+						session: {
+							id: "session-1",
+							groupId: "group-1",
+							projectDir: root,
+							sessionFile: path.join(root, "session.jsonl"),
+							label: "Session",
+							connectionId: "connection-1",
+							enabled: true,
+							connected: true,
+							busy: false,
+							pendingInput: false,
+							state: "ready" as const,
+						},
+						peers: [],
+						deliveries: [],
+						answers: [],
+						gatewayConnected: true,
+					};
+				},
+			},
+		});
+		cleanups.push(() => server.close());
+		await writePrivateJson(path.join(root, "ipc-token.json"), { token });
+		await writePrivateJson(path.join(root, "connector.json"), { version: 1, configKey: "native-account" });
+		await fs.writeFile(path.join(root, "config.json"), "unreadable", { mode: 0 });
+		const client = await connectExistingDiscordMode(root);
+		cleanups.push(() => client.close());
+		expect((await client.request(report)).session.id).toBe("session-1");
+		const rejected = await fetch("http://discord-mode.local/request", {
+			unix: socketPath,
+			method: "POST",
+			headers: { [DISCORD_MODE_AUTH_HEADER]: token, [DISCORD_MODE_CONFIG_HEADER]: "other-account" },
+			body: JSON.stringify({ protocol: DISCORD_MODE_PROTOCOL, request: report }),
+		});
+		expect(rejected.status).toBe(409);
+		expect(calls).toBe(1);
 	});
 
 	it("launches the source-fallback worker and authenticates protocol identity without Discord", async () => {

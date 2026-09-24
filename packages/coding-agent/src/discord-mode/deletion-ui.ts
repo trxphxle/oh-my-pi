@@ -1,7 +1,7 @@
 import { HookSelectorComponent } from "@oh-my-pi/pi-tui/overlays/hook-selector";
 import type { SessionDeleteChoice } from "@oh-my-pi/pi-tui/overlays/session-selector";
 import type { InteractiveModeContext } from "../modes/types";
-import type { ModeRetirementPolicy } from "./protocol";
+import type { ModeRetirementPolicy } from "@oh-my-pi/pi-wire/discord-mode";
 import { lookupDiscordDeletionBinding } from "./retirement-events";
 
 /** A local saved binding is sufficient; deletion never waits for the bot. */

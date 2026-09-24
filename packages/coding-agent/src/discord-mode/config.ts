@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
-import { readPrivateJson, writePrivateJson } from "./private-files";
-import type { DiscordModeConfig } from "./protocol";
+import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
+import type { DiscordModeConfig } from "@oh-my-pi/pi-wire/discord-mode";
 
 export const DISCORD_MODE_ROOT_ENV = "OMP_DISCORD_MODE_ROOT";
 export const DISCORD_MODE_CONFIG_ENV = "OMP_DISCORD_MODE_CONFIG_PATH";

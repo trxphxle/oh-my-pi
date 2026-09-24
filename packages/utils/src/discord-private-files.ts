@@ -35,7 +35,7 @@ export async function ensurePrivateDirectory(directoryPath: string): Promise<voi
 }
 
 /** Bounded, no-follow reads; missing files alone return undefined. */
-export async function readPrivateJson(filePath: string, maxBytes = MAX_PRIVATE_BYTES): Promise<unknown | undefined> {
+export async function readPrivateText(filePath: string, maxBytes = MAX_PRIVATE_BYTES): Promise<string | undefined> {
 	absolute(filePath);
 	if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_PRIVATE_BYTES)
 		throw new Error("Invalid private file size limit.");
@@ -62,12 +62,22 @@ export async function readPrivateJson(filePath: string, maxBytes = MAX_PRIVATE_B
 			throw new Error("Discord mode private file changed while reading.");
 		}
 		try {
-			return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length))) as unknown;
+			return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length));
 		} catch {
-			throw new Error("Discord mode private file contains invalid JSON.");
+			throw new Error("Discord mode private file contains invalid UTF-8.");
 		}
 	} finally {
 		await file.close();
+	}
+}
+
+export async function readPrivateJson(filePath: string, maxBytes = MAX_PRIVATE_BYTES): Promise<unknown | undefined> {
+	const text = await readPrivateText(filePath, maxBytes);
+	if (text === undefined) return undefined;
+	try {
+		return JSON.parse(text) as unknown;
+	} catch {
+		throw new Error("Discord mode private file contains invalid JSON.");
 	}
 }
 

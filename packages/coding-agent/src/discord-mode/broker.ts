@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { canonicalProjectDir } from "../launch/paths";
 import { discordCategoryName, discordChannelName } from "./names";
-import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "./private-files";
+import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	discardDiscordDeletionEvent,
 	isDiscordDeletedSessionFile,
@@ -32,7 +32,7 @@ import {
 	type ModeSession,
 	type ModeSnapshot,
 	type RemoteChannel,
-} from "./protocol";
+} from "@oh-my-pi/pi-wire/discord-mode";
 
 export const DISCORD_MODE_LEASE_MS = 45_000;
 export const DISCORD_MODE_RECONCILE_MS = 15_000;

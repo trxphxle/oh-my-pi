@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added shared protocol-only Discord broker clients, private storage helpers, and held service leases for external session adapters.
+
 ### Changed
 
 - Haiso identifies itself separately while preserving existing `.omp` configuration, XDG storage, logs, and provider compatibility.

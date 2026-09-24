@@ -4,8 +4,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
-import { connectDiscordModeAt } from "../../src/discord-mode/client";
-import { readPrivateJson, writePrivateJson } from "../../src/discord-mode/private-files";
+import { connectDiscordModeAt } from "@oh-my-pi/pi-utils/discord-client";
+import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	commitDiscordDeletionEvent,
 	discardDiscordDeletionEvent,
@@ -28,7 +28,7 @@ import type {
 	ModeRequest,
 	ModeSnapshot,
 	RemoteChannel,
-} from "../../src/discord-mode/protocol";
+} from "@oh-my-pi/pi-wire/discord-mode";
 
 const config = { guildId: "100", ownerId: "200", botToken: "offline-fixture-only" };
 

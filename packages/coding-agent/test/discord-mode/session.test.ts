@@ -19,7 +19,7 @@ import {
 	type ModeDialog,
 	type ModeRequest,
 	type ModeSnapshot,
-} from "../../src/discord-mode/protocol";
+} from "@oh-my-pi/pi-wire/discord-mode";
 import type { AgentSessionEvent } from "../../src/session/agent-session-events";
 import { normalizeCustomMessagePayload } from "../../src/session/messages";
 import { executeBuiltinSlashCommand } from "../../src/slash-commands/builtin-registry";

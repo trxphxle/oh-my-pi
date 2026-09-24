@@ -1,5 +1,5 @@
 import { replaceTabs } from "@oh-my-pi/pi-tui";
-import type { BindingState, ModeSnapshot } from "./protocol";
+import type { BindingState, ModeSnapshot } from "@oh-my-pi/pi-wire/discord-mode";
 
 export interface DiscordModePresentation {
 	state: "off" | "connected" | "disconnected" | "repair" | "held";

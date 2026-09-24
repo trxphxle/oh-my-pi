@@ -2,7 +2,7 @@ import * as path from "node:path";
 import { Container, Input, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { discordModePaths, loadDiscordModeConfig, saveDiscordModeConfig } from "../discord-mode/config";
 import { ensureDiscordModeSession, getDiscordModeSession, type DiscordModeSession } from "../discord-mode/session";
-import type { ModeSnapshot } from "../discord-mode/protocol";
+import type { ModeSnapshot } from "@oh-my-pi/pi-wire/discord-mode";
 import { describeDiscordMode, type DiscordModePresentation } from "../discord-mode/presentation";
 import type { InteractiveModeContext } from "../modes/types";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";

@@ -7,13 +7,18 @@ import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { canonicalProjectDir } from "../launch/paths";
 import { parseTitleSlotLine } from "../session/session-title-slot";
 import { discordModePaths } from "./config";
-import { createPrivateJson, ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "./private-files";
+import {
+	createPrivateJson,
+	ensurePrivateDirectory,
+	readPrivateJson,
+	writePrivateJson,
+} from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	DISCORD_MODE_MAX_SESSIONS,
 	type ModeDeletionBinding,
 	type ModeDeletionEvent,
 	type ModeRetirementPolicy,
-} from "./protocol";
+} from "@oh-my-pi/pi-wire/discord-mode";
 
 const MAX_STATE_BYTES = 24 * 1024 * 1024;
 const MAX_EVENT_BYTES = 16 * 1024;

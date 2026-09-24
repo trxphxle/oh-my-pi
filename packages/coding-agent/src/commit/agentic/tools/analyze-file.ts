@@ -1,6 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import { prompt } from "@oh-my-pi/pi-utils";
-import analyzeFilePrompt from "../../../commit/agentic/prompts/analyze-file.md" with { type: "text" };
+import analyzeFilePrompt from "../prompts/analyze-file.md" with { type: "text" };
 import type { CommitAgentState } from "../../../commit/agentic/state";
 import type { NumstatEntry } from "../../../commit/types";
 import type { ModelRegistry } from "../../../config/model-registry";

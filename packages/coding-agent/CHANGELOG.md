@@ -8,6 +8,7 @@
 - Added a verified source installer for the independent `haiso` command and runtime.
 - Added Discord `/session status`, `/session stop`, and `/session queue`, with session-card controls and guidance/cancellation actions for waiting messages.
 - Added session-deletion choices to archive the Discord conversation or explicitly delete its channel, with durable offline cleanup and closed-session notices.
+- Added an optional official OMP connector with explicit `/bridge` attachment, peer messaging, and reports without loading Haiso's application runtime or changing model settings.
 
 ### Changed
 

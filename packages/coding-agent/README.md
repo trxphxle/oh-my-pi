@@ -24,7 +24,7 @@ channels of their own.
 
 ### Setup and enrollment
 
-1. Run `haiso`, not the separate official `omp` installation. Use `haiso --resume` to continue an existing conversation after closing its old process.
+1. For native integration, run `haiso`. Use `haiso --resume` to continue an existing conversation after closing its old process. Official OMP users can use the [optional connector](#optional-official-omp-connector) instead.
 2. Create a dedicated bot in the [Discord Developer Portal](https://discord.com/developers/applications).
    Enable **Message Content Intent**, invite it to your private server, and grant
    **View Channels, Send Messages, Read Message History, Attach Files, Embed Links,
@@ -50,6 +50,52 @@ tools, conversation, and approval settings. It does not launch another coding
 engine. Keep the office machine awake, logged in, and online; ordinary terminal
 sessions still end when their host exits. This mode does not install a login
 service or automatically create persistent Builder processes.
+
+### Optional official OMP connector
+
+`packages/omp-bridge` is an opt-in extension for official OMP, verified with OMP
+18.2.8. It reuses this broker through private local IPC; it neither imports the
+Haiso application runtime nor runs a second Discord bot.
+
+Build from a prepared checkout and load explicitly:
+
+```sh
+bun packages/omp-bridge/scripts/build.ts
+omp --extension /absolute/path/to/oh-my-pi/packages/omp-bridge/dist/index.js --resume
+```
+
+The normal Haiso account setup remains a one-time broker-side operation. A current
+Haiso `/discord on` connection publishes the private connector descriptor. Keep
+that configured broker running, then use `/bridge on [channel label]` in OMP.
+The OMP conversation must already be saved: resume one or complete a local turn
+first. The connector never creates or rewrites OMP's native session file.
+
+| OMP terminal command | Behavior |
+| --- | --- |
+| `/bridge on [label]` | Explicitly attach this saved conversation and enable its small `bridge` tool. |
+| `/bridge off` | Stop routing, release the service lease, and remove only this extension's tool. |
+| `/bridge status` | Inspect local connection, destination, and uncertain deliveries. |
+| `/bridge reconcile` | Review unknown delivery outcomes without replaying them. |
+| `/bridge repair` | Explicitly repair a binding or resume held work after inspection. |
+
+The tool exposes `peers`, `send`, and `report`. Peer input stays untrusted agent
+data; only attributable owner-turn final text and explicit reports reach Discord.
+Enabling the tool lets OMP refresh its own tool catalog; no Haiso persona or system
+instructions are appended, and model/advisor/approval settings are unchanged.
+Existing project rules and conversation contents still apply normally.
+
+Use `--bridge-root /absolute/path/to/discord-mode` or `HAISO_BRIDGE_ROOT` for a
+different broker profile. The default is `~/.omp/agent/discord-mode`. The extension
+reads IPC credentials only, never `config.json` or the Discord bot token. It holds
+the existing managed service alive while attached, even after the original Haiso
+host exits. It does not start or replace a stopped service; start the configured
+broker from Haiso before attaching again.
+
+Approvals and settings stay in OMP's terminal. Its public extension API does not
+provide this connector an authoritative permanent-deletion event: switching,
+branching, navigating history, or exiting detaches, but does not delete the Discord
+channel. Do not infer deletion from a missing file. Use Haiso's native retirement
+workflow or explicitly clean up the Discord channel when needed.
 
 ### Conversation and control
 

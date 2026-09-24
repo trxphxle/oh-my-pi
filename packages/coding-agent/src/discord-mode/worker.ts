@@ -5,7 +5,12 @@ import * as path from "node:path";
 import { ptree } from "@oh-my-pi/pi-utils";
 import { SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
 import { DiscordModeBroker } from "./broker";
-import { connectDiscordModeAt, readDiscordModeToken, resolveDiscordModeWorkerCommand } from "./client";
+import {
+	connectDiscordModeAt,
+	readDiscordModeToken,
+	DISCORD_MODE_AUTH_HEADER,
+} from "@oh-my-pi/pi-utils/discord-client";
+import { resolveDiscordModeWorkerCommand } from "./client";
 import {
 	DISCORD_MODE_ROOT_ENV,
 	DISCORD_MODE_SOCKET_ENV,
@@ -14,9 +19,9 @@ import {
 	loadDiscordModeConfig,
 } from "./config";
 import { DiscordAdapter } from "./discord";
-import { createPrivateJson, ensurePrivateDirectory } from "./private-files";
-import { DISCORD_MODE_PROTOCOL, DISCORD_MODE_READY } from "./protocol";
-import { DISCORD_MODE_AUTH_HEADER, startDiscordModeServer } from "./server";
+import { createPrivateJson, ensurePrivateDirectory } from "@oh-my-pi/pi-utils/discord-private-files";
+import { DISCORD_MODE_PROTOCOL, DISCORD_MODE_READY } from "@oh-my-pi/pi-wire/discord-mode";
+import { startDiscordModeServer } from "./server";
 
 const SMOKE_ARG = "--discord-mode-smoke";
 
