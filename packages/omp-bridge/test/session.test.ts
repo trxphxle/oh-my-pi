@@ -15,6 +15,8 @@ import {
 	type ModeEnrollment,
 	type ModeRequest,
 	type ModeSession,
+	type ModeSettingCommand,
+	type ModeSettingsView,
 	type ModeSnapshot,
 } from "@oh-my-pi/pi-wire/discord-mode";
 import {
@@ -24,6 +26,7 @@ import {
 	type BridgeConnection,
 	type BridgeHost,
 	type BridgeHostState,
+	type BridgeSettingResult,
 } from "../src/host";
 import { BridgeSession } from "../src/session";
 
@@ -67,7 +70,14 @@ function marker(delivery: ModeDelivery): AgentMessage {
 	} as AgentMessage;
 }
 
-async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: number } = {}) {
+async function fixture(
+	options: {
+		timers?: boolean;
+		saved?: boolean;
+		maxReply?: number;
+		/** Broker advertises settings. */ settings?: boolean;
+	} = {},
+) {
 	const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-session-"));
 	const root = await fs.realpath(temporary);
 	cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
@@ -140,6 +150,16 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 	let aborts = 0;
 	let connects = 0;
 	let mode: BridgeSession;
+	/** Broker-side settings: the stored view revision, unacknowledged commands, and acknowledgements received. */
+	let settingsRevision = "";
+	const reportedViews: ModeSettingsView[] = [];
+	const commands: ModeSettingCommand[] = [];
+	const results: Array<Extract<ModeRequest, { op: "command-result" }>> = [];
+	const applied: ModeSettingCommand[] = [];
+	let applyResult: (command: ModeSettingCommand) => Promise<BridgeSettingResult> = async command => ({
+		outcome: "applied",
+		text: `Applied ${command.kind}.`,
+	});
 	const snapshot = (items: ModeDelivery[] = [...deliveries.values()]): ModeSnapshot =>
 		structuredClone({
 			group,
@@ -150,6 +170,7 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 			answers: [],
 			gatewayConnected: true,
 			...(options.maxReply === undefined ? {} : { maxReply: options.maxReply }),
+			...(options.settings ? { settingsRevision } : {}),
 		});
 	const connect = async (): Promise<BridgeConnection> => {
 		connects++;
@@ -218,7 +239,23 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 								intake.push(item);
 								if (item.kind === "message") busy = true;
 							}
-							result = snapshot(intake);
+							if (input.settings) {
+								settingsRevision = input.settings.revision;
+								reportedViews.push(input.settings);
+							}
+							result = {
+								...snapshot(intake),
+								...(commands.length ? { commands: structuredClone(commands) } : {}),
+							};
+							break;
+						}
+						case "command-result": {
+							results.push(input);
+							const index = commands.findIndex(item => item.id === input.commandId);
+							if (index < 0) throw new Error("unknown settings command");
+							commands.splice(index, 1);
+							if (input.settings) settingsRevision = input.settings.revision;
+							result = snapshot();
 							break;
 						}
 						case "receipt": {
@@ -295,6 +332,18 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 				timer.cancelled = true;
 			};
 		},
+		settings: () => ({
+			model: { selector: "fixture/alpha", name: "Alpha", efforts: ["off", "low", "high"] },
+			effort: "low",
+			capabilities: { persist: false, compact: true, advisor: false, plan: false },
+			shortlist: [{ selector: "fixture/alpha", name: "Alpha", efforts: ["off", "low", "high"] }],
+			models: [{ selector: "fixture/alpha", name: "Alpha", efforts: ["off", "low", "high"] }],
+		}),
+		usage: () => ({ tokens: 10, contextWindow: 100, percent: 10 }),
+		applySetting: command => {
+			applied.push(command);
+			return applyResult(command);
+		},
 	};
 	const create = () => new BridgeSession(host, { root, connect, pollIntervalMs: options.timers ? 1000 : 0 });
 	mode = create();
@@ -310,6 +359,13 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 		host,
 		peer,
 		requests,
+		reportedViews,
+		commands,
+		results,
+		applied,
+		set applyResult(value: typeof applyResult) {
+			applyResult = value;
+		},
 		deliveries,
 		delivered,
 		publications,
@@ -997,5 +1053,40 @@ describe("BridgeSession remembered sharing", () => {
 		const pending = f.timers.at(-1)!;
 		await f.mode.detach();
 		expect(pending.cancelled).toBe(true);
+	});
+});
+
+describe("BridgeSession Discord settings", () => {
+	test("reports settings only to brokers advertising them and applies an owner change once, at idle", async () => {
+		const legacy = await fixture();
+		await legacy.mode.on();
+		await legacy.mode.poll();
+		// Brokers without settings support reject unknown poll fields.
+		expect(legacy.requests.some(request => "settings" in request || "usage" in request)).toBe(false);
+
+		const f = await fixture({ settings: true });
+		await f.mode.on();
+		await f.mode.poll();
+		expect(f.reportedViews).toMatchObject([
+			{
+				model: { selector: "fixture/alpha" },
+				capabilities: { persist: false, compact: true, advisor: false, plan: false },
+			},
+		]);
+		const command = { id: randomUUID(), kind: "effort" as const, value: "high" };
+		f.commands.push(command);
+		f.state.idle = false;
+		await f.mode.poll();
+		expect(f.applied).toEqual([]);
+		const acknowledged = Promise.withResolvers<void>();
+		f.afterRequest = async input => {
+			if (input.op === "command-result") acknowledged.resolve();
+		};
+		f.state.idle = true;
+		await f.mode.poll();
+		await acknowledged.promise;
+		await f.mode.poll();
+		expect(f.applied).toEqual([command]);
+		expect(f.results).toMatchObject([{ commandId: command.id, outcome: "applied", text: "Applied effort." }]);
 	});
 });

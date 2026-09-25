@@ -1,13 +1,17 @@
 // Protocol-only Discord IPC transport. No service discovery, startup, or account configuration.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import {
 	DISCORD_MODE_MAX_FRAME,
+	DISCORD_MODE_MAX_MODELS,
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_SESSIONS,
 	DISCORD_MODE_MAX_REPLY,
+	DISCORD_MODE_MAX_SETTING_COMMANDS,
+	DISCORD_MODE_MAX_SETTINGS_BYTES,
+	DISCORD_MODE_MAX_SHORTLIST,
 	DISCORD_MODE_MAX_TEXT,
 	DISCORD_MODE_PROTOCOL,
 	type DiscordModeInfo,
@@ -15,7 +19,9 @@ import {
 	type ModeEnrollment,
 	type ModeGroup,
 	type ModeRequest,
+	type ModeModelChoice,
 	type ModeSession,
+	type ModeSettingsView,
 	type ModeSnapshot,
 } from "@oh-my-pi/pi-wire/discord-mode";
 import { readPrivateJson, readPrivateText } from "./discord-private-files";
@@ -37,6 +43,120 @@ function identifier(value: unknown): value is string {
 }
 function absolutePath(value: unknown): value is string {
 	return text(value, 4096) && path.isAbsolute(value);
+}
+const SETTING_KINDS = ["model", "effort", "default", "compact", "advisor", "advisor-model", "plan"];
+const EFFORT = /^[a-z0-9-]{1,16}$/;
+/** Nonempty, bounded, and free of control characters; the broker enforces the same rule. */
+function plain(value: unknown, max: number): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= max && !/[\x00-\x1f\x7f]/.test(value);
+}
+function modelChoice(value: unknown): boolean {
+	return (
+		record(value) &&
+		plain(value.selector, 200) &&
+		plain(value.name, 100) &&
+		(value.role === undefined || plain(value.role, 32)) &&
+		Array.isArray(value.efforts) &&
+		value.efforts.length <= 10 &&
+		value.efforts.every(effort => typeof effort === "string" && EFFORT.test(effort))
+	);
+}
+/** Session-reported settings; bounded so a view never crowds a poll frame. */
+export function isModeSettingsView(value: unknown): value is ModeSettingsView {
+	if (
+		!record(value) ||
+		typeof value.revision !== "string" ||
+		!/^[A-Za-z0-9_-]{1,64}$/.test(value.revision) ||
+		(value.model !== undefined && !modelChoice(value.model)) ||
+		(value.effort !== undefined && !(typeof value.effort === "string" && EFFORT.test(value.effort))) ||
+		!record(value.capabilities) ||
+		!["persist", "compact", "advisor", "plan"].every(
+			key => typeof (value.capabilities as Record<string, unknown>)[key] === "boolean",
+		) ||
+		(value.advisor !== undefined &&
+			!(
+				record(value.advisor) &&
+				typeof value.advisor.enabled === "boolean" &&
+				typeof value.advisor.active === "boolean" &&
+				(value.advisor.model === undefined || plain(value.advisor.model, 200))
+			)) ||
+		(value.plan !== undefined && !(record(value.plan) && typeof value.plan.enabled === "boolean")) ||
+		!Array.isArray(value.shortlist) ||
+		value.shortlist.length > DISCORD_MODE_MAX_SHORTLIST ||
+		!value.shortlist.every(modelChoice) ||
+		!Array.isArray(value.models) ||
+		value.models.length > DISCORD_MODE_MAX_MODELS ||
+		!value.models.every(modelChoice)
+	)
+		return false;
+	return Buffer.byteLength(JSON.stringify(value)) <= DISCORD_MODE_MAX_SETTINGS_BYTES;
+}
+
+/**
+ * Clamp a session's settings report into the wire bounds and stamp its revision. Names lose control characters,
+ * invalid selectors and efforts are dropped, and trailing searchable models are dropped until the view fits.
+ */
+export function sealModeSettingsView(report: Omit<ModeSettingsView, "revision">): ModeSettingsView {
+	const label = (value: string | undefined, max: number) =>
+		value
+			?.replace(/[\x00-\x1f\x7f]/g, " ")
+			.trim()
+			.slice(0, max) || undefined;
+	const choice = (item: ModeModelChoice): ModeModelChoice[] => {
+		if (!plain(item.selector, 200)) return [];
+		const role = label(item.role, 32);
+		return [
+			{
+				selector: item.selector,
+				name: label(item.name, 100) ?? item.selector.slice(0, 100),
+				...(role ? { role } : {}),
+				efforts: item.efforts.filter(effort => EFFORT.test(effort)).slice(0, 10),
+			},
+		];
+	};
+	const [model] = report.model ? choice(report.model) : [];
+	const view: Omit<ModeSettingsView, "revision"> = {
+		...(model ? { model } : {}),
+		...(report.effort && EFFORT.test(report.effort) ? { effort: report.effort } : {}),
+		...(report.advisor
+			? {
+					advisor: {
+						enabled: report.advisor.enabled,
+						active: report.advisor.active,
+						...(plain(report.advisor.model, 200) ? { model: report.advisor.model } : {}),
+					},
+				}
+			: {}),
+		...(report.plan ? { plan: { enabled: report.plan.enabled } } : {}),
+		capabilities: { ...report.capabilities },
+		shortlist: report.shortlist.flatMap(choice).slice(0, DISCORD_MODE_MAX_SHORTLIST),
+		models: [],
+	};
+	// Room for the revision stamp: `"revision":"<16 hex>",`.
+	let bytes = Buffer.byteLength(JSON.stringify(view)) + 32;
+	for (const item of report.models.flatMap(choice).slice(0, DISCORD_MODE_MAX_MODELS)) {
+		const size = Buffer.byteLength(JSON.stringify(item)) + 1;
+		if (bytes + size > DISCORD_MODE_MAX_SETTINGS_BYTES) break;
+		bytes += size;
+		view.models.push(item);
+	}
+	return { revision: createHash("sha256").update(JSON.stringify(view)).digest("hex").slice(0, 16), ...view };
+}
+function usage(value: unknown): boolean {
+	return (
+		record(value) &&
+		["tokens", "contextWindow", "percent"].every(
+			key => typeof value[key] === "number" && Number.isFinite(value[key]) && (value[key] as number) >= 0,
+		)
+	);
+}
+function settingCommand(value: unknown): boolean {
+	return (
+		record(value) &&
+		identifier(value.id) &&
+		SETTING_KINDS.includes(String(value.kind)) &&
+		(value.value === undefined || typeof value.value === "boolean" || plain(value.value, 200))
+	);
 }
 
 /** Reject invalid envelopes before they can enter the effect-owning broker queue. */
@@ -71,7 +191,20 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 		return false;
 	switch (value.op) {
 		case "poll":
-			return typeof value.busy === "boolean" && typeof value.pendingInput === "boolean";
+			return (
+				typeof value.busy === "boolean" &&
+				typeof value.pendingInput === "boolean" &&
+				(value.settings === undefined || isModeSettingsView(value.settings)) &&
+				(value.usage === undefined || usage(value.usage))
+			);
+		case "command-result":
+			return (
+				identifier(value.commandId) &&
+				["applied", "rejected", "failed"].includes(String(value.outcome)) &&
+				text(value.text, 500) &&
+				(value.settings === undefined || isModeSettingsView(value.settings)) &&
+				(value.usage === undefined || usage(value.usage))
+			);
 		case "status":
 		case "off":
 		case "detach":
@@ -296,7 +429,12 @@ function snapshot(value: unknown): value is ModeSnapshot {
 				(item.value === undefined || typeof item.value === "string" || typeof item.value === "boolean"),
 		) &&
 		(value.maxReply === undefined ||
-			(typeof value.maxReply === "number" && Number.isSafeInteger(value.maxReply) && value.maxReply > 0))
+			(typeof value.maxReply === "number" && Number.isSafeInteger(value.maxReply) && value.maxReply > 0)) &&
+		(value.settingsRevision === undefined || text(value.settingsRevision, 64, true)) &&
+		(value.commands === undefined ||
+			(Array.isArray(value.commands) &&
+				value.commands.length <= DISCORD_MODE_MAX_SETTING_COMMANDS &&
+				value.commands.every(settingCommand)))
 	);
 }
 

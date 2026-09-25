@@ -6,7 +6,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	DISCORD_MODE_MAX_FRAME,
+	DISCORD_MODE_MAX_MODELS,
 	DISCORD_MODE_MAX_REPLY,
+	DISCORD_MODE_MAX_SETTINGS_BYTES,
+	DISCORD_MODE_MAX_SHORTLIST,
 	DISCORD_MODE_MAX_TEXT,
 	DISCORD_MODE_PROTOCOL,
 	type ModeRequest,
@@ -19,6 +22,7 @@ import {
 	DISCORD_MODE_CONFIG_HEADER,
 	DiscordModeRequestError,
 	readDiscordModeJsonBody,
+	sealModeSettingsView,
 } from "../src/discord-client";
 import { readPrivateText, writePrivateJson } from "../src/discord-private-files";
 
@@ -371,6 +375,58 @@ describe("protocol-only Discord attachment", () => {
 		expect(server.effects).toBe(1);
 		server.respond = () =>
 			Response.json({ protocol: DISCORD_MODE_PROTOCOL, ok: true, result: { ...snapshot, maxReply: -1 } });
+		await expect(client.request(request)).rejects.toMatchObject({ outcome: "unknown" });
+	});
+
+	it("seals settings views into their byte bound and refuses unsealed views and unknown commands", async () => {
+		const root = await directory();
+		const server = await endpoint(root);
+		const client = await connectExistingDiscordMode(root);
+		cleanups.push(() => client.close());
+		const choice = (index: number) => ({
+			selector: `provider/model-${index}-${"x".repeat(150)}`,
+			name: `Model\n${index}`,
+			efforts: ["off", "high", "Not An Effort"],
+		});
+		const models = Array.from({ length: DISCORD_MODE_MAX_MODELS }, (_, index) => choice(index));
+		const view = sealModeSettingsView({
+			model: choice(0),
+			effort: "high",
+			capabilities: { persist: false, compact: true, advisor: false, plan: false },
+			shortlist: models.slice(0, 30),
+			models,
+		});
+		// 200 long entries overflow the bound: sealing keeps the head of the list and cleans each entry.
+		expect(Buffer.byteLength(JSON.stringify(view))).toBeLessThanOrEqual(DISCORD_MODE_MAX_SETTINGS_BYTES);
+		expect(view.models.length).toBeGreaterThan(0);
+		expect(view.models.length).toBeLessThan(DISCORD_MODE_MAX_MODELS);
+		expect(view.shortlist).toHaveLength(DISCORD_MODE_MAX_SHORTLIST);
+		expect(view.models[0]).toEqual({ selector: choice(0).selector, name: "Model 0", efforts: ["off", "high"] });
+		const poll = (settings: unknown) =>
+			({ op: "poll", lease: request.lease, busy: false, pendingInput: false, settings }) as ModeRequest;
+		await client.request(poll(view));
+		await client.request({
+			op: "command-result",
+			lease: request.lease,
+			commandId: "command-1",
+			outcome: "applied",
+			text: "Model → Model 1.",
+			settings: view,
+		});
+		expect(server.effects).toBe(2);
+		for (const invalid of [
+			{ ...view, models },
+			{ ...view, revision: "not a revision" },
+			{ ...view, effort: "Loud" },
+		])
+			await expect(client.request(poll(invalid))).rejects.toMatchObject({ outcome: "not-started" });
+		expect(server.effects).toBe(2);
+		server.respond = () =>
+			Response.json({
+				protocol: DISCORD_MODE_PROTOCOL,
+				ok: true,
+				result: { ...snapshot, settingsRevision: "", commands: [{ id: "command-2", kind: "approve-everything" }] },
+			});
 		await expect(client.request(request)).rejects.toMatchObject({ outcome: "unknown" });
 	});
 

@@ -83,7 +83,9 @@ the existing managed service alive while attached, even after the original Haiso
 host exits. It does not start or replace a stopped service; start the configured
 broker from Haiso before attaching again.
 
-Approvals and settings stay in OMP's terminal. Its public extension API does not
+Approvals stay in OMP's terminal; the Discord settings panel offers model, effort,
+and context/compact for OMP sessions (no advisor, plan mode, or "make default").
+Its public extension API does not
 provide this connector an authoritative permanent-deletion event: switching,
 branching, navigating history, or exiting disconnects (sharing is kept), but does
 not delete the Discord channel. Do not infer deletion from a missing file. Use Haiso's native retirement
@@ -102,7 +104,7 @@ is required.
 In a session channel, ordinary owner text queues for an idle boundary; no ask
 command is needed. Queued-message acknowledgments offer **Send as guidance** and
 **Cancel queued message** until dispatch. Session cards expose **Stop turn**,
-**Queue**, and **Session details**.
+**Queue**, **Session details**, and **Settings**.
 
 | Discord command | Behavior |
 | --- | --- |
@@ -110,6 +112,7 @@ command is needed. Queued-message acknowledgments offer **Send as guidance** and
 | `/session stop` | Request cancellation of the current turn, not rollback or process shutdown. |
 | `/session queue` | Inspect waiting owner messages; select one to view its full text and available actions. |
 | `/session notify mode:<all \| needs-you \| off>` | Choose when this session @mentions you (default `needs-you`); works while disconnected and persists. |
+| `/session settings` | Open the settings panel (also the card's **Settings** button). |
 | `!steer <message>` | Send guidance to active work. |
 | `!abort` | Request the same turn cancellation as `/session stop`. |
 
@@ -117,6 +120,15 @@ Mentions ping only the configured owner. `needs-you` pings when a session opens
 an approval or question (once per exchange, not per re-render) and when a reply
 arrives for a message that took 2 minutes or more. `all` also pings every reply;
 `off` never pings. Reports, status cards, acknowledgments, and peer traffic never ping.
+
+The settings panel shows the model, effort, and context use (%), plus advisor and
+plan mode for Haiso sessions. Pick a model from a short list (current, roles,
+recent) or **Search models…**; effort lists only levels the model supports;
+**Compact** works when the session is idle. Changes apply to this session only
+(Haiso's **Make default** is a separate button). A busy session answers *Pending —
+applies after this turn*; the panel confirms only after the session applied the
+change. Leaving plan mode goes through the normal plan approval. Approval rules,
+credentials, and logins are never exposed.
 
 Only queued, non-held owner messages in the current connection can be cancelled
 or promoted to guidance. Dispatched work cannot be changed through queue controls;
@@ -126,8 +138,8 @@ session. All 32 pending messages remain accessible through the queue selector.
 
 Startup replaces the bot's legacy `/omp`, `/team`, and `/tell` commands with the
 guild-scoped `/session` commands; unrelated registrations are preserved. Terminal
-commands such as `/discord on` remain local. Model/context controls and remote
-session creation/restart are not included.
+commands such as `/discord on` remain local. Remote session creation/restart is
+not included.
 
 Attachments, stickers, polls, and forwarded messages are rejected rather than
 partially sent. The overview links enrolled session channels and shows their

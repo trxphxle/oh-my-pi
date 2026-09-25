@@ -8,6 +8,14 @@ export const DISCORD_MODE_MAX_REPLY = 96 * 1024;
 export const DISCORD_MODE_MAX_PENDING = 32;
 export const DISCORD_MODE_MAX_SESSIONS = 128;
 export const DISCORD_MODE_MAX_FRAME = 256 * 1024;
+/** UTF-8 JSON bound for one reported settings view; it rides a poll only when its revision changed. */
+export const DISCORD_MODE_MAX_SETTINGS_BYTES = 48 * 1024;
+/** Quick model choices (one Discord select menu). */
+export const DISCORD_MODE_MAX_SHORTLIST = 25;
+/** Searchable models a session reports; search results are ranked from this list. */
+export const DISCORD_MODE_MAX_MODELS = 200;
+/** Outstanding owner settings changes per session. */
+export const DISCORD_MODE_MAX_SETTING_COMMANDS = 8;
 
 /** Private attachment identity; stable across service restarts, never model-visible. */
 export interface DiscordModeInfo {
@@ -131,6 +139,66 @@ export interface ModeSnapshot {
 	gatewayConnected: boolean;
 	/** Final-reply receipt byte bound; absent from older brokers, which accept only DISCORD_MODE_MAX_TEXT. */
 	maxReply?: number;
+	/**
+	 * Revision of this connection's last reported settings view, `""` before the first. Present only from brokers
+	 * that accept `settings`/`usage` on poll and `command-result`; older brokers reject those fields.
+	 */
+	settingsRevision?: string;
+	/** Poll only: owner settings changes this connection has not acknowledged yet, oldest first; ids repeat until acked. */
+	commands?: ModeSettingCommand[];
+}
+/** Owner-queued session settings changes. Approval policy, credentials, and logins never cross this boundary. */
+export type ModeSettingKind = "model" | "effort" | "default" | "compact" | "advisor" | "advisor-model" | "plan";
+export interface ModeSettingCommand {
+	id: string;
+	kind: ModeSettingKind;
+	/** `model`/`advisor-model`: model selector; `effort`: level; `advisor`: on/off. */
+	value?: string | boolean;
+}
+export interface ModeModelChoice {
+	/** Canonical `provider/id`. */
+	selector: string;
+	name: string;
+	/** Model role this choice fills (default, smol, slow, …). */
+	role?: string;
+	/** Effort choices this model supports, in ladder order; empty when it has no effort control. */
+	efforts: string[];
+}
+/** What the session lets a Discord owner see and change; controls follow `capabilities`. */
+export interface ModeSettingsView {
+	/** Session-computed digest of the rest of the view; the broker echoes it as `settingsRevision`. */
+	revision: string;
+	model?: ModeModelChoice;
+	/** Configured effort: a supported level, `off`, or `auto`. */
+	effort?: string;
+	advisor?: { enabled: boolean; active: boolean; model?: string };
+	plan?: { enabled: boolean };
+	capabilities: {
+		/** Make default: persist the current model and effort. Session-only otherwise. */
+		persist: boolean;
+		compact: boolean;
+		advisor: boolean;
+		plan: boolean;
+	};
+	/** Quick choices: current, role models, scoped, then recent. */
+	shortlist: ModeModelChoice[];
+	/** Searchable models in the session's picker order. */
+	models: ModeModelChoice[];
+}
+export interface ModeUsage {
+	tokens: number;
+	contextWindow: number;
+	percent: number;
+}
+/** Broker-assembled settings panel content. */
+export interface ModeSettingsPanel {
+	view: ModeSettingsView;
+	usage?: ModeUsage;
+	busy: boolean;
+	/** Outstanding changes, oldest first. */
+	pending: ModeSettingCommand[];
+	/** Ranked search results when the request carried a query. */
+	matches?: ModeModelChoice[];
 }
 export type ModeRequest =
 	| { op: "retire"; eventId: string }
@@ -151,7 +219,25 @@ export type ModeRequest =
 			 */
 			rejoin?: true;
 	  }
-	| { op: "poll"; lease: ModeLease; busy: boolean; pendingInput: boolean }
+	| {
+			op: "poll";
+			lease: ModeLease;
+			busy: boolean;
+			pendingInput: boolean;
+			/** Only to brokers advertising `settingsRevision`, and only when the revision changed. */
+			settings?: ModeSettingsView;
+			usage?: ModeUsage;
+	  }
+	/** Outcome of one owner settings change, with the fresh view; only to brokers advertising `settingsRevision`. */
+	| {
+			op: "command-result";
+			lease: ModeLease;
+			commandId: string;
+			outcome: "applied" | "rejected" | "failed";
+			text: string;
+			settings?: ModeSettingsView;
+			usage?: ModeUsage;
+	  }
 	| { op: "status"; lease: ModeLease }
 	| { op: "off"; lease: ModeLease }
 	/** Drop this connection but keep sharing enabled, so resuming the conversation rejoins its channel. */
@@ -205,15 +291,22 @@ export interface ModeControlResult {
 	connectionId?: string;
 	deliveryId?: string;
 	queued?: ModeQueuedMessage[];
+	settings?: ModeSettingsPanel;
+	/** A queued settings change; its outcome arrives later through `DiscordPort.settingsResult`. */
+	commandId?: string;
 }
 export interface ModeControlRequest {
 	id: string;
 	channelId: string;
 	ownerId: string;
-	action: "status" | "stop" | "queue" | "cancel" | "steer" | "notify";
+	action: "status" | "stop" | "queue" | "cancel" | "steer" | "notify" | "settings" | "setting";
 	connectionId?: string;
 	deliveryId?: string;
 	notify?: ModeNotify;
+	/** `setting` only. `model`/`advisor-model` values are choice tokens from the panel, never raw selectors. */
+	setting?: { kind: ModeSettingKind; value?: string | boolean };
+	/** `settings` only: rank the reported models against this text. */
+	query?: string;
 }
 export interface DiscordPortHandlers {
 	ownerMessage(input: {
@@ -263,5 +356,7 @@ export interface DiscordPort {
 	/** `mention` pings the owner; the broker decides per session notify mode. */
 	showDialog(channelId: string, dialog: ModeDialog, options?: { mention?: boolean }): Promise<void>;
 	endDialog(channelId: string, dialogId: string): Promise<void>;
+	/** Outcome of a queued settings change; never mentions. `panel` refreshes the owner's open panel. */
+	settingsResult(channelId: string, commandId: string, text: string, panel?: ModeSettingsPanel): Promise<void>;
 	retire(channelId: string, sessionId: string, policy: ModeRetirementPolicy): Promise<void>;
 }

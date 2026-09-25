@@ -15,7 +15,8 @@ import { DiscordDialogs, type DiscordDialogResult } from "./dialog";
 import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import { describeDiscordMode, type DiscordModePresentation } from "./presentation";
 import { readDiscordSharedSessions } from "./retirement-events";
-import { DiscordModeRequestError } from "@oh-my-pi/pi-utils/discord-client";
+import { createDiscordSettingsHost } from "./settings-host";
+import { DiscordModeRequestError, sealModeSettingsView } from "@oh-my-pi/pi-utils/discord-client";
 import {
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_REPLY,
@@ -25,7 +26,10 @@ import {
 	type ModeEnrollment,
 	type ModeLease,
 	type ModeRequest,
+	type ModeSettingCommand,
+	type ModeSettingsView,
 	type ModeSnapshot,
+	type ModeUsage,
 } from "@oh-my-pi/pi-wire/discord-mode";
 
 export interface DiscordSessionClient {
@@ -112,6 +116,20 @@ interface ActiveDelivery {
 	reported: boolean;
 }
 
+export interface DiscordSettingResult {
+	outcome: "applied" | "rejected" | "failed";
+	/** Shown to the Discord owner verbatim; plain, credential-free. */
+	text: string;
+}
+
+/** What a host lets its Discord owner see and change. Only `apply` mutates, and only while the session is idle. */
+export interface DiscordSettingsHost {
+	/** Undefined while there is nothing to report (no model yet, or the host moved to another engine). */
+	view(): Omit<ModeSettingsView, "revision"> | undefined;
+	usage(): ModeUsage | undefined;
+	apply(command: ModeSettingCommand): Promise<DiscordSettingResult>;
+}
+
 export interface DiscordSessionOptions {
 	connect?: () => Promise<DiscordSessionClient>;
 	receiptRoot?: string;
@@ -124,6 +142,8 @@ export interface DiscordSessionOptions {
 	shared?: () => Promise<boolean>;
 	/** Delay before the one rejoin retry while another process still holds the conversation's lease. */
 	rejoinRetryMs?: number;
+	/** Discord settings panel support; without it the session reports no settings and never applies changes. */
+	settings?: DiscordSettingsHost;
 }
 
 const sessions = new WeakMap<DiscordSessionEngine, DiscordModeSession>();
@@ -142,6 +162,10 @@ const MANUAL_RECONNECT_FAILURE = /configuration differs|protocol does not match/
 const REJOIN_RETRY_MS = 50_000;
 /** Expected refusals during automatic rejoin (sharing turned off meanwhile, or the conversation changed): stay quiet. */
 const QUIET_REJOIN_FAILURE = /automatic rejoin skipped|Session changed during Discord enrollment/;
+/** A reported settings view is rebuilt at most this often, and after every applied change. */
+const SETTINGS_REFRESH_MS = 5_000;
+/** Applied results remembered to re-send a lost acknowledgement instead of applying twice. */
+const SETTLED_COMMANDS = 32;
 
 /** The broker's stored form: canonical directory plus basename. */
 async function canonicalSessionFile(file: string): Promise<string> {
@@ -218,6 +242,13 @@ export class DiscordModeSession {
 	#rejoinTimer?: NodeJS.Timeout;
 	/** Set by a successful automatic rejoin; the footer says so until local activity. */
 	#rejoined = false;
+	/** Owner settings changes received on this lease and not yet applied, oldest first. */
+	#commands: ModeSettingCommand[] = [];
+	/** Results already applied on this lease; a repeated command re-sends its result, never applies twice. */
+	#settled = new Map<string, DiscordSettingResult>();
+	#acknowledging = new Set<string>();
+	#applying = false;
+	#settingsView?: { at: number; view: ModeSettingsView };
 
 	constructor(
 		readonly engine: DiscordSessionEngine,
@@ -425,6 +456,7 @@ export class DiscordModeSession {
 		this.#localDialogs = 0;
 		this.#transportAvailable = false;
 		this.#queue = [];
+		this.#clearCommands();
 		this.#reconnectAt = undefined;
 		this.#reconnectDelay = RECONNECT_BASE_MS;
 		this.#reconnectBlocked = undefined;
@@ -559,12 +591,15 @@ export class DiscordModeSession {
 				await this.#reconnect(epoch);
 				return;
 			}
-			await this.#request({
+			const snapshot = await this.#request({
 				op: "poll",
 				lease: this.#requireLease(),
 				busy: this.#busy(),
 				pendingInput: this.pendingInput,
+				...this.#settingsReport(),
 			});
+			// Settings apply first, so the next owner message already runs with them.
+			if (this.#current(epoch, generation)) this.#intakeCommands(snapshot.commands ?? [], epoch, generation);
 			if (this.#current(epoch, generation) && !this.#intakeHeld) await this.#drain(epoch, generation);
 		} catch {
 			if (epoch === this.#epoch && generation === this.#generation) {
@@ -575,6 +610,113 @@ export class DiscordModeSession {
 		} finally {
 			this.#polling = false;
 		}
+	}
+
+	/** Settings ride polls only to brokers that advertise them, and the full view only when its revision changed. */
+	#settingsReport(): { settings?: ModeSettingsView; usage?: ModeUsage } {
+		const revision = this.#snapshot?.settingsRevision;
+		if (!this.#options.settings || revision === undefined) return {};
+		const view = this.#currentSettings();
+		const usage = this.#usage();
+		return { ...(view && view.revision !== revision ? { settings: view } : {}), ...(usage ? { usage } : {}) };
+	}
+
+	#currentSettings(): ModeSettingsView | undefined {
+		const now = performance.now();
+		if (this.#settingsView && now - this.#settingsView.at < SETTINGS_REFRESH_MS) return this.#settingsView.view;
+		let view: ModeSettingsView | undefined;
+		try {
+			const report = this.#options.settings?.view();
+			view = report ? sealModeSettingsView(report) : undefined;
+		} catch {
+			// A host that cannot describe itself reports nothing; polling and delivery continue.
+		}
+		this.#settingsView = view ? { at: now, view } : undefined;
+		return view;
+	}
+
+	#usage(): ModeUsage | undefined {
+		try {
+			return this.#options.settings?.usage();
+		} catch {
+			return undefined;
+		}
+	}
+
+	#intakeCommands(commands: ModeSettingCommand[], epoch: number, generation: number): void {
+		for (const command of commands) {
+			const settled = this.#settled.get(command.id);
+			if (settled) void this.#acknowledge(command.id, settled, epoch, generation);
+			else if (!this.#commands.some(item => item.id === command.id)) this.#commands.push(command);
+		}
+		if (this.#commands.length && !this.#busy()) void this.#applyCommands(epoch, generation);
+	}
+
+	/** Detached from polling: a compaction can outlast the lease, so heartbeats continue while it runs. */
+	async #applyCommands(epoch: number, generation: number): Promise<void> {
+		this.#applying = true;
+		try {
+			while (this.#current(epoch, generation) && this.#commands.length && !this.#engineBusy()) {
+				const command = this.#commands.shift()!;
+				let result: DiscordSettingResult;
+				try {
+					result = this.#options.settings
+						? await this.#options.settings.apply(command)
+						: { outcome: "rejected", text: "This session can't change its settings from Discord." };
+				} catch (error) {
+					result = {
+						outcome: "failed",
+						text: `Failed: ${error instanceof Error ? error.message : String(error)}`,
+					};
+				}
+				this.#settingsView = undefined;
+				if (!this.#current(epoch, generation)) return;
+				this.#settled.set(command.id, result);
+				if (this.#settled.size > SETTLED_COMMANDS) this.#settled.delete(this.#settled.keys().next().value!);
+				await this.#acknowledge(command.id, result, epoch, generation);
+			}
+		} finally {
+			if (epoch === this.#epoch && generation === this.#generation) this.#applying = false;
+		}
+	}
+
+	async #acknowledge(
+		commandId: string,
+		result: DiscordSettingResult,
+		epoch: number,
+		generation: number,
+	): Promise<void> {
+		if (this.#acknowledging.has(commandId) || !this.#current(epoch, generation)) return;
+		this.#acknowledging.add(commandId);
+		try {
+			const view = this.#currentSettings();
+			const usage = this.#usage();
+			await this.#request({
+				op: "command-result",
+				lease: this.#requireLease(),
+				commandId,
+				outcome: result.outcome,
+				text:
+					result.text
+						.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ")
+						.slice(0, 500)
+						.trim() || result.outcome,
+				...(view ? { settings: view } : {}),
+				...(usage ? { usage } : {}),
+			});
+		} catch {
+			// The broker repeats an unacknowledged command on the next poll; the settled result is re-sent then.
+		} finally {
+			this.#acknowledging.delete(commandId);
+		}
+	}
+
+	#clearCommands(): void {
+		this.#commands = [];
+		this.#settled.clear();
+		this.#acknowledging.clear();
+		this.#applying = false;
+		this.#settingsView = undefined;
 	}
 
 	/**
@@ -672,6 +814,8 @@ export class DiscordModeSession {
 			// Old-generation deliveries are unknown or held on the broker now; the journal already fences reinjection.
 			this.#queue = [];
 			this.#active = undefined;
+			// The broker drops the old connection's settings changes and tells the owner; none is applied here.
+			this.#clearCommands();
 			this.#dialogs.unavailable();
 			this.#applySnapshot(snapshot);
 		} catch (error) {
@@ -784,7 +928,12 @@ export class DiscordModeSession {
 		this.#renderStatus();
 	}
 
+	/** Applying an owner settings change counts as busy, so no owner message starts mid-change. */
 	#busy(): boolean {
+		return this.#applying || this.#engineBusy();
+	}
+
+	#engineBusy(): boolean {
 		return Boolean(
 			this.#active ||
 			this.engine.isStreaming ||
@@ -986,6 +1135,7 @@ export function ensureDiscordModeSession(ctx: InteractiveModeContext): DiscordMo
 				ctx.session.isCompacting ||
 				ctx.session.isGeneratingHandoff ||
 				ctx.session.isRetrying,
+			settings: createDiscordSettingsHost(ctx),
 		});
 		sessions.set(ctx.session, mode);
 	}

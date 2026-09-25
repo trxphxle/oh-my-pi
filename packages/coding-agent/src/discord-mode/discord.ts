@@ -33,8 +33,10 @@ import {
 	TextInputStyle,
 	type TextChannel,
 } from "discord.js";
+import { formatNumber } from "@oh-my-pi/pi-utils/format";
 import { DiscordModeError } from "./broker";
 import { discordCategoryName, discordChannelName } from "./names";
+import { describeSettingCommand, settingsChoiceToken } from "./settings-view";
 import {
 	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
@@ -48,6 +50,7 @@ import {
 	type ModeDialog,
 	type ModeNotify,
 	type ModeRetirementPolicy,
+	type ModeSettingsPanel,
 	type RemoteChannel,
 } from "@oh-my-pi/pi-wire/discord-mode";
 
@@ -62,6 +65,27 @@ const DIALOG_LIMIT = 256;
 const PENDING_SEND_LIMIT = 32;
 const SEND_CONFIRMATION_MS = 1_500;
 const REPLY_PREVIEW = 1_800;
+/** Interaction tokens last 15 minutes; follow-ups stop a minute early and fall back to a channel note. */
+const SETTINGS_TOKEN_MS = 14 * 60_000;
+const PENDING_SETTINGS_LIMIT = 64;
+/** Settings panel controls; the card's own `settings` button opens the panel like any other session control. */
+const SETTINGS_ACTIONS: Record<string, true> = {
+	refresh: true,
+	search: true,
+	"search-q": true,
+	"set-model": true,
+	"set-effort": true,
+	"set-advisor": true,
+	"advisor-on": true,
+	"advisor-off": true,
+	plan: true,
+	compact: true,
+	default: true,
+};
+const SESSION_CONTROL = new RegExp(
+	`^haiso:s:(\\d{1,22}):([a-f0-9-]{36}):([A-Za-z0-9_-]{22})?:(status|stop|queue|steer|cancel|queue0|queue1|settings|${Object.keys(SETTINGS_ACTIONS).join("|")})$`,
+	"i",
+);
 const READ_PERMISSIONS = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
 const WRITE_PERMISSIONS = READ_PERMISSIONS | PermissionFlagsBits.SendMessages;
 const BOT_PERMISSIONS = WRITE_PERMISSIONS | PermissionFlagsBits.AttachFiles | PermissionFlagsBits.EmbedLinks;
@@ -101,6 +125,14 @@ interface PendingSend {
 	confirmation: Promise<Message | undefined>;
 	resolve: (message: Message | undefined) => void;
 	timer?: Timer;
+}
+
+/** A queued settings change whose confirmation goes back to the panel interaction that queued it. */
+interface PendingSettingReply {
+	interaction: ReplyInteraction;
+	channelId: string;
+	connectionId: string;
+	at: number;
 }
 
 /** Constructor-only seam: never read endpoint overrides from mode configuration. */
@@ -157,6 +189,7 @@ export class DiscordAdapter implements DiscordPort {
 	readonly #cards = new Map<string, Card>();
 	readonly #dialogs = new Map<string, Dialog>();
 	readonly #pendingSends = new Map<string, PendingSend>();
+	readonly #pendingSettings = new Map<string, PendingSettingReply>();
 	#handlers?: DiscordPortHandlers;
 	#guild?: Guild;
 	#sessionCommandId?: string;
@@ -355,6 +388,9 @@ export class DiscordAdapter implements DiscordPort {
 								{ name: "off — never mention", value: "off" },
 							),
 					),
+			)
+			.addSubcommand(command =>
+				command.setName("settings").setDescription("View and change the session's model, effort, and context"),
 			)
 			.toJSON();
 		const current = guildCommands.find(command => owned(command) && command.name === "session");
@@ -1070,6 +1106,39 @@ export class DiscordAdapter implements DiscordPort {
 		}
 	}
 
+	async settingsResult(channelId: string, commandId: string, text: string, panel?: ModeSettingsPanel): Promise<void> {
+		const pending = this.#pendingSettings.get(commandId);
+		this.#pendingSettings.delete(commandId);
+		if (pending?.channelId === channelId && Date.now() - pending.at < SETTINGS_TOKEN_MS) {
+			try {
+				await pending.interaction.followUp({
+					content: text,
+					flags: MessageFlags.Ephemeral,
+					allowedMentions: MENTIONS,
+				});
+				if (panel)
+					await pending.interaction
+						.editReply(this.#settingsPayload(channelId, pending.connectionId, panel, text))
+						.catch(() => {});
+				return;
+			} catch {
+				// The panel was dismissed or its token lapsed; the channel note below still reaches the owner.
+			}
+		}
+		const key = `${PREFIX}settings:${digest(`${channelId}:${commandId}`)}`;
+		await this.#once(key, async () => {
+			await this.#send(await this.#textChannel(channelId), key, { content: `Session settings: ${text}` });
+		});
+	}
+
+	#rememberSetting(commandId: string, interaction: ReplyInteraction, channelId: string, connectionId: string): void {
+		this.#pendingSettings.delete(commandId);
+		this.#pendingSettings.set(commandId, { interaction, channelId, connectionId, at: Date.now() });
+		for (const [id, pending] of this.#pendingSettings)
+			if (this.#pendingSettings.size > PENDING_SETTINGS_LIMIT || Date.now() - pending.at >= SETTINGS_TOKEN_MS)
+				this.#pendingSettings.delete(id);
+	}
+
 	#controlId(channelId: string, connectionId: string, action: string, deliveryId?: string): string {
 		if (!/^\d{1,22}$/.test(channelId) || !UUID.test(connectionId) || (deliveryId && !UUID.test(deliveryId)))
 			throw new Error("Discord session control identity is invalid.");
@@ -1093,6 +1162,10 @@ export class DiscordAdapter implements DiscordPort {
 					.setCustomId(this.#controlId(channelId, connectionId, "status"))
 					.setLabel("Session details")
 					.setStyle(ButtonStyle.Secondary),
+				new ButtonBuilder()
+					.setCustomId(this.#controlId(channelId, connectionId, "settings"))
+					.setLabel("Settings")
+					.setStyle(ButtonStyle.Secondary),
 			),
 		];
 	}
@@ -1113,6 +1186,8 @@ export class DiscordAdapter implements DiscordPort {
 	}
 
 	#controlPayload(channelId: string, result: ModeControlResult): ControlPayload {
+		if (result.settings && result.connectionId)
+			return this.#settingsPayload(channelId, result.connectionId, result.settings, result.text);
 		const rows: ControlRows = [];
 		if (result.connectionId) {
 			if (result.deliveryId) {
@@ -1153,6 +1228,138 @@ export class DiscordAdapter implements DiscordPort {
 		};
 	}
 
+	/** Ephemeral owner panel. Controls follow the session's reported capabilities and bind to its connection. */
+	#settingsPayload(channelId: string, connectionId: string, panel: ModeSettingsPanel, note?: string): ControlPayload {
+		const { view, usage, pending } = panel;
+		const control = (action: string) => this.#controlId(channelId, connectionId, action);
+		// Efforts follow the model the session will run: a pending model change, else the current one.
+		const pendingModel = pending.findLast(item => item.kind === "model")?.value;
+		const target =
+			(typeof pendingModel === "string"
+				? [...view.shortlist, ...view.models].find(choice => choice.selector === pendingModel)
+				: undefined) ?? view.model;
+		const lines = [
+			"**Session settings**",
+			`Model: ${view.model ? `${view.model.name} (${view.model.selector})` : "none"}`,
+			`Effort: ${view.model?.efforts.length ? (view.effort ?? "default") : "not adjustable for this model"}`,
+			`Context: ${
+				usage && usage.contextWindow > 0
+					? `${Math.round(usage.percent)}% (${formatNumber(usage.tokens)} / ${formatNumber(usage.contextWindow)} tokens)`
+					: "unknown"
+			}`,
+		];
+		if (view.capabilities.advisor)
+			lines.push(
+				`Advisor: ${view.advisor?.enabled ? "on" : "off"}${view.advisor?.model ? ` · ${view.advisor.model}` : ""}${
+					view.advisor?.enabled && !view.advisor.active ? " (no advisor model assigned)" : ""
+				}`,
+			);
+		if (view.capabilities.plan) lines.push(`Plan mode: ${view.plan?.enabled ? "on" : "off"}`);
+		if (pending.length)
+			lines.push(
+				`Pending: ${pending.map(item => describeSettingCommand(item, view)).join("; ")}${panel.busy ? " — applies after this turn" : ""}`,
+			);
+		lines.push("Model and effort changes last for this session only.");
+		if (note) lines.push("", note);
+		const modelOptions = (choices: ModeSettingsPanel["view"]["shortlist"], current: string | undefined) => {
+			const seen = new Set<string>();
+			return choices.flatMap(choice => {
+				const value = settingsChoiceToken(choice.selector);
+				if (seen.has(value)) return [];
+				seen.add(value);
+				return [
+					{
+						label: choice.name.slice(0, 100),
+						description: `${choice.selector}${choice.role ? ` · ${choice.role}` : ""}`.slice(0, 100),
+						value,
+						default: choice.selector === current,
+					},
+				];
+			});
+		};
+		const rows: ControlRows = [];
+		const searched = Boolean(panel.matches?.length);
+		const models = searched ? panel.matches! : view.shortlist;
+		if (models.length)
+			rows.push(
+				new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+					new StringSelectMenuBuilder()
+						.setCustomId(control("set-model"))
+						.setPlaceholder(searched ? `Search results (${models.length})` : "Model for this session")
+						.addOptions(modelOptions(models, searched ? undefined : view.model?.selector)),
+				),
+			);
+		if (target?.efforts.length)
+			rows.push(
+				new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+					new StringSelectMenuBuilder()
+						.setCustomId(control("set-effort"))
+						.setPlaceholder(target === view.model ? "Effort" : `Effort for ${target.name}`.slice(0, 150))
+						.addOptions(
+							target.efforts.map(effort => ({
+								label: effort,
+								value: effort,
+								default: target === view.model && effort === view.effort,
+							})),
+						),
+				),
+			);
+		const buttons = [
+			new ButtonBuilder().setCustomId(control("search")).setLabel("Search models…").setStyle(ButtonStyle.Primary),
+		];
+		if (view.capabilities.compact)
+			buttons.push(
+				new ButtonBuilder()
+					.setCustomId(control("compact"))
+					.setLabel(panel.busy ? "Compact (when idle)" : "Compact")
+					.setStyle(ButtonStyle.Secondary)
+					.setDisabled(panel.busy),
+			);
+		if (view.capabilities.persist)
+			buttons.push(
+				new ButtonBuilder()
+					.setCustomId(control("default"))
+					.setLabel("Make default")
+					.setStyle(ButtonStyle.Secondary),
+			);
+		buttons.push(
+			new ButtonBuilder().setCustomId(control("refresh")).setLabel("Refresh").setStyle(ButtonStyle.Secondary),
+		);
+		rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons));
+		const extras: ButtonBuilder[] = [];
+		if (view.capabilities.advisor)
+			extras.push(
+				new ButtonBuilder()
+					.setCustomId(control(view.advisor?.enabled ? "advisor-off" : "advisor-on"))
+					.setLabel(view.advisor?.enabled ? "Turn advisor off" : "Turn advisor on")
+					.setStyle(ButtonStyle.Secondary),
+			);
+		if (view.capabilities.plan)
+			extras.push(
+				new ButtonBuilder()
+					.setCustomId(control("plan"))
+					.setLabel(view.plan?.enabled ? "Plan mode is on" : "Enter plan mode")
+					.setStyle(ButtonStyle.Secondary)
+					.setDisabled(Boolean(view.plan?.enabled)),
+			);
+		if (extras.length) rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(extras));
+		if (view.capabilities.advisor && view.shortlist.length)
+			rows.push(
+				new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+					new StringSelectMenuBuilder()
+						.setCustomId(control("set-advisor"))
+						.setPlaceholder("Advisor model for this session")
+						.addOptions(modelOptions(view.shortlist, view.advisor?.model)),
+				),
+			);
+		return {
+			...this.#textPayload(lines.join("\n")),
+			components: rows,
+			attachments: [],
+			allowedMentions: MENTIONS,
+		};
+	}
+
 	async #sessionInteraction(interaction: ReplyInteraction): Promise<void> {
 		let action: ModeControlRequest["action"];
 		let connectionId: string | undefined;
@@ -1165,7 +1372,11 @@ export class DiscordAdapter implements DiscordPort {
 			if (
 				interaction.commandId !== this.#sessionCommandId ||
 				interaction.commandGuildId !== this.#config.guildId ||
-				(subcommand !== "status" && subcommand !== "stop" && subcommand !== "queue" && subcommand !== "notify") ||
+				(subcommand !== "status" &&
+					subcommand !== "stop" &&
+					subcommand !== "queue" &&
+					subcommand !== "notify" &&
+					subcommand !== "settings") ||
 				(subcommand === "notify" && !notify)
 			) {
 				await this.#reply(
@@ -1176,17 +1387,17 @@ export class DiscordAdapter implements DiscordPort {
 			}
 			action = subcommand;
 		} else {
-			const match =
-				"customId" in interaction
-					? /^haiso:s:(\d{1,22}):([a-f0-9-]{36}):([A-Za-z0-9_-]{22})?:(status|stop|queue|steer|cancel|queue0|queue1)$/i.exec(
-							interaction.customId,
-						)
-					: null;
+			const match = "customId" in interaction ? SESSION_CONTROL.exec(interaction.customId) : null;
 			if (!match || match[1] !== interaction.channelId || !UUID.test(match[2]!)) {
 				await this.#reply(interaction, "This session control is invalid or belongs to another channel.");
 				return;
 			}
 			connectionId = match[2]!;
+			if (SETTINGS_ACTIONS[match[4]!]) {
+				if (match[3]) await this.#reply(interaction, "Invalid settings control; nothing was changed.");
+				else await this.#settingsInteraction(interaction, match[4]!, connectionId);
+				return;
+			}
 			const selected = match[4] === "queue0" || match[4] === "queue1";
 			if (
 				selected &&
@@ -1248,6 +1459,84 @@ export class DiscordAdapter implements DiscordPort {
 					: "Session control outcome is unavailable or uncertain. It will not be retried automatically; inspect /session status or /session queue.",
 			);
 		}
+	}
+
+	/** Panel controls update the ephemeral panel in place; each change's outcome arrives later as a follow-up. */
+	async #settingsInteraction(interaction: ReplyInteraction, action: string, connectionId: string): Promise<void> {
+		const channelId = interaction.channelId!;
+		if (action === "search" && interaction.isButton()) {
+			await interaction.showModal(
+				new ModalBuilder()
+					.setCustomId(this.#controlId(channelId, connectionId, "search-q"))
+					.setTitle("Search models")
+					.addComponents(
+						new ActionRowBuilder<TextInputBuilder>().addComponents(
+							new TextInputBuilder()
+								.setCustomId("query")
+								.setLabel("Model name or provider/id")
+								.setStyle(TextInputStyle.Short)
+								.setRequired(true)
+								.setMaxLength(100),
+						),
+					),
+			);
+			return;
+		}
+		const value =
+			interaction.isStringSelectMenu() && interaction.values.length === 1 ? interaction.values[0] : undefined;
+		const button = interaction.isButton();
+		let request: Pick<ModeControlRequest, "action" | "setting" | "query"> | undefined;
+		if (action === "refresh" && button) request = { action: "settings" };
+		else if (action === "search-q" && interaction.isModalSubmit()) {
+			const query = interaction.fields
+				.getTextInputValue("query")
+				.replace(/[\x00-\x1f\x7f]/g, " ")
+				.trim();
+			if (query && query.length <= 100) request = { action: "settings", query };
+		} else if ((action === "set-model" || action === "set-advisor") && value && /^[a-f0-9]{16}$/.test(value))
+			request = { action: "setting", setting: { kind: action === "set-model" ? "model" : "advisor-model", value } };
+		else if (action === "set-effort" && value && /^[a-z0-9-]{1,16}$/.test(value))
+			request = { action: "setting", setting: { kind: "effort", value } };
+		else if ((action === "advisor-on" || action === "advisor-off") && button)
+			request = { action: "setting", setting: { kind: "advisor", value: action === "advisor-on" } };
+		else if ((action === "plan" || action === "compact" || action === "default") && button)
+			request = { action: "setting", setting: { kind: action } };
+		if (!request) {
+			await this.#reply(interaction, "Invalid settings control; nothing was changed.");
+			return;
+		}
+		try {
+			if (interaction.isMessageComponent() || (interaction.isModalSubmit() && interaction.isFromMessage()))
+				await interaction.deferUpdate();
+			else await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+		} catch {
+			await this.#reply(interaction, "Discord could not acknowledge this control. Nothing was changed.").catch(
+				() => {},
+			);
+			return;
+		}
+		let failure = "Session controls require an available, owner/bot-private text channel. Nothing was changed.";
+		try {
+			if (!this.#handlers) throw new Error("Unavailable session control.");
+			await this.#textChannel(channelId);
+			failure = "The settings change outcome is unavailable or uncertain; reopen /session settings before retrying.";
+			const result = await this.#handlers.control({
+				id: interaction.id,
+				channelId,
+				ownerId: interaction.user.id,
+				connectionId,
+				...request,
+			});
+			if (result.commandId) this.#rememberSetting(result.commandId, interaction, channelId, connectionId);
+			await interaction.editReply(this.#controlPayload(channelId, result));
+			return;
+		} catch (error) {
+			if (error instanceof DiscordModeError) failure = error.message;
+		}
+		// The panel stays as it was; the refusal arrives beside it.
+		await interaction
+			.followUp({ content: failure, flags: MessageFlags.Ephemeral, allowedMentions: MENTIONS })
+			.catch(() => {});
 	}
 
 	async #interaction(interaction: Interaction): Promise<void> {

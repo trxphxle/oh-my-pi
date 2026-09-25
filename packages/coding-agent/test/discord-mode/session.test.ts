@@ -259,6 +259,10 @@ async function fixture(options: { rejoinRetryMs?: number } = {}) {
 		setMaxReply(maxReply: number | undefined) {
 			snapshot = { ...snapshot, maxReply };
 		},
+		/** Broker-held settings revision; brokers without settings support omit it. */
+		setSettingsRevision(settingsRevision: string | undefined) {
+			snapshot = { ...snapshot, settingsRevision };
+		},
 		/** Broker state reset: the UUID is no longer enrolled. */
 		forget() {
 			forgotten = true;
@@ -444,6 +448,52 @@ describe("native Discord session routing", () => {
 		const bounded = (await g.completed).text!;
 		expect(Buffer.byteLength(bounded)).toBeLessThanOrEqual(DISCORD_MODE_MAX_REPLY);
 		expect(bounded).toEndWith("[response truncated]");
+	});
+
+	test("settings ride polls only to brokers advertising them, and the view only when its revision changed", async () => {
+		const clock = fakeClock();
+		const f = await fixture();
+		let effort = "high";
+		const mode = new DiscordModeSession(f.engine, {
+			connect: async () => f.client,
+			receiptRoot: f.root,
+			pollIntervalMs: 0,
+			settings: {
+				view: () => ({
+					model: { selector: "provider/model", name: "Model", efforts: ["off", "low", "high"] },
+					effort,
+					capabilities: { persist: true, compact: true, advisor: true, plan: true },
+					shortlist: [],
+					models: [],
+				}),
+				usage: () => ({ tokens: 1_000, contextWindow: 10_000, percent: 10 }),
+				apply: async () => ({ outcome: "applied", text: "Applied." }),
+			},
+		});
+		cleanups.push(() => mode.off());
+		await mode.on("Project", "Session");
+		const polls = () =>
+			f.requests.filter((request): request is Extract<ModeRequest, { op: "poll" }> => request.op === "poll");
+		await mode.poll();
+		// An older broker rejects unknown poll fields, so it never receives them.
+		f.setSettingsRevision("");
+		await mode.poll();
+		expect(polls().map(request => "settings" in request || "usage" in request)).toEqual([false, false]);
+		await mode.poll();
+		const reported = polls().at(-1)!;
+		expect(reported.settings).toMatchObject({ effort: "high" });
+		expect(reported.usage).toEqual({ tokens: 1_000, contextWindow: 10_000, percent: 10 });
+		// The broker stored it; once its answer carries that revision, the view stops riding along.
+		f.setSettingsRevision(reported.settings!.revision);
+		await mode.poll();
+		await mode.poll();
+		expect(polls().at(-1)).not.toHaveProperty("settings");
+		expect(polls().at(-1)!.usage).toBeDefined();
+		effort = "low";
+		clock.advance(5_000);
+		await mode.poll();
+		expect(polls().at(-1)!.settings).toMatchObject({ effort: "low" });
+		expect(polls().at(-1)!.settings!.revision).not.toBe(reported.settings!.revision);
 	});
 
 	test("status and registration never execute broker-held queued work", async () => {

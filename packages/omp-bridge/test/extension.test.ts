@@ -358,9 +358,6 @@ describe("official OMP bridge adapter", () => {
 		await f.command("on Research terminal");
 		expect(f.activeTools).toContain("bridge");
 		expect(f.requests.find(request => request.op === "register")).toMatchObject({ label: "Research terminal" });
-		const localNotices = f.notices.map(notice => notice.text).join("\n");
-		expect(localNotices).toMatch(/approvals.*settings.*local/i);
-		expect(localNotices).toMatch(/no authoritative permanent.deletion/i);
 	});
 
 	test("off removes only its own tool and does not restore stale tool choices", async () => {

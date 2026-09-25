@@ -4,7 +4,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { DISCORD_MODE_LONG_TURN_MS, DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
-import { connectDiscordModeAt } from "@oh-my-pi/pi-utils/discord-client";
+import { DiscordModeSession, type DiscordSessionEngine } from "../../src/discord-mode/session";
+import { settingsChoiceToken } from "../../src/discord-mode/settings-view";
+import { connectDiscordModeAt, sealModeSettingsView } from "@oh-my-pi/pi-utils/discord-client";
 import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	commitDiscordDeletionEvent,
@@ -28,6 +30,9 @@ import type {
 	ModeRetirementPolicy,
 	ModeLease,
 	ModeRequest,
+	ModeSettingCommand,
+	ModeSettingsPanel,
+	ModeSettingsView,
 	ModeSnapshot,
 	RemoteChannel,
 } from "@oh-my-pi/pi-wire/discord-mode";
@@ -200,6 +205,23 @@ class FixtureDiscord implements DiscordPort {
 	}
 	async endDialog(channelId: string, dialogId: string): Promise<void> {
 		if (this.dialogs.get(channelId)?.id === dialogId) this.dialogs.delete(channelId);
+	}
+	readonly settingsResults: Array<{ channelId: string; commandId: string; text: string; panel?: ModeSettingsPanel }> =
+		[];
+	#settingsWaiters: Array<{ count: number; resolve: () => void }> = [];
+	async settingsResult(channelId: string, commandId: string, text: string, panel?: ModeSettingsPanel): Promise<void> {
+		this.settingsResults.push({ channelId, commandId, text, ...(panel ? { panel } : {}) });
+		for (const waiter of this.#settingsWaiters.filter(item => item.count <= this.settingsResults.length)) {
+			this.#settingsWaiters.splice(this.#settingsWaiters.indexOf(waiter), 1);
+			waiter.resolve();
+		}
+	}
+	/** Settings outcomes arrive off the request path (detached apply, post-mutation notes); await the delivery itself. */
+	settingsDelivered(count: number): Promise<void> {
+		if (this.settingsResults.length >= count) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#settingsWaiters.push({ count, resolve });
+		return promise;
 	}
 	channel(id: string): RemoteChannel {
 		const channel = this.channels.get(id);
@@ -2254,6 +2276,268 @@ describe("Haiso and OMP app split", () => {
 			expect(port.cards.get(gammaId)?.text).toStartWith("OMP · gamma\n");
 			expect(port.cards.get(alphaId)).toMatchObject({ app: "haiso" });
 			expect(port.cards.get(alphaId)?.text).toStartWith("Haiso · alpha\n");
+		} finally {
+			await broker.close();
+		}
+	});
+});
+
+describe("Discord session settings", () => {
+	const OPUS = "anthropic/claude-opus-4-5";
+	const SONNET = "anthropic/claude-sonnet-4-5";
+	const HAIKU = "anthropic/claude-haiku-4-5";
+	const CHOICES: Record<string, ModeSettingsView["shortlist"][number]> = {
+		[OPUS]: { selector: OPUS, name: "Claude Opus 4.5", role: "default", efforts: ["off", "auto", "low", "high"] },
+		[SONNET]: {
+			selector: SONNET,
+			name: "Claude Sonnet 4.5",
+			role: "smol",
+			efforts: ["off", "auto", "low", "medium", "high"],
+		},
+		[HAIKU]: { selector: HAIKU, name: "Claude Haiku 4.5", efforts: [] },
+	};
+	const SEARCHABLE = ["openai/gpt-5.1-codex", "openrouter/openai/gpt-5.1", "openai/gpt-5.1"].map(selector => ({
+		selector,
+		name: selector,
+		efforts: ["off", "low", "high"],
+	}));
+
+	function haisoReport(
+		overrides: Partial<Omit<ModeSettingsView, "revision">> = {},
+	): Omit<ModeSettingsView, "revision"> {
+		const shortlist = [CHOICES[OPUS]!, CHOICES[SONNET]!, CHOICES[HAIKU]!];
+		return {
+			model: CHOICES[OPUS],
+			effort: "high",
+			advisor: { enabled: false, active: false },
+			plan: { enabled: false },
+			capabilities: { persist: true, compact: true, advisor: true, plan: true },
+			shortlist,
+			models: [...shortlist, ...SEARCHABLE],
+			...overrides,
+		};
+	}
+
+	function setting(
+		port: FixtureDiscord,
+		session: ModeSnapshot,
+		kind: ModeSettingCommand["kind"],
+		value?: string | boolean,
+	): Promise<ModeControlResult> {
+		return port.control(session, "setting", {
+			connectionId: session.session.connectionId,
+			setting: { kind, ...(value === undefined ? {} : { value }) },
+		});
+	}
+
+	function report(broker: DiscordModeBroker, session: ModeSnapshot, view: Omit<ModeSettingsView, "revision">) {
+		return broker.request({
+			op: "poll",
+			lease: lease(session),
+			busy: false,
+			pendingInput: false,
+			settings: sealModeSettingsView(view),
+		});
+	}
+
+	/** A real session client on the real broker, with a settings host that records what it applied. */
+	async function liveSession(broker: DiscordModeBroker, root: string) {
+		const sessionId = randomUUID();
+		const state = { streaming: false };
+		let current = haisoReport();
+		const applied: ModeSettingCommand[] = [];
+		const engine: DiscordSessionEngine = {
+			sessionFile: path.join(root, `${sessionId}.jsonl`),
+			get isStreaming() {
+				return state.streaming;
+			},
+			hasAdmittedSubmission: false,
+			queuedMessageCount: 0,
+			sessionManager: {
+				getSessionId: () => sessionId,
+				getCwd: () => root,
+				ensureOnDisk: async () => {},
+				flush: async () => {},
+			},
+			subscribe: () => () => {},
+			promptCustomMessage: async () => true,
+			abort: async () => {},
+			waitForSessionTransition: async () => {},
+		};
+		const mode = new DiscordModeSession(engine, {
+			connect: async () => ({
+				request: input => broker.request(input),
+				lookup: (projectDir, id) => broker.lookup(projectDir, id),
+				close: async () => {},
+			}),
+			receiptRoot: root,
+			pollIntervalMs: 0,
+			settings: {
+				view: () => current,
+				usage: () => ({ tokens: 50_000, contextWindow: 200_000, percent: 25 }),
+				apply: async command => {
+					applied.push(command);
+					if (command.kind === "model") current = { ...current, model: CHOICES[String(command.value)] };
+					return { outcome: "applied", text: `Applied ${command.kind}.` };
+				},
+			},
+		});
+		const snapshot = await mode.on("Named project", "live");
+		return { mode, state, applied, snapshot };
+	}
+
+	it("applies an idle change once despite a double click, confirming only after the session acknowledges it", async () => {
+		using temporary = TempDir.createSync("@discord-settings-idle-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		const live = await liveSession(broker, root);
+		try {
+			await live.mode.poll();
+			const panel = await port.control(live.snapshot, "settings");
+			expect(panel.settings?.view.model?.selector).toBe(OPUS);
+			expect(panel.settings?.usage).toEqual({ tokens: 50_000, contextWindow: 200_000, percent: 25 });
+			const first = await setting(port, live.snapshot, "model", settingsChoiceToken(SONNET));
+			const again = await setting(port, live.snapshot, "model", settingsChoiceToken(SONNET));
+			expect(first.text).toStartWith("Sent to the session");
+			expect(again.text).toStartWith("Already pending");
+			expect(again.commandId).toBeUndefined();
+			expect(port.settingsResults).toEqual([]);
+			await live.mode.poll();
+			await port.settingsDelivered(1);
+			await live.mode.poll();
+			expect(live.applied).toEqual([{ id: first.commandId!, kind: "model", value: SONNET }]);
+			expect(port.settingsResults).toMatchObject([
+				{ channelId: live.snapshot.session.channelId, commandId: first.commandId, text: "Applied model." },
+			]);
+			// The confirmation carries the session's fresh view, so the panel shows the new model.
+			expect(port.settingsResults[0]!.panel).toMatchObject({ view: { model: { selector: SONNET } }, pending: [] });
+		} finally {
+			await live.mode.off();
+			await broker.close();
+		}
+	});
+
+	it("holds a change made during a turn, refuses compaction until idle, then applies and confirms", async () => {
+		using temporary = TempDir.createSync("@discord-settings-busy-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		const live = await liveSession(broker, root);
+		try {
+			live.state.streaming = true;
+			await live.mode.poll();
+			const queued = await setting(port, live.snapshot, "effort", "low");
+			expect(queued.text).toStartWith("Pending — applies after this turn");
+			await expect(setting(port, live.snapshot, "compact")).rejects.toThrow("busy");
+			await live.mode.poll();
+			expect(live.applied).toEqual([]);
+			expect(port.settingsResults).toEqual([]);
+			live.state.streaming = false;
+			await live.mode.poll();
+			await port.settingsDelivered(1);
+			expect(live.applied).toEqual([{ id: queued.commandId!, kind: "effort", value: "low" }]);
+			expect(port.settingsResults).toMatchObject([{ commandId: queued.commandId, text: "Applied effort." }]);
+		} finally {
+			await live.mode.off();
+			await broker.close();
+		}
+	});
+
+	it("offers only what the session reported: supported efforts, its models, and Haiso-only controls", async () => {
+		using temporary = TempDir.createSync("@discord-settings-validate-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "validated"));
+			// A client that never reports settings (an older app) offers nothing to change.
+			expect((await port.control(session, "settings")).settings).toBeUndefined();
+			await expect(setting(port, session, "compact")).rejects.toThrow("isn't reporting");
+			await report(broker, session, haisoReport());
+			await expect(setting(port, session, "effort", "medium")).rejects.toThrow(
+				"Claude Opus 4.5 doesn't support effort medium",
+			);
+			await expect(setting(port, session, "model", settingsChoiceToken("unknown/model"))).rejects.toThrow(
+				"no longer offered",
+			);
+			// Efforts follow a pending model change.
+			await setting(port, session, "model", settingsChoiceToken(SONNET));
+			expect((await setting(port, session, "effort", "medium")).commandId).toBeDefined();
+			await report(
+				broker,
+				session,
+				haisoReport({
+					advisor: undefined,
+					plan: undefined,
+					capabilities: { persist: false, compact: true, advisor: false, plan: false },
+				}),
+			);
+			for (const [kind, value] of [
+				["advisor", true],
+				["advisor-model", settingsChoiceToken(SONNET)],
+				["plan", undefined],
+				["default", undefined],
+			] as const)
+				await expect(setting(port, session, kind, value)).rejects.toThrow("doesn't offer");
+			expect((await poll(broker, session)).commands?.map(command => [command.kind, command.value])).toEqual([
+				["model", SONNET],
+				["effort", "medium"],
+			]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("ranks searched models by the TUI's relevance tiers and accepts a model found by search", async () => {
+		using temporary = TempDir.createSync("@discord-settings-search-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "search"));
+			await report(broker, session, haisoReport());
+			const found = await port.control(session, "settings", { query: "gpt-5.1" });
+			const matches = found.settings?.matches?.map(choice => choice.selector) ?? [];
+			// The exact id wins over earlier-listed partial matches; unrelated models never match.
+			expect(matches[0]).toBe("openai/gpt-5.1");
+			expect(matches.slice(1).sort()).toEqual(["openai/gpt-5.1-codex", "openrouter/openai/gpt-5.1"]);
+			expect((await port.control(session, "settings", { query: "llama" })).settings?.matches).toEqual([]);
+			await setting(port, session, "model", settingsChoiceToken("openai/gpt-5.1"));
+			expect((await poll(broker, session)).commands).toMatchObject([{ kind: "model", value: "openai/gpt-5.1" }]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("refuses stale panels and tells the owner which changes a disconnect dropped", async () => {
+		using temporary = TempDir.createSync("@discord-settings-stale-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const input = registration(root, "stale");
+			const first = await broker.request(input);
+			await report(broker, first, haisoReport());
+			const dispatched = await setting(port, first, "model", settingsChoiceToken(SONNET));
+			await poll(broker, first);
+			const queued = await setting(port, first, "compact");
+			await broker.request({ op: "detach", lease: lease(first) });
+			await port.settingsDelivered(2);
+			expect(port.settingsResults.map(result => [result.commandId, result.text.split(" (")[0]])).toEqual([
+				[dispatched.commandId!, "Outcome unknown"],
+				[queued.commandId!, "Not applied"],
+			]);
+			const reconnected = await broker.request(resumed(input));
+			expect(reconnected.settingsRevision).toBe("");
+			await expect(setting(port, first, "compact")).rejects.toThrow("stale connection");
+			// The new connection must report its own settings before anything can change.
+			expect((await port.control(reconnected, "settings")).settings).toBeUndefined();
 		} finally {
 			await broker.close();
 		}

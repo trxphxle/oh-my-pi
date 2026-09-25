@@ -30,7 +30,13 @@ import {
 } from "discord.js";
 import { DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
 import { DiscordAdapter } from "../../src/discord-mode/discord";
-import { DISCORD_MODE_MAX_REPLY, type DiscordPortHandlers } from "@oh-my-pi/pi-wire/discord-mode";
+import { settingsChoiceToken } from "../../src/discord-mode/settings-view";
+import {
+	DISCORD_MODE_MAX_REPLY,
+	type DiscordPortHandlers,
+	type ModeSettingsPanel,
+	type ModeSettingsView,
+} from "@oh-my-pi/pi-wire/discord-mode";
 
 const GUILD = "100000000000000001";
 const OWNER = "100000000000000002";
@@ -509,7 +515,7 @@ describe("Discord mode gateway adapter (offline)", () => {
 		const session = [...f.guildCommands.values()].find(command => command.name === "session")!;
 		expect(session.id).toBe(oldSession.id);
 		expect(session.default_member_permissions).toBeNull();
-		expect(session.options?.map(option => option.name)).toEqual(["status", "stop", "queue", "notify"]);
+		expect(session.options?.map(option => option.name)).toEqual(["status", "stop", "queue", "notify", "settings"]);
 		const notify = session.options?.find(option => option.name === "notify");
 		const mode = notify && "options" in notify ? notify.options?.[0] : undefined;
 		expect(mode && { name: mode.name, required: mode.required }).toEqual({ name: "mode", required: true });
@@ -629,6 +635,131 @@ describe("Discord mode gateway adapter (offline)", () => {
 			f.controls.map(({ channelId, ownerId, action, notify }) => ({ channelId, ownerId, action, notify })),
 		).toEqual([{ channelId: CHANNEL, ownerId: OWNER, action: "notify", notify: "off" }]);
 		expect(request.acknowledgements).toEqual([{ flags: MessageFlags.Ephemeral }]);
+	});
+
+	it("shows capability-gated settings panels and confirms queued changes beside the panel or in the channel", async () => {
+		const f = fixture();
+		const opus = { selector: "anthropic/opus", name: "Opus", efforts: ["off", "auto", "low", "high"] };
+		const gpt = { selector: "openai/gpt", name: "GPT", efforts: ["off", "low"] };
+		let haiso = true;
+		const view = (): ModeSettingsView => ({
+			revision: "r1",
+			model: opus,
+			effort: "high",
+			...(haiso ? { advisor: { enabled: false, active: false }, plan: { enabled: false } } : {}),
+			capabilities: { persist: haiso, compact: true, advisor: haiso, plan: haiso },
+			shortlist: [opus, gpt],
+			models: [opus, gpt],
+		});
+		f.handlers.control = async input => {
+			f.controls.push(input);
+			const settings: ModeSettingsPanel = {
+				view: view(),
+				usage: { tokens: 50_000, contextWindow: 200_000, percent: 25 },
+				busy: false,
+				pending: [],
+				...(input.query ? { matches: [gpt] } : {}),
+			};
+			return input.action === "setting"
+				? { text: "Sent to the session.", connectionId: CONNECTION, commandId: "command-1", settings }
+				: { text: "", connectionId: CONNECTION, settings };
+		};
+		await f.adapter.start(f.handlers);
+		await f.adapter.status(CHANNEL, "running", "session", CONNECTION);
+		const rows = (payload: InteractionEditReplyOptions) =>
+			(payload.components ?? []).map(row => ("toJSON" in row ? row.toJSON() : row)) as Array<{
+				components: Array<{ custom_id: string; options?: Array<{ value: string }> }>;
+			}>;
+		const actions = (payload: InteractionEditReplyOptions) =>
+			rows(payload).flatMap(row => row.components.map(component => component.custom_id.split(":").at(-1)));
+		const open = async () => {
+			const request = f.interaction(controlId(f.sent[0]!, "settings"));
+			f.client.emit(Events.InteractionCreate, request.event);
+			await settleEvents();
+			return request.payloads.at(-1)!;
+		};
+		const haisoPanel = await open();
+		expect(haisoPanel.content).toContain("Context: 25% (50K / 200K tokens)");
+		expect(actions(haisoPanel)).toEqual([
+			"set-model",
+			"set-effort",
+			"search",
+			"compact",
+			"default",
+			"refresh",
+			"advisor-on",
+			"plan",
+			"set-advisor",
+		]);
+		// Effort choices are exactly the current model's supported levels.
+		expect(rows(haisoPanel)[1]!.components[0]!.options!.map(option => option.value)).toEqual(opus.efforts);
+		haiso = false;
+		expect(actions(await open())).toEqual(["set-model", "set-effort", "search", "compact", "refresh"]);
+		const updates: string[] = [];
+		const followUps: unknown[] = [];
+		const panelControl = (action: string, overrides: Record<string, unknown>) =>
+			f.interaction(controlId(haisoPanel as MessageCreateOptions, "search").replace(/search$/, action), {
+				isButton: () => false,
+				isMessageComponent: () => true,
+				deferUpdate: async () => {
+					updates.push(action);
+				},
+				followUp: async (payload: unknown) => {
+					followUps.push(payload);
+				},
+				...overrides,
+			});
+		const pick = panelControl("set-model", {
+			isStringSelectMenu: () => true,
+			values: [settingsChoiceToken(gpt.selector)],
+		});
+		f.client.emit(Events.InteractionCreate, pick.event);
+		await settleEvents();
+		expect(f.controls.at(-1)).toMatchObject({
+			action: "setting",
+			connectionId: CONNECTION,
+			setting: { kind: "model", value: settingsChoiceToken(gpt.selector) },
+		});
+		// The panel updates in place instead of opening another reply.
+		expect(updates).toEqual(["set-model"]);
+		expect(pick.acknowledgements).toEqual([]);
+		expect(pick.payloads.at(-1)!.content).toContain("Sent to the session.");
+		const panel: ModeSettingsPanel = { view: { ...view(), model: gpt }, busy: false, pending: [] };
+		await f.adapter.settingsResult(CHANNEL, "command-1", "Model → GPT (this session only).", panel);
+		expect(followUps).toEqual([
+			{
+				content: "Model → GPT (this session only).",
+				flags: MessageFlags.Ephemeral,
+				allowedMentions: { parse: [], repliedUser: false },
+			},
+		]);
+		expect(pick.payloads.at(-1)!.content).toContain("Model: GPT (openai/gpt)");
+		// Without a live panel interaction the outcome becomes a silent channel note.
+		await f.adapter.settingsResult(
+			CHANNEL,
+			"command-2",
+			"Not applied (compact the context): the session disconnected first.",
+		);
+		expect(f.sent.at(-1)).toMatchObject({
+			content: "Session settings: Not applied (compact the context): the session disconnected first.",
+			allowedMentions: { parse: [], repliedUser: false },
+		});
+		const search = panelControl("search", { isButton: () => true });
+		f.client.emit(Events.InteractionCreate, search.event);
+		await settleEvents();
+		expect(search.modals).toHaveLength(1);
+		const submit = panelControl("search-q", {
+			isMessageComponent: () => false,
+			isModalSubmit: () => true,
+			isFromMessage: () => true,
+			fields: { getTextInputValue: () => "gpt" },
+		});
+		f.client.emit(Events.InteractionCreate, submit.event);
+		await settleEvents();
+		expect(f.controls.at(-1)).toMatchObject({ action: "settings", connectionId: CONNECTION, query: "gpt" });
+		expect(rows(submit.payloads.at(-1)!)[0]!.components[0]!.options!.map(option => option.value)).toEqual([
+			settingsChoiceToken(gpt.selector),
+		]);
 	});
 
 	it("mentions exactly the owner on flagged replies and dialogs, keeping replies within one 2000-character message", async () => {

@@ -10,11 +10,16 @@ import {
 	readDiscordDeletionEvents,
 	withDiscordDeletionLock,
 } from "./retirement-events";
+import { describeSettingCommand, findSettingsChoice, findSettingsModel, rankSettingsModels } from "./settings-view";
 import {
 	DISCORD_MODE_MAX_FRAME,
+	DISCORD_MODE_MAX_MODELS,
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_SESSIONS,
 	DISCORD_MODE_MAX_REPLY,
+	DISCORD_MODE_MAX_SETTING_COMMANDS,
+	DISCORD_MODE_MAX_SETTINGS_BYTES,
+	DISCORD_MODE_MAX_SHORTLIST,
 	DISCORD_MODE_MAX_TEXT,
 	type BindingState,
 	type ChannelInspection,
@@ -33,6 +38,10 @@ import {
 	type ModeRequest,
 	type ModeNotify,
 	type ModeSession,
+	type ModeSettingCommand,
+	type ModeSettingsPanel,
+	type ModeSettingsView,
+	type ModeUsage,
 	type ModeSnapshot,
 	type RemoteChannel,
 } from "@oh-my-pi/pi-wire/discord-mode";
@@ -101,6 +110,34 @@ const DialogShape = type({
 	"prefill?": OptionalText,
 	"+": "reject",
 });
+const Plain = (max: number) =>
+	type("string")
+		.atLeastLength(1)
+		.atMostLength(max)
+		.matching(/^[^\x00-\x1f\x7f]+$/);
+const Selector = Plain(200);
+const EffortName = type("string").matching(/^[a-z0-9-]{1,16}$/);
+const SettingKind = type("'model' | 'effort' | 'default' | 'compact' | 'advisor' | 'advisor-model' | 'plan'");
+const ModelChoiceShape = type({
+	selector: Selector,
+	name: Plain(100),
+	"role?": Plain(32),
+	efforts: EffortName.array().atMostLength(10),
+	"+": "reject",
+});
+const SettingsViewShape = type({
+	revision: type("string").matching(/^[A-Za-z0-9_-]{1,64}$/),
+	"model?": ModelChoiceShape,
+	"effort?": EffortName,
+	"advisor?": { enabled: "boolean", active: "boolean", "model?": Selector, "+": "reject" },
+	"plan?": { enabled: "boolean", "+": "reject" },
+	capabilities: { persist: "boolean", compact: "boolean", advisor: "boolean", plan: "boolean", "+": "reject" },
+	shortlist: ModelChoiceShape.array().atMostLength(DISCORD_MODE_MAX_SHORTLIST),
+	models: ModelChoiceShape.array().atMostLength(DISCORD_MODE_MAX_MODELS),
+	"+": "reject",
+}).narrow(view => Buffer.byteLength(JSON.stringify(view)) <= DISCORD_MODE_MAX_SETTINGS_BYTES);
+const Amount = type("number").narrow(value => Number.isFinite(value) && value >= 0);
+const UsageShape = type({ tokens: Amount, contextWindow: Amount, percent: Amount, "+": "reject" });
 const RequestShape = type.or(
 	{
 		op: "'register'",
@@ -116,7 +153,28 @@ const RequestShape = type.or(
 		"+": "reject",
 	},
 	{ op: "'retire'", eventId: Id, "+": "reject" },
-	{ op: "'poll'", lease: LeaseShape, busy: "boolean", pendingInput: "boolean", "+": "reject" },
+	{
+		op: "'poll'",
+		lease: LeaseShape,
+		busy: "boolean",
+		pendingInput: "boolean",
+		"settings?": SettingsViewShape,
+		"usage?": UsageShape,
+		"+": "reject",
+	},
+	{
+		op: "'command-result'",
+		lease: LeaseShape,
+		commandId: Id,
+		outcome: "'applied' | 'rejected' | 'failed'",
+		text: type("string")
+			.atLeastLength(1)
+			.atMostLength(500)
+			.matching(/^[^\x00-\x08\x0b\x0c\x0e-\x1f]*$/),
+		"settings?": SettingsViewShape,
+		"usage?": UsageShape,
+		"+": "reject",
+	},
 	{ op: "'status'", lease: LeaseShape, "+": "reject" },
 	{ op: "'off'", lease: LeaseShape, "+": "reject" },
 	{ op: "'detach'", lease: LeaseShape, "+": "reject" },
@@ -259,10 +317,12 @@ const ControlShape = type({
 	id: RequestId,
 	channelId: RemoteId,
 	ownerId: RemoteId,
-	action: "'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify'",
+	action: "'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify' | 'settings' | 'setting'",
 	"connectionId?": Id,
 	"deliveryId?": Id,
 	"notify?": Notify,
+	"setting?": { kind: SettingKind, "value?": Selector.or("boolean"), "+": "reject" },
+	"query?": Plain(100),
 	"+": "reject",
 });
 const RemoteAnswerShape = type({
@@ -281,6 +341,29 @@ type Operation = typeof OperationShape.infer;
 /** Only broker-authored, credential-free messages may cross the authenticated IPC error boundary. */
 export class DiscordModeError extends Error {}
 class UnknownEffect extends DiscordModeError {}
+
+/** A session's last reported settings, bound to the connection that reported them. */
+interface SettingsReport {
+	connectionId: string;
+	view?: ModeSettingsView;
+	usage?: ModeUsage;
+}
+/** An owner settings change the current connection has not acknowledged; repeated on every poll until it does. */
+interface PendingSetting {
+	command: ModeSettingCommand;
+	connectionId: string;
+	channelId: string;
+	dispatched: boolean;
+}
+/** Kinds whose newer undispatched choice replaces an older one instead of queueing behind it. */
+const SUPERSEDABLE: Partial<Record<ModeSettingCommand["kind"], true>> = {
+	model: true,
+	effort: true,
+	advisor: true,
+	"advisor-model": true,
+};
+/** Recent settings interaction ids and settled command ids kept for idempotent replays. */
+const SETTINGS_MEMORY = 256;
 
 /** Serialized durable routing for existing sessions; never owns or stops their engines. */
 export class DiscordModeBroker {
@@ -301,6 +384,13 @@ export class DiscordModeBroker {
 	#dialogEnded = new Map<string, number>();
 	/** Last relabel attempted per channel; volatile so each wanted name is tried at most once per process. */
 	#relabelled = new Map<string, string>();
+	/** Settings are live session state, never journaled: a restart or reconnect makes the session report afresh. */
+	#settings = new Map<string, SettingsReport>();
+	#commands = new Map<string, PendingSetting[]>();
+	#settled = new Set<string>();
+	#settingControls = new Map<string, ModeControlResult>();
+	/** Outcomes owed for changes dropped by revocation; posted once the current mutation finishes. */
+	#settingNotes: Array<{ channelId: string; commandId: string; text: string }> = [];
 
 	constructor(options: { config: DiscordModeConfig; storePath: string; port: DiscordPort }) {
 		RemoteId.assert(options.config.guildId);
@@ -438,7 +528,10 @@ export class DiscordModeBroker {
 			const session = this.#authorize(parsed.lease);
 			switch (parsed.op) {
 				case "poll":
-					return this.#poll(session, parsed.busy, parsed.pendingInput);
+					return this.#poll(session, parsed);
+				case "command-result":
+					await this.#commandResult(session, parsed);
+					break;
 				case "status":
 					await this.#reconcileSession(session);
 					await this.#persist();
@@ -541,6 +634,9 @@ export class DiscordModeBroker {
 			})
 			.finally(() => {
 				this.#backlog--;
+				// Revocation drops changes synchronously; tell the owner outside the serialized queue, never pinging.
+				for (const note of this.#settingNotes.splice(0))
+					void this.#port.settingsResult(note.channelId, note.commandId, note.text).catch(() => {});
 			});
 		this.#serial = result.then(
 			() => undefined,
@@ -883,6 +979,18 @@ export class DiscordModeBroker {
 				else if (delivery.state === "dispatched" || delivery.state === "accepted") delivery.state = "unknown";
 			}
 		this.#journal.dialogs = this.#journal.dialogs.filter(item => item.sessionId !== session.id);
+		// Settings changes are connection-bound: none survives into a later connection or process.
+		const view = this.#settings.get(session.id)?.view;
+		this.#settings.delete(session.id);
+		for (const item of this.#commands.get(session.id) ?? [])
+			this.#settingNotes.push({
+				channelId: item.channelId,
+				commandId: item.command.id,
+				text: item.dispatched
+					? `Outcome unknown (${describeSettingCommand(item.command, view)}): the session disconnected before confirming. Check /session settings once it's back.`
+					: `Not applied (${describeSettingCommand(item.command, view)}): the session disconnected first.`,
+			});
+		this.#commands.delete(session.id);
 	}
 
 	async #expire(): Promise<void> {
@@ -969,7 +1077,8 @@ export class DiscordModeBroker {
 		});
 	}
 
-	async #poll(session: Session, busy: boolean, pendingInput: boolean): Promise<ModeSnapshot> {
+	async #poll(session: Session, input: Extract<ModeRequest, { op: "poll" }>): Promise<ModeSnapshot> {
+		const { busy, pendingInput } = input;
 		if (
 			this.#journal.deliveries.some(
 				item => item.sessionId === session.id && item.source === "owner" && item.state === "queued",
@@ -981,7 +1090,18 @@ export class DiscordModeBroker {
 		session.seenAt = Date.now();
 		session.busy = busy;
 		session.pendingInput = pendingInput;
-		let responseBytes = Buffer.byteLength(JSON.stringify(this.#snapshot(session))) + 1024;
+		if (input.settings || input.usage) this.#report(session, input.settings, input.usage);
+		// Unacknowledged changes repeat on every poll; the session dedups by id and re-sends a lost result.
+		const commands: ModeSettingCommand[] = [];
+		for (const item of this.#commands.get(session.id) ?? [])
+			if (item.connectionId === session.connectionId) {
+				item.dispatched = true;
+				commands.push({ ...item.command });
+			}
+		let responseBytes =
+			Buffer.byteLength(JSON.stringify(this.#snapshot(session))) +
+			Buffer.byteLength(JSON.stringify(commands)) +
+			1024;
 		const deliveries: ModeDelivery[] = [];
 		const active = this.#journal.deliveries.some(
 			item =>
@@ -1031,7 +1151,193 @@ export class DiscordModeBroker {
 			}
 		if (changed || deliveries.length || answers.length) await this.#persist();
 		if (changed || deliveries.length) await this.#cards(this.#group(session.groupId));
-		return { ...this.#snapshot(session), deliveries, answers };
+		return { ...this.#snapshot(session), deliveries, answers, ...(commands.length ? { commands } : {}) };
+	}
+
+	#report(session: Session, view: ModeSettingsView | undefined, usage: ModeUsage | undefined): void {
+		const report = this.#settingsFor(session) ?? { connectionId: session.connectionId };
+		if (view) report.view = view;
+		if (usage) report.usage = usage;
+		this.#settings.set(session.id, report);
+	}
+
+	#settingsFor(session: Session): SettingsReport | undefined {
+		const report = this.#settings.get(session.id);
+		return report?.connectionId === session.connectionId ? report : undefined;
+	}
+
+	#panel(session: Session, view: ModeSettingsView, usage: ModeUsage | undefined): ModeSettingsPanel {
+		return {
+			view,
+			...(usage ? { usage } : {}),
+			busy: session.busy || session.pendingInput,
+			pending: (this.#commands.get(session.id) ?? []).map(item => ({ ...item.command })),
+		};
+	}
+
+	#settingsPanel(session: Session, query: string | undefined): ModeControlResult {
+		const connectionId = this.#controlConnection(session);
+		if (!connectionId) return { text: "This conversation isn't open locally; resume it to change its settings." };
+		const report = this.#settingsFor(session);
+		if (!report?.view)
+			return {
+				text: "This session hasn't reported its settings. Its app may predate Discord settings, or it just connected; try again in a moment.",
+			};
+		const settings = this.#panel(session, report.view, report.usage);
+		if (query === undefined) return { text: "", connectionId, settings };
+		settings.matches = rankSettingsModels(report.view.models, query, DISCORD_MODE_MAX_SHORTLIST);
+		return {
+			text: settings.matches.length
+				? `${settings.matches.length} model${settings.matches.length === 1 ? "" : "s"} match “${query}”.`
+				: `No model matches “${query}”.`,
+			connectionId,
+			settings,
+		};
+	}
+
+	/** Validate one owner change against what the session reported, then queue it for the session's next idle moment. */
+	#queueSetting(session: Session, input: ModeControlRequest): ModeControlResult {
+		const repeated = this.#settingControls.get(input.id);
+		if (repeated) return repeated;
+		this.#requireLive(session);
+		const connectionId = this.#controlConnection(session);
+		const report = this.#settingsFor(session);
+		if (!connectionId || !report?.view)
+			throw new DiscordModeError("This session isn't reporting its settings right now; reopen the settings panel.");
+		const view = report.view;
+		const setting = input.setting!;
+		const queue = this.#commands.get(session.id) ?? [];
+		const value = this.#settingValue(session, view, queue, setting);
+		const duplicate = queue.find(item => item.command.kind === setting.kind && item.command.value === value);
+		let result: ModeControlResult;
+		if (duplicate) {
+			result = {
+				text: `Already pending: ${describeSettingCommand(duplicate.command, view)}. You'll get one confirmation when it applies.`,
+				connectionId,
+				settings: this.#panel(session, view, report.usage),
+			};
+		} else {
+			// The session never saw an undispatched change, so a newer choice of the same kind simply replaces it.
+			const replaced = SUPERSEDABLE[setting.kind]
+				? queue.findIndex(item => !item.dispatched && item.command.kind === setting.kind)
+				: -1;
+			if (replaced >= 0) {
+				const [old] = queue.splice(replaced, 1);
+				this.#settingNotes.push({
+					channelId: old!.channelId,
+					commandId: old!.command.id,
+					text: `Not applied (${describeSettingCommand(old!.command, view)}): replaced by your newer choice.`,
+				});
+			}
+			if (queue.length >= DISCORD_MODE_MAX_SETTING_COMMANDS)
+				throw new DiscordModeError("Too many settings changes are pending; wait for them to apply.");
+			const command: ModeSettingCommand = {
+				id: randomUUID(),
+				kind: setting.kind,
+				...(value === undefined ? {} : { value }),
+			};
+			queue.push({ command, connectionId, channelId: session.channelId!, dispatched: false });
+			this.#commands.set(session.id, queue);
+			const described = describeSettingCommand(command, view);
+			result = {
+				text:
+					session.busy || session.pendingInput
+						? `Pending — applies after this turn: ${described}.`
+						: `Sent to the session: ${described}. You'll get a confirmation once it applies.`,
+				connectionId,
+				commandId: command.id,
+				settings: this.#panel(session, view, report.usage),
+			};
+		}
+		this.#settingControls.set(input.id, result);
+		if (this.#settingControls.size > SETTINGS_MEMORY)
+			this.#settingControls.delete(this.#settingControls.keys().next().value!);
+		return result;
+	}
+
+	/** The command value the session will receive; refuses anything the session did not offer. */
+	#settingValue(
+		session: Session,
+		view: ModeSettingsView,
+		queue: PendingSetting[],
+		setting: NonNullable<ModeControlRequest["setting"]>,
+	): string | boolean | undefined {
+		const unsupported = () => new DiscordModeError("This session doesn't offer that setting.");
+		switch (setting.kind) {
+			case "model":
+			case "advisor-model": {
+				if (setting.kind === "advisor-model" && !view.capabilities.advisor) throw unsupported();
+				const choice = typeof setting.value === "string" ? findSettingsChoice(view, setting.value) : undefined;
+				if (!choice)
+					throw new DiscordModeError(
+						"That model is no longer offered by this session; reopen the settings panel.",
+					);
+				return choice.selector;
+			}
+			case "effort": {
+				// Efforts follow the model the session will run: a pending model change, else the current one.
+				const pendingModel = queue.findLast(item => item.command.kind === "model")?.command.value;
+				const model = typeof pendingModel === "string" ? findSettingsModel(view, pendingModel) : view.model;
+				if (typeof setting.value !== "string" || !model?.efforts.includes(setting.value))
+					throw new DiscordModeError(
+						`${model?.name ?? "The session's model"} doesn't support effort ${String(setting.value)}.`,
+					);
+				return setting.value;
+			}
+			case "default":
+				if (!view.capabilities.persist) throw unsupported();
+				return undefined;
+			case "compact":
+				if (!view.capabilities.compact) throw unsupported();
+				if (session.busy || session.pendingInput)
+					throw new DiscordModeError("The session is busy; compact it once it's idle.");
+				return undefined;
+			case "advisor":
+				if (!view.capabilities.advisor) throw unsupported();
+				if (typeof setting.value !== "boolean") throw new DiscordModeError("Choose advisor on or off.");
+				return setting.value;
+			case "plan":
+				if (!view.capabilities.plan) throw unsupported();
+				if (view.plan?.enabled)
+					throw new DiscordModeError("Plan mode is already on; leaving it goes through plan approval.");
+				return undefined;
+		}
+	}
+
+	/** The session applied (or refused) one change; confirm it to the owner with the fresh view. */
+	async #commandResult(session: Session, input: Extract<ModeRequest, { op: "command-result" }>): Promise<void> {
+		if (this.#settled.has(input.commandId)) return;
+		const queue = this.#commands.get(session.id) ?? [];
+		const index = queue.findIndex(
+			item => item.command.id === input.commandId && item.connectionId === session.connectionId && item.dispatched,
+		);
+		if (index < 0)
+			throw new DiscordModeError("Settings result does not match a change dispatched to this connection.");
+		const [item] = queue.splice(index, 1);
+		if (!queue.length) this.#commands.delete(session.id);
+		this.#settled.add(input.commandId);
+		if (this.#settled.size > SETTINGS_MEMORY) this.#settled.delete(this.#settled.values().next().value!);
+		if (input.settings || input.usage) this.#report(session, input.settings, input.usage);
+		const report = this.#settingsFor(session);
+		if (!this.#gateway) return;
+		// Best effort and never an uncertain binding: the panel and /session settings show the state either way.
+		const deadline = Promise.withResolvers<void>();
+		const timer = setTimeout(deadline.resolve, EFFECT_TIMEOUT_MS);
+		try {
+			await Promise.race([
+				this.#port
+					.settingsResult(
+						item!.channelId,
+						input.commandId,
+						input.text,
+						report?.view ? this.#panel(session, report.view, report.usage) : undefined,
+					)
+					.catch(() => {}),
+				deadline.promise,
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	async #receipt(session: Session, input: Extract<ModeRequest, { op: "receipt" }>): Promise<void> {
@@ -1161,7 +1467,10 @@ export class DiscordModeBroker {
 					input.action !== "queue" &&
 					input.action !== "cancel" &&
 					input.action !== "steer") ||
-				(input.action === "notify") !== (input.notify !== undefined)
+				(input.action === "notify") !== (input.notify !== undefined) ||
+				(input.action === "setting") !== (input.setting !== undefined) ||
+				(input.action === "setting" && !input.connectionId) ||
+				(input.query !== undefined && input.action !== "settings")
 			)
 				throw new Error("Invalid control fields");
 		} catch {
@@ -1197,6 +1506,8 @@ export class DiscordModeBroker {
 			await this.#cards(this.#group(session.groupId));
 			return { text: `Notifications: ${input.notify}. ${NOTIFY_DESCRIPTIONS[input.notify!]}` };
 		}
+		if (input.action === "settings") return this.#settingsPanel(session, input.query);
+		if (input.action === "setting") return this.#queueSetting(session, input);
 		const readOnly = input.action === "status" || input.action === "queue";
 		if (readOnly) await this.#cards(this.#group(session.groupId));
 		if (input.action === "status")
@@ -1959,6 +2270,7 @@ export class DiscordModeBroker {
 			answers: [],
 			gatewayConnected: this.#gateway,
 			maxReply: DISCORD_MODE_MAX_REPLY,
+			settingsRevision: this.#settingsFor(session)?.view?.revision ?? "",
 		};
 	}
 

@@ -3,7 +3,11 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { connectExistingDiscordMode, DiscordModeRequestError } from "@oh-my-pi/pi-utils/discord-client";
+import {
+	connectExistingDiscordMode,
+	DiscordModeRequestError,
+	sealModeSettingsView,
+} from "@oh-my-pi/pi-utils/discord-client";
 import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	DISCORD_MODE_MAX_PENDING,
@@ -13,7 +17,10 @@ import {
 	type ModeLease,
 	type ModeRequest,
 	type ModeSession,
+	type ModeSettingCommand,
+	type ModeSettingsView,
 	type ModeSnapshot,
+	type ModeUsage,
 } from "@oh-my-pi/pi-wire/discord-mode";
 import {
 	BRIDGE_MESSAGE_SOURCE,
@@ -24,6 +31,7 @@ import {
 	type BridgeHost,
 	type BridgeHostState,
 	type BridgePeer,
+	type BridgeSettingResult,
 } from "./host";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -36,6 +44,10 @@ const RECOVERY =
 /** One broker lease (45 s) plus margin: a crashed or just-closed window has released it by then. */
 const REJOIN_RETRY_MS = 50_000;
 const MAX_STATE_BYTES = 24 * 1024 * 1024;
+/** A reported settings view is rebuilt at most this often, and after every applied change. */
+const SETTINGS_REFRESH_MS = 5_000;
+/** Applied results remembered to re-send a lost acknowledgement instead of applying twice. */
+const SETTLED_COMMANDS = 32;
 
 type ReceiptState = "attempted" | "accepted" | "settled" | "held" | "resolved";
 interface Receipt {
@@ -320,6 +332,13 @@ interface Attachment {
 	available: boolean;
 	polling: boolean;
 	cancelTimer?: () => void;
+	/** Owner settings changes received on this attachment and not yet applied, oldest first. */
+	commands: ModeSettingCommand[];
+	/** Applied results; a repeated command re-sends its result, never applies twice. */
+	settled: Map<string, BridgeSettingResult>;
+	acknowledging: Set<string>;
+	applying: boolean;
+	view?: { at: number; view: ModeSettingsView };
 }
 
 export interface BridgeSessionOptions {
@@ -542,6 +561,10 @@ export class BridgeSession {
 				effects: new Set(),
 				available: true,
 				polling: false,
+				commands: [],
+				settled: new Map(),
+				acknowledging: new Set(),
+				applying: false,
 			};
 			this.#attachment = attachment;
 			await this.#tool(true);
@@ -549,7 +572,7 @@ export class BridgeSession {
 			this.#render(attachment);
 			if (!rejoin)
 				this.host.notify(
-					"Bridge attached to this saved session. Approvals and settings remain local. Switching, branching, or shutdown only detaches: resuming this conversation reattaches it until /bridge off. Official OMP has no authoritative permanent-deletion event, so a missing file never retires or deletes a Discord channel.",
+					"Bridge attached to this saved session. Approvals stay local; Discord's Settings panel can change this session's model, effort, and context (applied when idle). Switching, branching, or shutdown only detaches: resuming this conversation reattaches it until /bridge off. Official OMP has no authoritative permanent-deletion event, so a missing file never retires or deletes a Discord channel.",
 					"info",
 				);
 			if (attachment.holds.size) this.host.notify(RECOVERY, "warning");
@@ -782,6 +805,7 @@ export class BridgeSession {
 				lease: attachment.lease,
 				busy: this.#busy(attachment),
 				pendingInput: state.pendingInput || state.draft,
+				...this.#settingsReport(attachment),
 			});
 			for (const delivery of snapshot.deliveries) {
 				if (
@@ -799,12 +823,111 @@ export class BridgeSession {
 				}
 				attachment.queue.push(delivery);
 			}
+			// Settings apply first, so the next owner message already runs with them.
+			this.#intakeCommands(attachment, snapshot.commands ?? []);
 			await this.#drain(attachment);
 		} catch (error) {
 			if (!(error instanceof DiscordModeRequestError && error.outcome === "not-started"))
 				this.#hold(attachment, "intake");
 		} finally {
 			attachment.polling = false;
+		}
+	}
+
+	/** Settings ride polls only to brokers that advertise them, and the full view only when its revision changed. */
+	#settingsReport(attachment: Attachment): { settings?: ModeSettingsView; usage?: ModeUsage } {
+		const revision = attachment.snapshot.settingsRevision;
+		if (revision === undefined) return {};
+		const view = this.#settingsView(attachment);
+		const usage = this.#usage();
+		return { ...(view && view.revision !== revision ? { settings: view } : {}), ...(usage ? { usage } : {}) };
+	}
+
+	#settingsView(attachment: Attachment): ModeSettingsView | undefined {
+		const now = performance.now();
+		if (attachment.view && now - attachment.view.at < SETTINGS_REFRESH_MS) return attachment.view.view;
+		let view: ModeSettingsView | undefined;
+		try {
+			const report = this.host.settings();
+			view = report ? sealModeSettingsView(report) : undefined;
+		} catch {
+			// A host that cannot describe itself reports nothing; polling and delivery continue.
+		}
+		attachment.view = view ? { at: now, view } : undefined;
+		return view;
+	}
+
+	#usage(): ModeUsage | undefined {
+		try {
+			return this.host.usage();
+		} catch {
+			return undefined;
+		}
+	}
+
+	#intakeCommands(attachment: Attachment, commands: ModeSettingCommand[]): void {
+		for (const command of commands) {
+			const settled = attachment.settled.get(command.id);
+			if (settled) void this.#acknowledge(attachment, command.id, settled);
+			else if (!attachment.commands.some(item => item.id === command.id)) attachment.commands.push(command);
+		}
+		if (attachment.commands.length && !this.#busy(attachment)) void this.#applyCommands(attachment);
+	}
+
+	/** Detached from polling: a compaction can outlast the lease, so heartbeats continue while it runs. */
+	async #applyCommands(attachment: Attachment): Promise<void> {
+		attachment.applying = true;
+		try {
+			while (this.#current(attachment) && attachment.commands.length && !this.#hostBusy(attachment)) {
+				const command = attachment.commands.shift()!;
+				let result: BridgeSettingResult;
+				try {
+					result = await this.host.applySetting(command);
+				} catch (error) {
+					result = {
+						outcome: "failed",
+						text: `Failed: ${error instanceof Error ? error.message : String(error)}`,
+					};
+				}
+				attachment.view = undefined;
+				if (!this.#current(attachment)) return;
+				attachment.settled.set(command.id, result);
+				if (attachment.settled.size > SETTLED_COMMANDS)
+					attachment.settled.delete(attachment.settled.keys().next().value!);
+				await this.#acknowledge(attachment, command.id, result);
+			}
+		} finally {
+			attachment.applying = false;
+		}
+	}
+
+	async #acknowledge(attachment: Attachment, commandId: string, result: BridgeSettingResult): Promise<void> {
+		if (attachment.acknowledging.has(commandId) || !this.#current(attachment)) return;
+		attachment.acknowledging.add(commandId);
+		try {
+			const view = this.#settingsView(attachment);
+			const usage = this.#usage();
+			// Straight to the broker: a refused acknowledgement is not a transport fault and must not hold intake.
+			await attachment.client.request(
+				{
+					op: "command-result",
+					lease: attachment.lease,
+					commandId,
+					outcome: result.outcome,
+					text:
+						result.text
+							.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ")
+							.slice(0, 500)
+							.trim() || result.outcome,
+					...(view ? { settings: view } : {}),
+					...(usage ? { usage } : {}),
+				},
+				attachment.signal,
+			);
+		} catch {
+			// The broker repeats an unacknowledged command on the next poll; the settled result is re-sent then.
+		} finally {
+			attachment.acknowledging.delete(commandId);
 		}
 	}
 
@@ -909,7 +1032,12 @@ export class BridgeSession {
 		return change;
 	}
 
+	/** Applying an owner settings change counts as busy, so no owner message starts mid-change. */
 	#busy(attachment: Attachment): boolean {
+		return attachment.applying || this.#hostBusy(attachment);
+	}
+
+	#hostBusy(attachment: Attachment): boolean {
 		const state = this.host.getState();
 		return (
 			!state.idle ||

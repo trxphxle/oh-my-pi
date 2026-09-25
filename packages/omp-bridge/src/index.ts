@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { DISCORD_MODE_MAX_TEXT, type ModeSnapshot } from "@oh-my-pi/pi-wire/discord-mode";
+import {
+	DISCORD_MODE_MAX_MODELS,
+	DISCORD_MODE_MAX_SHORTLIST,
+	DISCORD_MODE_MAX_TEXT,
+	type ModeModelChoice,
+	type ModeSnapshot,
+} from "@oh-my-pi/pi-wire/discord-mode";
 import bridgePrompt from "../prompts/bridge.md" with { type: "text" };
 import peerPrompt from "../prompts/peer.md" with { type: "text" };
 import {
@@ -11,6 +18,7 @@ import {
 	BRIDGE_PEER_MESSAGE_TYPE,
 	type BridgeConnection,
 	type BridgeHost,
+	type BridgeSettingResult,
 } from "./host";
 import { BridgeSession } from "./session";
 
@@ -35,6 +43,21 @@ function describe(snapshot: ModeSnapshot): string {
 		`Project: ${snapshot.group.name} (${snapshot.group.state}); category ${snapshot.group.categoryId ?? "unbound"}.`,
 		...(uncertain ? [`${uncertain} uncertain delivery(s): use /bridge reconcile; no automatic replay.`] : []),
 	].join("\n");
+}
+
+type BridgeModel = NonNullable<ExtensionContext["model"]>;
+
+const selectorOf = (model: BridgeModel) => `${model.provider}/${model.id}`;
+
+/** OMP's public thinking API: off plus the model's own levels (no `auto`); empty without an effort control. */
+function effortLadder(model: BridgeModel): string[] {
+	const efforts = model.reasoning ? (model.thinking?.efforts ?? []) : [];
+	return efforts.length ? ["off", ...efforts] : [];
+}
+
+/** Authenticated models; older OMP builds lack `ctx.models`, so fall back to the registry. */
+function availableModels(ctx: ExtensionContext): BridgeModel[] {
+	return ctx.models?.list?.() ?? ctx.modelRegistry.getAvailable();
 }
 
 /** Dependencies are injectable for isolated transport fixtures; production uses the shared connector. */
@@ -117,6 +140,94 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 				callback();
 			}, delayMs);
 			return () => ctx.clearTimer(timer);
+		},
+		settings() {
+			const ctx = latest;
+			const model = ctx?.model;
+			if (!ctx || !model) return undefined;
+			const available = availableModels(ctx);
+			const roles = new Map<string, string>();
+			const roleModels: BridgeModel[] = [];
+			for (const role of ["default", "smol", "slow"]) {
+				const resolved = ctx.models?.resolve?.(`@${role}`);
+				if (!resolved) continue;
+				roleModels.push(resolved);
+				if (!roles.has(selectorOf(resolved))) roles.set(selectorOf(resolved), role);
+			}
+			const unique = (models: BridgeModel[], limit: number) => {
+				const seen = new Set<string>();
+				const result: ModeModelChoice[] = [];
+				for (const item of models) {
+					if (result.length === limit) break;
+					const selector = selectorOf(item);
+					if (seen.has(selector)) continue;
+					seen.add(selector);
+					const role = roles.get(selector);
+					result.push({
+						selector,
+						name: item.name.trim() || item.id,
+						...(role ? { role } : {}),
+						efforts: effortLadder(item),
+					});
+				}
+				return result;
+			};
+			const level = pi.getThinkingLevel();
+			return {
+				model: unique([model], 1)[0],
+				...(level && effortLadder(model).length ? { effort: level === "inherit" ? "off" : level } : {}),
+				// OMP's extension API has no persistent model roles, advisor, or plan-mode entry.
+				capabilities: { persist: false, compact: true, advisor: false, plan: false },
+				shortlist: unique([model, ...roleModels, ...available], DISCORD_MODE_MAX_SHORTLIST),
+				models: unique(available, DISCORD_MODE_MAX_MODELS),
+			};
+		},
+		usage() {
+			const usage = latest?.getContextUsage();
+			return usage
+				? { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: usage.percent }
+				: undefined;
+		},
+		async applySetting(command): Promise<BridgeSettingResult> {
+			const ctx = latest;
+			if (!ctx) return { outcome: "rejected", text: "Not applied: this OMP window has no active session." };
+			switch (command.kind) {
+				case "model": {
+					const model = availableModels(ctx).find(item => selectorOf(item) === command.value);
+					if (!model)
+						return {
+							outcome: "rejected",
+							text: `Not applied: ${String(command.value)} is no longer available here.`,
+						};
+					const name = model.name.trim() || model.id;
+					// Like the TUI's session switch: compact first when the transcript exceeds the target's window.
+					const tokens = ctx.getContextUsage()?.tokens ?? 0;
+					const window = model.contextWindow ?? 0;
+					const compacted = window > 0 && tokens > window;
+					if (compacted) await ctx.compact();
+					if (!(await pi.setModel(model)))
+						return {
+							outcome: "rejected",
+							text: `Not applied: no API key is configured for ${selectorOf(model)}.`,
+						};
+					return {
+						outcome: "applied",
+						text: `Model → ${name} (this session only)${compacted ? "; compacted first to fit its context window" : ""}.`,
+					};
+				}
+				case "effort": {
+					const level = String(command.value);
+					if (!ctx.model || !effortLadder(ctx.model).includes(level))
+						return { outcome: "rejected", text: `Not applied: this model doesn't support effort ${level}.` };
+					pi.setThinkingLevel(level as ThinkingLevel);
+					return { outcome: "applied", text: `Effort → ${pi.getThinkingLevel() ?? level}.` };
+				}
+				case "compact":
+					await ctx.compact();
+					return { outcome: "applied", text: "Context compacted." };
+				default:
+					return { outcome: "rejected", text: "Not applied: OMP sessions don't offer this setting." };
+			}
 		},
 	};
 
@@ -226,7 +337,8 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 		description: "Existing Haiso Discord broker root (default: HAISO_BRIDGE_ROOT or ~/.omp/agent/discord-mode)",
 	});
 	pi.registerCommand(TOOL_NAME, {
-		description: "Opt in to the existing Haiso Discord broker; approvals and settings remain local",
+		description:
+			"Opt in to the existing Haiso Discord broker; approvals stay local, and Discord may change model, effort, and context when idle",
 		async handler(args, ctx) {
 			await useContext(ctx);
 			if (ctx.mode !== "tui" || !ctx.hasUI) {
