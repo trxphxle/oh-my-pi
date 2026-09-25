@@ -64,7 +64,6 @@ first. The connector never creates or rewrites OMP's native session file.
 
 | OMP terminal command | Behavior |
 | --- | --- |
-| `/bridge on [label]` | Explicitly attach this saved conversation and enable its small `bridge` tool. |
 | `/bridge on [label]` | Share this saved conversation and enable its small `bridge` tool; afterwards it rejoins automatically when resumed in OMP. |
 | `/bridge off` | Make this conversation private (sticky), release the service lease, and remove only this extension's tool. |
 | `/bridge status` | Inspect local connection, destination, and uncertain deliveries. |
