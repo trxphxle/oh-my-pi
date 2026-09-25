@@ -43,8 +43,8 @@ interface FakeClock {
 }
 
 /** Reconnect backoff reads the monotonic clock; tests advance it explicitly instead of sleeping. */
-function fakeClock(): FakeClock {
-	let now = performance.now();
+function fakeClock(start = performance.now()): FakeClock {
+	let now = start;
 	vi.spyOn(performance, "now").mockImplementation(() => now);
 	return {
 		advance(ms) {
@@ -470,7 +470,8 @@ describe("native Discord session routing", () => {
 	});
 
 	test("settings ride polls only to brokers advertising them, and the view only when its revision changed", async () => {
-		const clock = fakeClock();
+		// At this start, `(start + 5000) - start` rounds to 4999.999…: the view cache must expire by its deadline anyway.
+		const clock = fakeClock(3192.3);
 		const f = await fixture();
 		let effort = "high";
 		const mode = new DiscordModeSession(f.engine, {

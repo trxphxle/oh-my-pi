@@ -339,15 +339,22 @@ interface Attachment {
 	cancelTimer?: () => void;
 	/** A parked broker wait between polls; detach or a local state change aborts it. */
 	parked?: AbortController;
-	/** What the last poll reported; a local change ends a parked wait so the broker hears it promptly. */
-	reported?: { state: string; progress: string; at: number };
+	/**
+	 * What the last poll reported; a local change ends a parked wait so the broker hears it promptly. A progress-only
+	 * change counts from `progressDue` on.
+	 */
+	reported?: { state: string; progress: string; progressDue: number };
 	/** Owner settings changes received on this attachment and not yet applied, oldest first. */
 	commands: ModeSettingCommand[];
 	/** Applied results; a repeated command re-sends its result, never applies twice. */
 	settled: Map<string, BridgeSettingResult>;
 	acknowledging: Set<string>;
 	applying: boolean;
-	view?: { at: number; view: ModeSettingsView };
+	/**
+	 * Cached view, rebuilt from `until` on. Deadlines are stored rather than start times: `now - start < interval` can
+	 * round below `interval` on a float clock even once the interval has passed.
+	 */
+	view?: { until: number; view: ModeSettingsView };
 }
 
 export interface BridgeSessionOptions {
@@ -843,7 +850,7 @@ export class BridgeSession {
 			attachment.reported = {
 				state: `${busy}|${pendingInput}`,
 				progress: JSON.stringify(progress.progress ?? null),
-				at: performance.now(),
+				progressDue: performance.now() + PROGRESS_POLL_MS,
 			};
 			const snapshot = await this.#request(attachment, {
 				op: "poll",
@@ -903,7 +910,7 @@ export class BridgeSession {
 
 	#settingsView(attachment: Attachment): ModeSettingsView | undefined {
 		const now = performance.now();
-		if (attachment.view && now - attachment.view.at < SETTINGS_REFRESH_MS) return attachment.view.view;
+		if (attachment.view && now < attachment.view.until) return attachment.view.view;
 		let view: ModeSettingsView | undefined;
 		try {
 			const report = this.host.settings();
@@ -911,7 +918,7 @@ export class BridgeSession {
 		} catch {
 			// A host that cannot describe itself reports nothing; polling and delivery continue.
 		}
-		attachment.view = view ? { at: now, view } : undefined;
+		attachment.view = view ? { until: now + SETTINGS_REFRESH_MS, view } : undefined;
 		return view;
 	}
 
@@ -1214,7 +1221,7 @@ export class BridgeSession {
 		const revision = attachment.snapshot.settingsRevision;
 		if (revision !== undefined && (this.#settingsView(attachment)?.revision ?? revision) !== revision) return true;
 		return (
-			performance.now() - reported.at >= PROGRESS_POLL_MS &&
+			performance.now() >= reported.progressDue &&
 			JSON.stringify(this.#progressReport(attachment).progress ?? null) !== reported.progress
 		);
 	}

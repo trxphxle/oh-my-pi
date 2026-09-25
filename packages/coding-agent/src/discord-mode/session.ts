@@ -278,8 +278,11 @@ export class DiscordModeSession {
 	#timer?: NodeJS.Timeout;
 	/** A parked broker wait between polls; teardown or a local state change aborts it. */
 	#parked?: AbortController;
-	/** What the last poll reported; a local change ends a parked wait so the broker hears it promptly. */
-	#reported?: { state: string; progress: string; at: number };
+	/**
+	 * What the last poll reported; a local change ends a parked wait so the broker hears it promptly. A progress-only
+	 * change counts from `progressDue` on.
+	 */
+	#reported?: { state: string; progress: string; progressDue: number };
 	#unsubscribe?: () => void;
 	#queue: ModeDelivery[] = [];
 	#active?: ActiveDelivery;
@@ -300,7 +303,11 @@ export class DiscordModeSession {
 	#settled = new Map<string, DiscordSettingResult>();
 	#acknowledging = new Set<string>();
 	#applying = false;
-	#settingsView?: { at: number; view: ModeSettingsView };
+	/**
+	 * Cached view, rebuilt from `until` on. Deadlines are stored rather than start times: `now - start < interval` can
+	 * round below `interval` on a float clock even once the interval has passed.
+	 */
+	#settingsView?: { until: number; view: ModeSettingsView };
 	/** Background copy: the launch its first registration claims, then undefined. */
 	#launchId?: string;
 	#released = false;
@@ -673,7 +680,7 @@ export class DiscordModeSession {
 			this.#reported = {
 				state: `${busy}|${pendingInput}`,
 				progress: JSON.stringify(progress.progress ?? null),
-				at: performance.now(),
+				progressDue: performance.now() + PROGRESS_POLL_MS,
 			};
 			const snapshot = await this.#request({
 				op: "poll",
@@ -717,7 +724,7 @@ export class DiscordModeSession {
 
 	#currentSettings(): ModeSettingsView | undefined {
 		const now = performance.now();
-		if (this.#settingsView && now - this.#settingsView.at < SETTINGS_REFRESH_MS) return this.#settingsView.view;
+		if (this.#settingsView && now < this.#settingsView.until) return this.#settingsView.view;
 		let view: ModeSettingsView | undefined;
 		try {
 			const report = this.#options.settings?.view();
@@ -725,7 +732,7 @@ export class DiscordModeSession {
 		} catch {
 			// A host that cannot describe itself reports nothing; polling and delivery continue.
 		}
-		this.#settingsView = view ? { at: now, view } : undefined;
+		this.#settingsView = view ? { until: now + SETTINGS_REFRESH_MS, view } : undefined;
 		return view;
 	}
 
@@ -1088,7 +1095,7 @@ export class DiscordModeSession {
 		)
 			return true;
 		return (
-			performance.now() - reported.at >= PROGRESS_POLL_MS &&
+			performance.now() >= reported.progressDue &&
 			JSON.stringify(this.#progressReport().progress ?? null) !== reported.progress
 		);
 	}
