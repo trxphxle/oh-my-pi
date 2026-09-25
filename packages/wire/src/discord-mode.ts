@@ -19,6 +19,11 @@ export const DISCORD_MODE_MAX_SETTING_COMMANDS = 8;
 /** Session card progress: `last` label bound and edited-file cap; the tracker never exceeds them. */
 export const DISCORD_MODE_MAX_PROGRESS_LABEL = 48;
 export const DISCORD_MODE_MAX_PROGRESS_FILES = 999;
+/**
+ * Longest `/wait` park (ms). A wait refreshes the lease on entry and exit, so it must stay well inside the broker's
+ * 45 s lease and the 30 s request deadline.
+ */
+export const DISCORD_MODE_MAX_WAIT_MS = 25_000;
 
 /**
  * Hidden Haiso CLI selector (the only argument) that starts or adopts the account service, prints
@@ -181,6 +186,11 @@ export interface ModeSnapshot {
 	stepAside?: true;
 	/** The service's build, so a client can tell it is running an older release than the one installed. */
 	service?: ModeServiceInfo;
+	/**
+	 * The broker answers `POST /wait {lease, timeoutMs}` with `{ready}` once work for this lease is ready (or the
+	 * timeout passes); clients then poll once. Absent from older brokers, whose clients keep polling every second.
+	 */
+	wait?: true;
 }
 /** Owner-queued session settings changes. Approval policy, credentials, and logins never cross this boundary. */
 export type ModeSettingKind = "model" | "effort" | "default" | "compact" | "advisor" | "advisor-model" | "plan";
@@ -392,7 +402,8 @@ export interface ModeControlRequest {
 	 * `review`: list saved messages, or show one (`deliveryId`). These accept a revoked `connectionId`.
 	 * `sessions`/`resume`/`new` work in a project's overview or any of its session channels; `resume` takes
 	 * `sessionId` (else this channel's conversation); `new` takes `name`, `message`, and optional `model`. `close`
-	 * detaches a background copy at its next idle point.
+	 * detaches a background copy at its next idle point. `rename` renames this session's channel to `name` (also while
+	 * the conversation is closed).
 	 */
 	action:
 		| "status"
@@ -411,7 +422,8 @@ export interface ModeControlRequest {
 		| "sessions"
 		| "resume"
 		| "new"
-		| "close";
+		| "close"
+		| "rename";
 	connectionId?: string;
 	deliveryId?: string;
 	notify?: ModeNotify;
@@ -420,7 +432,10 @@ export interface ModeControlRequest {
 	/** `settings` only: rank the reported models against this text. */
 	query?: string;
 	sessionId?: string;
-	/** `new` only: the conversation's name, its first owner message, and an optional `provider/model` selector. */
+	/**
+	 * `new`: the conversation's name, its first owner message, and an optional `provider/model` selector.
+	 * `rename`: the channel's new name.
+	 */
 	name?: string;
 	message?: string;
 	model?: string;

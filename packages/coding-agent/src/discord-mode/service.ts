@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import { getGlobalDaemonRuntimeDir } from "@oh-my-pi/pi-utils";
+import { PowerAssertion } from "@oh-my-pi/pi-natives";
+import { getGlobalDaemonRuntimeDir, isBunTestRuntime } from "@oh-my-pi/pi-utils";
 import { discordModeSocketIsStale } from "@oh-my-pi/pi-utils/discord-client";
 import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import { type DiscordModeConnector, DISCORD_MODE_DAEMON_NAME } from "@oh-my-pi/pi-wire/discord-mode";
@@ -11,6 +12,14 @@ import { discordModePaths } from "./config";
 export interface DiscordServiceSettings {
 	/** Keep the account service running after the last Haiso/OMP process releases it. */
 	keepOnline: boolean;
+	/** Keep the Mac from idle-sleeping while a conversation is shared and open (or a background copy runs). */
+	keepAwake: boolean;
+}
+
+const DEFAULT_SETTINGS: DiscordServiceSettings = { keepOnline: true, keepAwake: false };
+
+function settingsPath(): string {
+	return path.join(discordModePaths().root, "service.json");
 }
 
 /** Machine-global supervisor scope for one Discord mode root. */
@@ -34,17 +43,103 @@ export function discordModeSupervisorLease(
 	};
 }
 
-/** Missing, unreadable, or malformed settings mean the default: keep online. */
+/** Missing, unreadable, or malformed settings mean the defaults: keep online, let the Mac sleep. */
 export async function readDiscordServiceSettings(): Promise<DiscordServiceSettings> {
 	let value: unknown;
 	try {
-		value = await readPrivateJson(path.join(discordModePaths().root, "service.json"), 4096);
+		value = await readPrivateJson(settingsPath(), 4096);
 	} catch {
-		return { keepOnline: true };
+		return { ...DEFAULT_SETTINGS };
 	}
-	if (typeof value !== "object" || value === null || !("keepOnline" in value) || typeof value.keepOnline !== "boolean")
-		return { keepOnline: true };
-	return { keepOnline: value.keepOnline };
+	if (typeof value !== "object" || value === null) return { ...DEFAULT_SETTINGS };
+	return {
+		keepOnline:
+			"keepOnline" in value && typeof value.keepOnline === "boolean"
+				? value.keepOnline
+				: DEFAULT_SETTINGS.keepOnline,
+		keepAwake:
+			"keepAwake" in value && typeof value.keepAwake === "boolean" ? value.keepAwake : DEFAULT_SETTINGS.keepAwake,
+	};
+}
+
+async function writeDiscordServiceSettings(change: Partial<DiscordServiceSettings>): Promise<void> {
+	await writePrivateJson(settingsPath(), { version: 1, ...(await readDiscordServiceSettings()), ...change });
+}
+
+/** Persist keep-awake; the running service re-reads its settings within DISCORD_SERVICE_SETTINGS_MS. */
+export async function setDiscordServiceKeepAwake(keepAwake: boolean): Promise<void> {
+	await writeDiscordServiceSettings({ keepAwake });
+}
+
+/** How often the running service re-reads its settings file. */
+export const DISCORD_SERVICE_SETTINGS_MS = 15_000;
+
+/** A held platform power assertion; `stop` is idempotent. */
+export interface DiscordPowerHold {
+	stop(): void;
+}
+
+/** Idle-sleep prevention (`caffeinate -i`); unsupported platforms get the native no-op handle. Never in tests. */
+function holdIdleSleep(): DiscordPowerHold | undefined {
+	if (isBunTestRuntime()) return undefined;
+	return PowerAssertion.start({ reason: "Haiso Discord: shared conversation open", idle: true });
+}
+
+/**
+ * Holds the power assertion exactly while keep-awake is on and something is shared: a connected conversation or a
+ * background copy. Off by default; releasing never throws.
+ */
+export class DiscordKeepAwake {
+	#enabled = false;
+	#sharing = false;
+	#hold: DiscordPowerHold | undefined;
+	#held = false;
+	readonly #start: () => DiscordPowerHold | undefined;
+
+	constructor(start: () => DiscordPowerHold | undefined = holdIdleSleep) {
+		this.#start = start;
+	}
+
+	/** Whether the assertion is held right now. */
+	get holding(): boolean {
+		return this.#held;
+	}
+
+	setEnabled(enabled: boolean): void {
+		this.#enabled = enabled;
+		this.#apply();
+	}
+
+	setSharing(sharing: boolean): void {
+		this.#sharing = sharing;
+		this.#apply();
+	}
+
+	close(): void {
+		this.#enabled = false;
+		this.#apply();
+	}
+
+	#apply(): void {
+		const want = this.#enabled && this.#sharing;
+		if (want === this.#held) return;
+		this.#held = want;
+		if (want) {
+			try {
+				this.#hold = this.#start();
+			} catch {
+				this.#hold = undefined;
+			}
+			return;
+		}
+		const hold = this.#hold;
+		this.#hold = undefined;
+		try {
+			hold?.stop();
+		} catch {
+			/* Releasing is best-effort; the OS drops the assertion when the process exits. */
+		}
+	}
 }
 
 /**
@@ -54,7 +149,7 @@ export async function readDiscordServiceSettings(): Promise<DiscordServiceSettin
  */
 export async function setDiscordServiceKeepOnline(keepOnline: boolean): Promise<{ live: boolean }> {
 	const paths = discordModePaths();
-	await writePrivateJson(path.join(paths.root, "service.json"), { version: 1, keepOnline });
+	await writeDiscordServiceSettings({ keepOnline });
 	try {
 		const service = await discordModeSupervisorService(paths.root);
 		const runtimeDir = await canonicalProjectDir(getGlobalDaemonRuntimeDir(service));

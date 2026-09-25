@@ -33,7 +33,12 @@ import {
 	withDiscordDeletionLock,
 } from "../../src/discord-mode/retirement-events";
 import { startDiscordModeServer } from "../../src/discord-mode/server";
-import { DISCORD_MODE_MAX_REPLY, DISCORD_MODE_MAX_TEXT } from "@oh-my-pi/pi-wire/discord-mode";
+import {
+	DISCORD_MODE_MAX_PENDING,
+	DISCORD_MODE_MAX_REPLY,
+	DISCORD_MODE_MAX_TEXT,
+	DISCORD_MODE_MAX_WAIT_MS,
+} from "@oh-my-pi/pi-wire/discord-mode";
 import type {
 	ChannelInspection,
 	DiscordPort,
@@ -3687,6 +3692,235 @@ describe("background conversations from Discord", () => {
 			expect(copy.session.host).toBe(`haiso-s-${input.sessionId}`);
 		} finally {
 			await broker.close();
+		}
+	});
+});
+
+describe("Discord rename, keep-awake input, and push waits", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("renames a session channel from Discord with the terminal's validation and markers, also while closed", async () => {
+		using temporary = TempDir.createSync("@discord-rename-control-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "first"));
+			const omp = await broker.request({ ...registration(root, "api"), app: "omp" });
+			const channelId = session.session.channelId!;
+			const rename = (name: string | undefined, id = randomUUID(), target = session, ownerId = config.ownerId) =>
+				port.handlers!.control({
+					id,
+					channelId: target.session.channelId!,
+					ownerId,
+					action: "rename",
+					...(name === undefined ? {} : { name }),
+				});
+			const id = randomUUID();
+			// A pasted foreign marker is replaced by the session's own app marker, as with /discord rename.
+			expect((await rename("🔵 New Name", id)).text).toBe("Renamed this channel to #🟣-new-name.");
+			expect(port.channel(channelId).name).toBe("🟣-new-name");
+			expect(port.cards.get(channelId)?.text).toStartWith("Haiso · new-name\n");
+			const renames = port.renames.length;
+			expect((await rename("🔵 New Name", id)).text).toBe("Renamed this channel to #🟣-new-name.");
+			expect(port.renames).toHaveLength(renames);
+			await expect(rename("Other", id)).rejects.toThrow("already used with different input");
+			await rename("service", undefined, omp);
+			expect(port.channel(omp.session.channelId!).name).toBe("🔵-service");
+			await expect(rename("!!!")).rejects.toThrow("usable letters");
+			await expect(rename(undefined)).rejects.toThrow("Invalid session control");
+			await expect(rename("a\nb")).rejects.toThrow("Invalid session control");
+			await expect(port.control(session, "status", { name: "x" })).rejects.toThrow("Invalid session control");
+			await expect(rename("hijack", randomUUID(), session, "999")).rejects.toThrow("Only the configured owner");
+			expect(port.renames).toHaveLength(renames + 1);
+			// Closed at the desk: the broker still owns the channel, so the rename needs no lease.
+			await broker.request({ op: "detach", lease: lease(session) });
+			await rename("later");
+			expect(port.channel(channelId).name).toBe("🟣-later");
+			const enrollment = await broker.lookup(session.group.projectDir, session.session.id);
+			expect(enrollment?.session).toMatchObject({ label: "later", connected: false });
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("reports sharing on and off as conversations connect and close, for keep-awake", async () => {
+		using temporary = TempDir.createSync("@discord-sharing-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const sharing: boolean[] = [];
+		const broker = new DiscordModeBroker({
+			config,
+			storePath: path.join(root, "private", "state.json"),
+			port,
+			onSharing: value => sharing.push(value),
+		});
+		await broker.start();
+		try {
+			expect(sharing).toEqual([]);
+			const firstInput = registration(root, "first");
+			const first = await broker.request(firstInput);
+			const second = await broker.request(registration(root, "second"));
+			expect(sharing).toEqual([true]);
+			await broker.request({ op: "detach", lease: lease(first) });
+			expect(sharing).toEqual([true]);
+			await broker.request({ op: "off", lease: lease(second) });
+			expect(sharing).toEqual([true, false]);
+			await broker.request(resumed(firstInput));
+			expect(sharing).toEqual([true, false, true]);
+			// A lease that expires (crashed process) stops sharing too.
+			const time = Date.now();
+			vi.spyOn(Date, "now").mockImplementation(() => time + 46_000);
+			await port.handlers!.changed();
+			expect(sharing).toEqual([true, false, true, false]);
+			vi.restoreAllMocks();
+			await broker.request(resumed(firstInput));
+			await broker.close();
+			expect(sharing).toEqual([true, false, true, false, true, false]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("parks a wait until work is ready, never spinning on work the session can't take yet", async () => {
+		using temporary = TempDir.createSync("@discord-wait-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "waiting"));
+			expect(session.wait).toBe(true);
+			// Never polled: the snapshot it holds is the registration's, so it polls first.
+			expect(await broker.wait(lease(session), 5_000)).toBe(true);
+			expect((await poll(broker, session)).wait).toBe(true);
+			const started = performance.now();
+			expect(await broker.wait(lease(session), 40)).toBe(false);
+			expect(performance.now() - started).toBeGreaterThanOrEqual(35);
+			// An owner message wakes the parked wait; the wait itself dispatches nothing.
+			const parked = broker.wait(lease(session), 5_000);
+			await port.owner(session, "hello");
+			expect(await parked).toBe(true);
+			const [hello] = (await poll(broker, session)).deliveries;
+			expect(hello?.text).toBe("hello");
+			for (const state of ["accepted", "completed"] as const)
+				await broker.request({ op: "receipt", lease: lease(session), deliveryId: hello!.id, state });
+			// Busy: a queued message waits for idle, so the wait stays parked instead of waking every time.
+			await poll(broker, session, true);
+			const busy = broker.wait(lease(session), 60);
+			await port.owner(session, "later");
+			expect(await busy).toBe(false);
+			expect((await poll(broker, session, true)).deliveries).toEqual([]);
+			expect((await poll(broker, session)).deliveries.map(item => item.text)).toEqual(["later"]);
+			// A snapshot change the session has not seen (its channel was renamed) wakes it too.
+			const renamed = broker.wait(lease(session), 5_000);
+			await port.control(session, "rename", { name: "renamed" });
+			expect(await renamed).toBe(true);
+			await poll(broker, session);
+			// Abort drops the waiter; a revoked lease answers at once so the client's poll reports it.
+			const controller = new AbortController();
+			const aborted = broker.wait(lease(session), 5_000, controller.signal);
+			controller.abort();
+			expect(await aborted).toBe(false);
+			const revoked = broker.wait(lease(session), 5_000);
+			await broker.request({ op: "detach", lease: lease(session) });
+			expect(await revoked).toBe(true);
+			expect(await broker.wait(lease(session), 5_000)).toBe(true);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("keeps the lease alive across back-to-back waits without polls in between", async () => {
+		using temporary = TempDir.createSync("@discord-wait-lease-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "heartbeat"));
+			await poll(broker, session);
+			let now = Date.now();
+			vi.spyOn(Date, "now").mockImplementation(() => now);
+			// 40 s after the poll, then 40 s after that wait: each wait refreshed the 45 s lease.
+			now += 40_000;
+			expect(await broker.wait(lease(session), 5)).toBe(false);
+			now += 40_000;
+			await port.handlers!.changed();
+			expect((await poll(broker, session)).session.connected).toBe(true);
+			// Without a wait, the same gap expires it.
+			now += 46_000;
+			await port.handlers!.changed();
+			await expect(poll(broker, session)).rejects.toThrow("invalid, expired, or revoked");
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("serves /wait outside the request cap, end to end over the socket", async () => {
+		using temporary = TempDir.createSync("@discord-wait-server-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		const socketPath = path.join(root, "ipc.sock");
+		const token = "offline-wait-fixture-token-1234567890";
+		const server = await startDiscordModeServer({ broker, socketPath, token });
+		const clients = await Promise.all(
+			Array.from({ length: Math.ceil((DISCORD_MODE_MAX_PENDING + 8) / 4) }, () =>
+				connectDiscordModeAt(socketPath, token),
+			),
+		);
+		try {
+			const client = clients[0]!;
+			const sessions = [];
+			for (let index = 0; index < DISCORD_MODE_MAX_PENDING + 8; index++) {
+				const snapshot = await client.request(registration(root, `idle-${index}`));
+				await client.request({ op: "poll", lease: lease(snapshot), busy: false, pendingInput: false });
+				sessions.push(snapshot);
+			}
+			// More parked waits than the request cap; requests still go through meanwhile.
+			const waits = sessions.map((snapshot, index) => clients[index % clients.length]!.wait(lease(snapshot), 5_000));
+			// Real socket integration: give the parked requests time to reach the server before the capped route runs.
+			await Bun.sleep(50);
+			const target = sessions[0]!;
+			expect((await client.request({ op: "status", lease: lease(target) })).session.connected).toBe(true);
+			await port.owner(target, "wake up");
+			expect(await waits[0]).toBe(true);
+			await Promise.all(sessions.slice(1).map(snapshot => broker.request({ op: "detach", lease: lease(snapshot) })));
+			expect(await Promise.all(waits.slice(1))).toEqual(sessions.slice(1).map(() => true));
+			await expect(client.wait(lease(target), DISCORD_MODE_MAX_WAIT_MS + 1)).rejects.toThrow("Invalid Discord");
+		} finally {
+			for (const client of clients) await client.close();
+			await server.close();
+			await broker.close();
+		}
+	});
+
+	it("an older service without /wait refuses it unexecuted, so clients keep polling", async () => {
+		using temporary = TempDir.createSync("@discord-wait-old-");
+		const root = temporary.path();
+		const socketPath = path.join(root, "ipc.sock");
+		const token = "offline-wait-legacy-token-1234567890";
+		const server = await startDiscordModeServer({
+			socketPath,
+			token,
+			broker: {
+				async request(): Promise<never> {
+					throw new Error("not used");
+				},
+			},
+		});
+		const client = await connectDiscordModeAt(socketPath, token);
+		try {
+			const stale = { sessionId: randomUUID(), connectionId: randomUUID(), token: "a".repeat(64) };
+			await expect(client.wait(stale, 1_000)).rejects.toMatchObject({ outcome: "not-started" });
+		} finally {
+			await client.close();
+			await server.close();
 		}
 	});
 });

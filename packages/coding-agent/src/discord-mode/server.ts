@@ -7,8 +7,10 @@ import { ensurePrivateDirectory } from "@oh-my-pi/pi-utils/discord-private-files
 import {
 	DISCORD_MODE_MAX_FRAME,
 	DISCORD_MODE_MAX_PENDING,
+	DISCORD_MODE_MAX_SESSIONS,
 	DISCORD_MODE_PROTOCOL,
 	type ModeEnrollment,
+	type ModeLease,
 	type ModeServiceInfo,
 } from "@oh-my-pi/pi-wire/discord-mode";
 
@@ -17,6 +19,7 @@ import {
 	DISCORD_MODE_AUTH_HEADER,
 	DISCORD_MODE_CONFIG_HEADER,
 	isModeRequest,
+	isModeWaitRequest,
 	readDiscordModeJsonBody,
 	inspectDiscordModeSocket,
 	discordModeSocketIsStale,
@@ -54,6 +57,7 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
 
 type RequestBroker = Pick<DiscordModeBroker, "request"> & {
 	lookup?(projectDir: string, sessionId: string): Promise<ModeEnrollment | undefined>;
+	wait?(lease: ModeLease, timeoutMs: number, signal?: AbortSignal): Promise<boolean>;
 };
 
 /** Owns the socket only. The worker owns gateway/broker lifecycle, and sessions remain in their native process. */
@@ -76,6 +80,8 @@ export async function startDiscordModeServer(options: {
 	const instanceId = randomUUID();
 	let ready = options.ready ?? true;
 	let active = 0;
+	/** Parked `/wait`s: idle sessions hold one each, so they have their own cap instead of `active`'s. */
+	let waiting = 0;
 	let closed = false;
 	const failure = (status: number, outcome: "not-started" | "unknown") =>
 		Response.json({ protocol: DISCORD_MODE_PROTOCOL, ok: false, outcome }, { status });
@@ -101,6 +107,28 @@ export async function startDiscordModeServer(options: {
 					instanceId,
 					...(options.service ? { service: options.service } : {}),
 				});
+			}
+			if (request.method === "POST" && url.pathname === "/wait") {
+				if (!options.broker.wait) return failure(404, "not-started");
+				if (waiting >= DISCORD_MODE_MAX_SESSIONS) return failure(429, "not-started");
+				waiting++;
+				try {
+					let body: unknown;
+					try {
+						body = await readDiscordModeJsonBody(request);
+					} catch {
+						return failure(400, "not-started");
+					}
+					if (!record(body) || body.protocol !== DISCORD_MODE_PROTOCOL || !isModeWaitRequest(body))
+						return failure(400, "not-started");
+					// A client that hangs up (it moved on) aborts the request, which drops the waiter.
+					const ready = await options.broker.wait(body.lease, body.timeoutMs, request.signal);
+					return Response.json({ protocol: DISCORD_MODE_PROTOCOL, ok: true, ready });
+				} catch {
+					return failure(500, "not-started");
+				} finally {
+					waiting--;
+				}
 			}
 			if (active >= DISCORD_MODE_MAX_PENDING) return failure(429, "not-started");
 			if (request.method === "GET" && url.pathname === "/enrollment") {

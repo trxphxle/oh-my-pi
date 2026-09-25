@@ -263,6 +263,41 @@ describe("Haiso compiled releases", () => {
 		expect(missing.stderr).toContain(`updater not found: ${updater}`);
 	}, 120_000);
 
+	it("routes `haiso discord doctor` to the doctor selector and keeps pre-doctor launchers valid", async () => {
+		const { root, options } = await fixture();
+		const receipt = await install(options);
+		const args = async (...argv: string[]) => JSON.parse(await execute([receipt.launcher, ...argv], root)).args;
+		expect(await args("discord", "doctor")).toEqual(["__omp_worker_discord_doctor"]);
+		expect(await args("discord", "foo")).toEqual(["discord", "foo"]);
+		expect(await args("doctor")).toEqual(["doctor"]);
+
+		// Rewrite the release as an installer before the doctor route sealed it: no launcherVersion, no route.
+		const rewrite = async (file: string, content: string) => {
+			const mode = (await fs.lstat(file)).mode & 0o777;
+			await fs.chmod(file, 0o600);
+			await fs.writeFile(file, content);
+			await fs.chmod(file, mode);
+		};
+		const wrapper = path.join(receipt.release, "bin/launch");
+		const routed = await fs.readFile(wrapper, "utf8");
+		await rewrite(
+			wrapper,
+			routed
+				.split("\n")
+				.filter(line => !line.includes("__omp_worker_discord_doctor"))
+				.join("\n"),
+		);
+		await expect(readHaisoRelease(receipt.release)).rejects.toThrow("Tampered release launcher");
+		const receiptPath = path.join(receipt.release, "receipt.json");
+		const { launcherVersion, ...previous } = JSON.parse(await fs.readFile(receiptPath, "utf8"));
+		expect(launcherVersion).toBe(2);
+		await rewrite(receiptPath, `${JSON.stringify(previous, null, 2)}\n`);
+		await rewrite(path.join(receipt.release, "receipt.sha256"), `${await sha256(receiptPath)}\n`);
+		expect((await readHaisoRelease(receipt.release)).release).toBe(receipt.release);
+		expect((await currentHaisoRelease(options.prefix))?.release).toBe(receipt.release);
+		expect(await args("discord", "doctor")).toEqual(["discord", "doctor"]);
+	}, 120_000);
+
 	it("prints the held-update notice and schedules at most one background check per day", async () => {
 		const { root, options, updater } = await fixture();
 		const receipt = await install(options);

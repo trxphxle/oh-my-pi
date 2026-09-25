@@ -13,6 +13,7 @@ import {
 	DISCORD_MODE_MAX_TEXT,
 	type ModeDelivery,
 	type ModeEnrollment,
+	type ModeLease,
 	type ModeRequest,
 	type ModeSession,
 	type ModeSettingCommand,
@@ -80,6 +81,8 @@ async function fixture(
 		/** Interactive host choice; absent like hosts without a UI. */
 		select?: BridgeHost["select"];
 		startService?: HaisoServiceStarter;
+		/** Broker advertises and answers `/wait`. */
+		wait?: boolean;
 	} = {},
 ) {
 	const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-session-"));
@@ -148,7 +151,9 @@ async function fixture(
 	const notices: string[] = [];
 	const statuses: Array<string | undefined> = [];
 	const activeTools = new Set(["read", "custom-tool"]);
-	const timers: Array<{ callback: () => void; cancelled: boolean }> = [];
+	const timers: Array<{ callback: () => void; cancelled: boolean; delay: number }> = [];
+	/** Parked `/wait`s, oldest first; `resolve(true)` rings like broker work would. */
+	const waits: Array<{ timeoutMs: number; resolve: (ready: boolean) => void; signal?: AbortSignal }> = [];
 	const connections: Array<{ closed: boolean }> = [];
 	const completions = new Map<string, PromiseWithResolvers<void>>();
 	let aborts = 0;
@@ -175,6 +180,7 @@ async function fixture(
 			gatewayConnected: true,
 			...(options.maxReply === undefined ? {} : { maxReply: options.maxReply }),
 			...(options.settings ? { settingsRevision } : {}),
+			...(options.wait ? { wait: true as const } : {}),
 		});
 	const connect = async (): Promise<BridgeConnection> => {
 		connects++;
@@ -186,6 +192,16 @@ async function fixture(
 			close: async () => {
 				connection.closed = true;
 			},
+			...(options.wait
+				? {
+						wait: (_lease: ModeLease, timeoutMs: number, signal?: AbortSignal) => {
+							const { promise, resolve } = Promise.withResolvers<boolean>();
+							waits.push({ timeoutMs, resolve, signal });
+							signal?.addEventListener("abort", () => resolve(false), { once: true });
+							return promise;
+						},
+					}
+				: {}),
 			request: async input => {
 				if (connection.closed) throw new DiscordModeRequestError("not-started", "fixture connection closed");
 				requests.push(input);
@@ -341,8 +357,8 @@ async function fixture(
 		notify: text => {
 			notices.push(text);
 		},
-		schedule: callback => {
-			const timer = { callback, cancelled: false };
+		schedule: (callback, delay) => {
+			const timer = { callback, cancelled: false, delay };
 			timers.push(timer);
 			return () => {
 				timer.cancelled = true;
@@ -397,6 +413,7 @@ async function fixture(
 		statuses,
 		activeTools,
 		timers,
+		waits,
 		connections,
 		replay,
 		get mode() {
@@ -1204,5 +1221,67 @@ describe("BridgeSession starts Haiso's stopped service", () => {
 		expect(s.roots).toEqual([f.root]);
 		// Automatic rejoin stays quiet: no starting notice.
 		expect(f.notices).not.toContain("Starting Haiso's Discord service…");
+	});
+});
+
+describe("BridgeSession push waits", () => {
+	/** Timers are the host's; each loop step runs the one live timer, then lets its async work reach the next one. */
+	async function step(f: { timers: Array<{ callback: () => void; cancelled: boolean }> }): Promise<void> {
+		const live = f.timers.filter(timer => !timer.cancelled);
+		expect(live).toHaveLength(1);
+		live[0]!.cancelled = true;
+		live[0]!.callback();
+		await until(() => f.timers.some(timer => !timer.cancelled));
+	}
+	async function until(condition: () => boolean): Promise<void> {
+		for (let attempt = 0; attempt < 400 && !condition(); attempt++) await Bun.sleep(1);
+		expect(condition()).toBe(true);
+	}
+	const polls = (requests: ModeRequest[]) =>
+		requests.filter((request): request is Extract<ModeRequest, { op: "poll" }> => request.op === "poll");
+
+	test("an idle bridge polls once per broker wait instead of once per interval", async () => {
+		const legacy = await fixture({ timers: true });
+		await legacy.mode.on();
+		for (let tick = 0; tick < 10; tick++) await step(legacy);
+		expect(polls(legacy.requests)).toHaveLength(10);
+
+		const f = await fixture({ timers: true, wait: true });
+		await f.mode.on();
+		await step(f);
+		expect(polls(f.requests)).toHaveLength(1);
+		expect(f.waits.map(wait => wait.timeoutMs)).toEqual([25_000]);
+		// The same ten idle intervals only run the local check: no IPC, no polls.
+		for (let tick = 0; tick < 10; tick++) await step(f);
+		expect(polls(f.requests)).toHaveLength(1);
+		expect(f.waits).toHaveLength(1);
+	});
+
+	test("broker work ends the wait and the next poll takes it", async () => {
+		const f = await fixture({ timers: true, wait: true });
+		await f.mode.on();
+		await step(f);
+		const watch = f.timers.find(timer => !timer.cancelled)!;
+		const delivery = f.queue({ text: "wake up" });
+		f.waits[0]!.resolve(true);
+		await until(() => watch.cancelled && f.timers.some(timer => !timer.cancelled));
+		await step(f);
+		expect(polls(f.requests)).toHaveLength(2);
+		expect(f.delivered.map(item => item.delivery.id)).toEqual([delivery.id]);
+	});
+
+	test("a local change ends the wait so the broker hears it on the next poll; detach aborts it", async () => {
+		const f = await fixture({ timers: true, wait: true });
+		await f.mode.on();
+		await step(f);
+		f.state.draft = true;
+		// The local check notices the draft, ends the wait, and the loop polls with it.
+		await step(f);
+		expect(f.waits[0]!.signal?.aborted).toBe(true);
+		await step(f);
+		expect(polls(f.requests).at(-1)).toMatchObject({ busy: true, pendingInput: true });
+		expect(f.waits).toHaveLength(2);
+		await f.mode.detach();
+		expect(f.waits[1]!.signal?.aborted).toBe(true);
 	});
 });

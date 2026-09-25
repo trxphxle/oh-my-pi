@@ -34,6 +34,7 @@ import {
 	BLOB_BROKER_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
 	DAEMON_BROKER_WORKER_ARG,
+	DISCORD_MODE_DOCTOR_WORKER_ARG,
 	DISCORD_MODE_ENSURE_WORKER_ARG,
 	DISCORD_MODE_WORKER_ARG,
 	LSP_MUX_WORKER_ARG,
@@ -41,6 +42,7 @@ import {
 	TERMINAL_OUTPUT_WORKER_ARG,
 } from "./cli/worker-selectors";
 import type * as JsProcessEntry from "./eval/js/process-entry";
+import type * as DiscordDoctor from "./discord-mode/doctor";
 import type * as DiscordWorker from "./discord-mode/worker";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
 
@@ -197,6 +199,10 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		const { ensureDiscordModeService }: typeof DiscordWorker = require("./discord-mode/worker");
 		await ensureDiscordModeService();
 		return true;
+	}
+	if (arg === DISCORD_MODE_DOCTOR_WORKER_ARG) {
+		const { runDiscordDoctorCommand }: typeof DiscordDoctor = require("./discord-mode/doctor");
+		await runDiscordDoctorCommand();
 	}
 	if (arg === TINY_WORKER_ARG) {
 		await runTinyWorker();

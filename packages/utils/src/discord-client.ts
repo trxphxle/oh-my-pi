@@ -15,10 +15,12 @@ import {
 	DISCORD_MODE_MAX_SETTINGS_BYTES,
 	DISCORD_MODE_MAX_SHORTLIST,
 	DISCORD_MODE_MAX_TEXT,
+	DISCORD_MODE_MAX_WAIT_MS,
 	DISCORD_MODE_PROTOCOL,
 	type DiscordModeInfo,
 	type DiscordModeConnector,
 	type ModeEnrollment,
+	type ModeLease,
 	type ModeGroup,
 	type ModeRequest,
 	type ModeModelChoice,
@@ -32,6 +34,8 @@ import { readPrivateJson, readPrivateText } from "./discord-private-files";
 const PROBE_TIMEOUT_MS = 1500;
 
 export const DISCORD_MODE_REQUEST_TIMEOUT_MS = 30_000;
+/** A wait's client deadline past its park: the broker answers at the park's end, never much later. */
+const DISCORD_MODE_WAIT_GRACE_MS = 5_000;
 export const DISCORD_MODE_AUTH_HEADER = "x-omp-discord-token";
 export const DISCORD_MODE_CONFIG_HEADER = "x-omp-discord-config";
 
@@ -307,6 +311,25 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 	}
 }
 
+/** A `/wait` body: this connection's lease and a park no longer than DISCORD_MODE_MAX_WAIT_MS. */
+export interface ModeWaitRequest {
+	lease: ModeLease;
+	timeoutMs: number;
+}
+export function isModeWaitRequest(value: unknown): value is ModeWaitRequest {
+	return (
+		record(value) &&
+		record(value.lease) &&
+		identifier(value.lease.sessionId) &&
+		identifier(value.lease.connectionId) &&
+		text(value.lease.token, 512) &&
+		typeof value.timeoutMs === "number" &&
+		Number.isSafeInteger(value.timeoutMs) &&
+		value.timeoutMs >= 0 &&
+		value.timeoutMs <= DISCORD_MODE_MAX_WAIT_MS
+	);
+}
+
 /** Shared streaming ceiling also bounds responses from a replaced or faulty local endpoint. */
 export async function readDiscordModeJsonBody(message: Request | Response): Promise<unknown> {
 	const length = message.headers.get("content-length");
@@ -484,6 +507,7 @@ function snapshot(value: unknown): value is ModeSnapshot {
 				value.commands.length <= DISCORD_MODE_MAX_SETTING_COMMANDS &&
 				value.commands.every(settingCommand))) &&
 		(value.progress === undefined || value.progress === true) &&
+		(value.wait === undefined || value.wait === true) &&
 		(value.background === undefined || value.background === true) &&
 		(value.stepAside === undefined || value.stepAside === true) &&
 		(value.service === undefined || serviceInfo(value.service))
@@ -662,6 +686,30 @@ export class DiscordModeClient {
 			);
 		}
 		return body.result;
+	}
+
+	/**
+	 * Parks until the broker has work for this lease (true) or `timeoutMs` passes (false); never dispatches anything, so
+	 * the caller polls afterwards either way. Only for brokers whose snapshot advertises `wait`.
+	 */
+	async wait(lease: ModeLease, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+		const input = { lease, timeoutMs };
+		if (!isModeWaitRequest(input)) throw new DiscordModeRequestError("not-started", "Invalid Discord mode wait.");
+		const { response, body } = await this.#fetch(
+			"/wait",
+			{ method: "POST", body: JSON.stringify({ protocol: DISCORD_MODE_PROTOCOL, ...input }) },
+			timeoutMs + DISCORD_MODE_WAIT_GRACE_MS,
+			signal,
+		);
+		if (
+			!response.ok ||
+			!record(body) ||
+			body.protocol !== DISCORD_MODE_PROTOCOL ||
+			body.ok !== true ||
+			typeof body.ready !== "boolean"
+		)
+			throw new DiscordModeRequestError("not-started", "Discord mode did not accept the wait.");
+		return body.ready;
 	}
 
 	async lookup(projectDir: string, sessionId: string): Promise<ModeEnrollment | undefined> {

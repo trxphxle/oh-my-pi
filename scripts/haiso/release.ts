@@ -25,6 +25,10 @@ const BRIDGE_ENTRY = "omp-bridge/index.js";
 /** First line of the OMP extension file the installer maintains; a file without it is never touched. */
 export const BRIDGE_LOADER_MARKER =
 	"// Haiso OMP bridge loader, maintained by `haiso update`. Delete this file to stop loading it.";
+/** Current launcher template: 2 routes `haiso discord doctor`. Receipts without it keep the original template. */
+const LAUNCHER_VERSION = 2;
+/** The CLI's hidden doctor selector (`DISCORD_MODE_DOCTOR_WORKER_ARG` in packages/coding-agent/src/cli/worker-selectors.ts). */
+const DOCTOR_SELECTOR = "__omp_worker_discord_doctor";
 
 export interface InstallOptions {
 	binary: string;
@@ -64,6 +68,8 @@ export interface ReleaseReceipt extends ReceiptCommon {
 	stateDir: string;
 	/** Frozen OMP bridge bundle; absent from releases built before it was shipped. */
 	bridge?: { path: string; sha256: string };
+	/** Launcher template revision; absent from releases whose launcher predates `haiso discord doctor` routing. */
+	launcherVersion?: typeof LAUNCHER_VERSION;
 }
 
 /** A release rebuilt from a frozen fork.patch; still readable and a rollback target, never produced again. */
@@ -220,12 +226,14 @@ interface LauncherInputs {
 	repo: string;
 	stateDir: string;
 	executable: string;
+	launcherVersion?: typeof LAUNCHER_VERSION;
 }
 
 /**
  * `haiso update …` runs the repository updater on the release's own runtime (plugin updates stay
  * in the binary); other launches schedule at most one daily background check and print any held-update
- * notice before replacing the shell with the frozen executable.
+ * notice before replacing the shell with the frozen executable. Launcher version 2 also routes `haiso discord doctor`
+ * straight to the doctor selector.
  */
 function launcherText(inputs: LauncherInputs): string {
 	return `#!/bin/sh
@@ -245,7 +253,7 @@ if [ "$1" = update ]; then
 		;;
 	esac
 fi
-if [ -z "$HAISO_UPDATE_DISABLED" ] && [ -f "$updater" ] && grep -q '"enabled": *true' "$state/settings.json" 2>/dev/null && [ -z "$(find "$state/last-check" -mmin -1440 2>/dev/null)" ]; then
+${inputs.launcherVersion === LAUNCHER_VERSION ? `[ "$1" = discord ] && [ "$2" = doctor ] && exec ${shellQuote(inputs.executable)} ${DOCTOR_SELECTOR}\n` : ""}if [ -z "$HAISO_UPDATE_DISABLED" ] && [ -f "$updater" ] && grep -q '"enabled": *true' "$state/settings.json" 2>/dev/null && [ -z "$(find "$state/last-check" -mmin -1440 2>/dev/null)" ]; then
 	: >"$state/last-check" 2>/dev/null && { nohup "$runtime" "$updater" --background >/dev/null 2>&1 & }
 fi
 [ -f "$state/notice" ] && cat "$state/notice" >&2
@@ -318,6 +326,7 @@ export async function readHaisoRelease(release: string): Promise<InstallReceipt>
 		(receipt.schemaVersion === 3
 			? !validSource(receipt.source) ||
 				!isNormalAbsolute(receipt.stateDir) ||
+				(receipt.launcherVersion !== undefined && receipt.launcherVersion !== LAUNCHER_VERSION) ||
 				(receipt.bridge !== undefined &&
 					(receipt.bridge.path !== path.join(release, BRIDGE_ENTRY) || !DIGEST.test(receipt.bridge.sha256)))
 			: receipt.forkPatch !== path.join(release, "fork.patch") ||
@@ -362,6 +371,7 @@ export async function readHaisoRelease(release: string): Promise<InstallReceipt>
 					repo: receipt.source.repo,
 					stateDir: receipt.stateDir,
 					executable: receipt.executable,
+					launcherVersion: receipt.launcherVersion,
 				})
 			: legacyLauncherText(receipt.executable, receipt.prefix);
 	if ((await fs.promises.readFile(wrapper, "utf8")) !== expectedLauncher)
@@ -598,7 +608,14 @@ export async function stageHaiso(options: InstallOptions): Promise<ReleaseReceip
 			const wrapper = path.join(release, "bin/launch");
 			await fs.promises.writeFile(
 				wrapper,
-				launcherText({ prefix, runtime, repo: source.repo, stateDir, executable }),
+				launcherText({
+					prefix,
+					runtime,
+					repo: source.repo,
+					stateDir,
+					executable,
+					launcherVersion: LAUNCHER_VERSION,
+				}),
 				{ mode: 0o500, flag: "wx" },
 			);
 			const runtimeVersion = await withProbeHome(async (home, env) => {
@@ -631,6 +648,7 @@ export async function stageHaiso(options: InstallOptions): Promise<ReleaseReceip
 				upstream: { tag: options.upstream.tag, commit: options.upstream.commit },
 				source,
 				stateDir,
+				launcherVersion: LAUNCHER_VERSION,
 				runtime: {
 					suppliedPath: suppliedRuntime,
 					installedPath: runtime,

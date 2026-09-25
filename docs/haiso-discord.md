@@ -65,6 +65,15 @@ engine. This mode does not install a login service.
   version and `update ready · switches when idle` while one is waiting.
 - **Pinned guide:** the service keeps one bot-pinned guide in `#general` current and
   posts a short *Haiso updated* note there when commands or guide sections change.
+- **Keep awake (opt-in):** `/discord service awake on` keeps the Mac from idle-sleeping
+  while a conversation is shared and connected or a background copy runs (closing the
+  lid still sleeps it). Off by default.
+- **Low overhead:** with a current service, idle sessions wait for work instead of
+  polling every second.
+- **Diagnostics:** `haiso discord doctor` (or `/discord doctor`) checks config and
+  permissions, the bot token, guild permissions, command registration, the service,
+  saved state, the release, and the OMP connector loader, with a one-line fix per
+  problem.
 - Keep the machine awake and online; sleep pauses everything until it wakes.
 
 ### Background conversations from Discord
@@ -151,6 +160,7 @@ command is needed. Queued-message acknowledgments offer **Send as guidance** and
 | `/session queue` | Inspect waiting owner messages; select one to view its full text and available actions. |
 | `/session notify mode:<all \| needs-you \| off>` | Choose when this session @mentions you (default `needs-you`); works while disconnected and persists. |
 | `/session settings` | Open the settings panel (also the card's **Settings** button). |
+| `/session rename` | Rename this session's channel (a form; the 🟣/🔵 marker is kept); works while closed. |
 | `!steer <message>` | Send guidance to active work. |
 | `!abort` | Request the same turn cancellation as `/session stop`. |
 

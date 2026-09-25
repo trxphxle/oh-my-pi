@@ -13,6 +13,7 @@ import {
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
+	DISCORD_MODE_MAX_WAIT_MS,
 	type ModeDelivery,
 	type ModeLease,
 	type ModeProgress,
@@ -50,6 +51,8 @@ const MAX_STATE_BYTES = 24 * 1024 * 1024;
 const SETTINGS_REFRESH_MS = 5_000;
 /** Applied results remembered to re-send a lost acknowledgement instead of applying twice. */
 const SETTLED_COMMANDS = 32;
+/** A progress-only change ends a parked wait at most this often; the card itself updates every 10 s at most. */
+const PROGRESS_POLL_MS = 2_000;
 
 type ReceiptState = "attempted" | "accepted" | "settled" | "held" | "resolved";
 interface Receipt {
@@ -334,6 +337,10 @@ interface Attachment {
 	available: boolean;
 	polling: boolean;
 	cancelTimer?: () => void;
+	/** A parked broker wait between polls; detach or a local state change aborts it. */
+	parked?: AbortController;
+	/** What the last poll reported; a local change ends a parked wait so the broker hears it promptly. */
+	reported?: { state: string; progress: string; at: number };
 	/** Owner settings changes received on this attachment and not yet applied, oldest first. */
 	commands: ModeSettingCommand[];
 	/** Applied results; a repeated command re-sends its result, never applies twice. */
@@ -348,6 +355,8 @@ export interface BridgeSessionOptions {
 	connect?: (root: string) => Promise<BridgeConnection>;
 	receiptRoot?: string;
 	pollIntervalMs?: number;
+	/** Longest broker wait between idle polls (default DISCORD_MODE_MAX_WAIT_MS); tests shorten it. */
+	waitMs?: number;
 	/** Delay before the one automatic-rejoin retry while another window still holds the conversation's lease. */
 	rejoinRetryMs?: number;
 	/**
@@ -681,6 +690,7 @@ export class BridgeSession {
 		this.#abort?.abort();
 		this.#abort = undefined;
 		attachment?.cancelTimer?.();
+		attachment?.parked?.abort();
 		this.#cancelRejoin?.();
 		this.#cancelRejoin = undefined;
 		this.#statusText = "Bridge: off";
@@ -827,13 +837,21 @@ export class BridgeSession {
 		attachment.polling = true;
 		try {
 			const state = this.host.getState();
+			const busy = this.#busy(attachment);
+			const pendingInput = state.pendingInput || state.draft;
+			const progress = this.#progressReport(attachment);
+			attachment.reported = {
+				state: `${busy}|${pendingInput}`,
+				progress: JSON.stringify(progress.progress ?? null),
+				at: performance.now(),
+			};
 			const snapshot = await this.#request(attachment, {
 				op: "poll",
 				lease: attachment.lease,
-				busy: this.#busy(attachment),
-				pendingInput: state.pendingInput || state.draft,
+				busy,
+				pendingInput,
 				...this.#settingsReport(attachment),
-				...this.#progressReport(attachment),
+				...progress,
 			});
 			for (const delivery of snapshot.deliveries) {
 				if (
@@ -1115,13 +1133,90 @@ export class BridgeSession {
 		if (first) this.host.notify(RECOVERY, "warning");
 	}
 
-	#schedule(attachment: Attachment): void {
-		if (!this.#current(attachment) || attachment.cancelTimer || this.options.pollIntervalMs === 0) return;
+	/**
+	 * One loop per attachment: poll, then park on the broker's `/wait` while idle when it advertises `wait` (else the
+	 * 1 s cadence as before). Polls stay at least one interval apart either way.
+	 */
+	#schedule(attachment: Attachment, delay = this.options.pollIntervalMs ?? 1000): void {
+		if (
+			!this.#current(attachment) ||
+			attachment.cancelTimer ||
+			attachment.parked ||
+			this.options.pollIntervalMs === 0
+		)
+			return;
 		attachment.cancelTimer = this.host.schedule(() => {
 			attachment.cancelTimer = undefined;
 			if (this.#attachment !== attachment) return;
-			void this.poll().finally(() => this.#schedule(attachment));
-		}, this.options.pollIntervalMs ?? 1000);
+			const started = performance.now();
+			void this.poll()
+				.then(() => this.#park(attachment))
+				.finally(() =>
+					this.#schedule(
+						attachment,
+						Math.max(0, (this.options.pollIntervalMs ?? 1000) - (performance.now() - started)),
+					),
+				);
+		}, delay);
+	}
+
+	/**
+	 * Waits for broker work instead of polling, while nothing local is pending. A local check each interval (no IPC)
+	 * ends the wait early when busy/input state, the settings view, or (every 2 s at most) progress changed. Any wait
+	 * failure just falls back to the next poll.
+	 */
+	async #park(attachment: Attachment): Promise<void> {
+		const wait = attachment.client.wait?.bind(attachment.client);
+		if (
+			!wait ||
+			!attachment.snapshot.wait ||
+			!this.#current(attachment) ||
+			!attachment.available ||
+			attachment.queue.length ||
+			attachment.commands.length ||
+			attachment.applying ||
+			this.#localChanged(attachment)
+		)
+			return;
+		const controller = new AbortController();
+		attachment.parked = controller;
+		const aborted = Promise.withResolvers<void>();
+		const signal = AbortSignal.any([controller.signal, attachment.signal]);
+		signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+		let cancelWatch: (() => void) | undefined;
+		const watch = () => {
+			cancelWatch = this.host.schedule(
+				() => {
+					if (!this.#current(attachment) || this.#localChanged(attachment)) controller.abort();
+					else watch();
+				},
+				Math.max(this.options.pollIntervalMs ?? 1000, 1),
+			);
+		};
+		watch();
+		try {
+			await Promise.race([
+				wait(attachment.lease, this.options.waitMs ?? DISCORD_MODE_MAX_WAIT_MS, signal).catch(() => true),
+				aborted.promise,
+			]);
+		} finally {
+			cancelWatch?.();
+			controller.abort();
+			if (attachment.parked === controller) attachment.parked = undefined;
+		}
+	}
+
+	/** Whether the broker's view of this session is stale: what a poll would report differs from the last one. */
+	#localChanged(attachment: Attachment): boolean {
+		const reported = attachment.reported;
+		const state = this.host.getState();
+		if (!reported || `${this.#busy(attachment)}|${state.pendingInput || state.draft}` !== reported.state) return true;
+		const revision = attachment.snapshot.settingsRevision;
+		if (revision !== undefined && (this.#settingsView(attachment)?.revision ?? revision) !== revision) return true;
+		return (
+			performance.now() - reported.at >= PROGRESS_POLL_MS &&
+			JSON.stringify(this.#progressReport(attachment).progress ?? null) !== reported.progress
+		);
 	}
 
 	/** Offer owner messages saved while this conversation was closed; only the owner's choice releases or drops them. */

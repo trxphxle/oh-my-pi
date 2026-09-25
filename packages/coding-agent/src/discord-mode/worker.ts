@@ -21,7 +21,7 @@ import {
 import { DiscordAdapter, sessionCommandGuide } from "./discord";
 import { renderDiscordGuide } from "./guide";
 import { DiscordHostLauncher } from "./launcher";
-import { readDiscordServiceSettings } from "./service";
+import { DISCORD_SERVICE_SETTINGS_MS, DiscordKeepAwake, readDiscordServiceSettings } from "./service";
 import {
 	DISCORD_REPLACES_ENV,
 	DiscordServiceSwitchover,
@@ -60,6 +60,8 @@ export async function startDiscordModeWorker(): Promise<void> {
 	let server: { close(): Promise<void>; ready(): void } | undefined;
 	let broker: DiscordModeBroker | undefined;
 	let switchover: DiscordServiceSwitchover | undefined;
+	let settingsTimer: NodeJS.Timeout | undefined;
+	const keepAwake = new DiscordKeepAwake();
 	/** Set once the service stopped for an update: hand over to the prefix's release after closing. */
 	let handover: string | undefined;
 	const stopped = Promise.withResolvers<void>();
@@ -87,6 +89,11 @@ export async function startDiscordModeWorker(): Promise<void> {
 		} else {
 			const config = await loadDiscordModeConfig();
 			const release = readDiscordServiceRelease();
+			// The setting is re-read periodically, so `/discord service awake on|off` applies without a restart.
+			const applySettings = async () => keepAwake.setEnabled((await readDiscordServiceSettings()).keepAwake);
+			await applySettings();
+			settingsTimer = setInterval(() => void applySettings(), DISCORD_SERVICE_SETTINGS_MS);
+			settingsTimer.unref();
 			broker = new DiscordModeBroker({
 				config,
 				storePath: paths.statePath,
@@ -94,6 +101,7 @@ export async function startDiscordModeWorker(): Promise<void> {
 				service: release.info,
 				guide: renderDiscordGuide(sessionCommandGuide()),
 				hosts: new DiscordHostLauncher(),
+				onSharing: sharing => keepAwake.setSharing(sharing),
 			});
 			// Claim IPC before logging into Discord, so a startup loser cannot create another gateway connection.
 			server = await startDiscordModeServer({
@@ -133,6 +141,8 @@ export async function startDiscordModeWorker(): Promise<void> {
 		process.removeListener("SIGTERM", stop);
 		process.removeListener("SIGINT", stop);
 		switchover?.stop();
+		clearInterval(settingsTimer);
+		keepAwake.close();
 		try {
 			await server?.close();
 		} finally {

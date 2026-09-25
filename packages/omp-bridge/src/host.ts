@@ -2,6 +2,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type {
 	ModeDelivery,
 	ModeEnrollment,
+	ModeLease,
 	ModeRequest,
 	ModeProgress,
 	ModeSettingCommand,
@@ -55,6 +56,8 @@ export interface BridgeHost {
 export interface BridgeConnection {
 	request(input: ModeRequest, signal?: AbortSignal): Promise<ModeSnapshot>;
 	lookup(projectDir: string, sessionId: string): Promise<ModeEnrollment | undefined>;
+	/** Parks until the broker has work for the lease; only brokers advertising `wait` answer it. */
+	wait?(lease: ModeLease, timeoutMs: number, signal?: AbortSignal): Promise<boolean>;
 	close(): Promise<void>;
 }
 

@@ -11,7 +11,7 @@ Send text to chat; it waits until the agent is idle. Controls are owner-only.
 
 **Sharing — terminal**
 Haiso: `/discord on` once per conversation. OMP: `/bridge on`. Sharing is remembered: resuming the conversation rejoins its channel. `/discord off` / `/bridge off` makes it private (sticky).
-The service stays online after your last terminal closes and updates itself once every session is idle. A closed session shows *Closed* with a **Resume** button; messages sent to it are saved and offered when it resumes. `/session resume` and `/session new` run conversations in the background; opening one at your desk takes it over.
+The service stays online after your last terminal closes and updates itself once every session is idle. A closed session shows *Closed* with a **Resume** button; messages sent to it are saved and offered when it resumes. `/session resume`/`new` run conversations in the background; opening one at your desk takes it over.
 
 **Delete — terminal**
 `/session delete`, `/delete`, or the picker: keep Discord history (channel archived) · delete both · cancel.

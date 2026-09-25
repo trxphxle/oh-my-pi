@@ -16,7 +16,12 @@ import {
 	discordModeConfigKey,
 } from "../../src/discord-mode/config";
 import { startDiscordModeServer } from "../../src/discord-mode/server";
-import { readDiscordServiceSettings, setDiscordServiceKeepOnline } from "../../src/discord-mode/service";
+import {
+	DiscordKeepAwake,
+	readDiscordServiceSettings,
+	setDiscordServiceKeepAwake,
+	setDiscordServiceKeepOnline,
+} from "../../src/discord-mode/service";
 import * as daemon from "../../src/launch/client";
 import type { DaemonOperation } from "../../src/launch/protocol";
 import { resolveWorkerSpawnCmd } from "../../src/subprocess/worker-client";
@@ -339,7 +344,9 @@ describe("native Discord service lifecycle", () => {
 
 	it("persists keep online and switches a running supervised service live", async () => {
 		const { root, factory } = await fixture();
-		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: true });
+		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: true, keepAwake: false });
+		// Keep-awake survives keep-online changes.
+		await setDiscordServiceKeepAwake(true);
 		const operations = fakeSupervisor(root, factory, [{ name: DISCORD_MODE_DAEMON_NAME, state: "running" }]);
 		const probe = discordClient.discordModeSocketIsStale;
 		const liveness = spyOn(discordClient, "discordModeSocketIsStale").mockImplementation(async socketPath =>
@@ -348,7 +355,7 @@ describe("native Discord service lifecycle", () => {
 		cleanups.push(() => liveness.mockRestore());
 		await writePrivateJson(path.join(root, "connector.json"), { version: 1, configKey });
 		expect(await setDiscordServiceKeepOnline(false)).toEqual({ live: true });
-		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: false });
+		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: false, keepAwake: true });
 		expect(operations.at(-1)).toEqual({ op: "mode", name: DISCORD_MODE_DAEMON_NAME, mode: "session" });
 		// Session-scoped again: bridges must lease the supervisor, so the connector publishes it.
 		expect((await readConnector(root)).supervisor).toMatchObject({ projectDir: path.join(root, "supervisor") });
@@ -356,7 +363,37 @@ describe("native Discord service lifecycle", () => {
 		expect(await readConnector(root)).toEqual({ version: 1, configKey });
 		liveness.mockImplementation(async () => true);
 		expect(await setDiscordServiceKeepOnline(true)).toEqual({ live: false });
-		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: true });
+		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: true, keepAwake: true });
 		expect(operations.filter(operation => operation.op === "mode")).toHaveLength(2);
+	});
+
+	it("keeps the Mac awake only when opted in and something is shared", async () => {
+		const { root } = await fixture();
+		// Off by default; toggling it keeps the keep-online choice.
+		expect((await readDiscordServiceSettings()).keepAwake).toBe(false);
+		await writePrivateJson(path.join(root, "service.json"), { version: 1, keepOnline: false });
+		await setDiscordServiceKeepAwake(true);
+		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: false, keepAwake: true });
+		await setDiscordServiceKeepAwake(false);
+		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: false, keepAwake: false });
+
+		const events: string[] = [];
+		const awake = new DiscordKeepAwake(() => {
+			events.push("hold");
+			return { stop: () => events.push("release") };
+		});
+		awake.setSharing(true);
+		expect(awake.holding).toBe(false);
+		awake.setEnabled(true);
+		awake.setSharing(true);
+		expect(awake.holding).toBe(true);
+		awake.setSharing(false);
+		awake.setSharing(true);
+		awake.setEnabled(false);
+		awake.setEnabled(true);
+		awake.close();
+		awake.setSharing(true);
+		expect(awake.holding).toBe(false);
+		expect(events).toEqual(["hold", "release", "hold", "release", "hold", "release"]);
 	});
 });

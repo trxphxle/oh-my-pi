@@ -11,6 +11,8 @@ export const BLOB_BROKER_WORKER_ARG = "__omp_worker_blob_broker";
 export const DISCORD_MODE_WORKER_ARG = "__omp_worker_discord_mode";
 /** Discord-service ensure selector; its string is the OMP bridge's contract (constants-only module). */
 export { DISCORD_MODE_ENSURE_WORKER_ARG } from "@oh-my-pi/pi-wire/discord-mode";
+/** `haiso discord doctor` selector: prints the Discord diagnostics checklist and exits 1 on any failure. */
+export const DISCORD_MODE_DOCTOR_WORKER_ARG = "__omp_worker_discord_doctor";
 /** Computer-worker selector shared by the CLI dispatcher and worker launcher. */
 export const COMPUTER_WORKER_ARG = "__omp_worker_computer";
 /** Daemon-broker selector shared by the CLI dispatcher and worker launcher. */

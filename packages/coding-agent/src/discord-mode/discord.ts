@@ -38,7 +38,7 @@ import {
 import { formatNumber } from "@oh-my-pi/pi-utils/format";
 import { DiscordModeError } from "./broker";
 import type { DiscordGuideCommand } from "./guide";
-import { discordCategoryName, discordChannelName } from "./names";
+import { discordCategoryName, discordChannelName, sessionLabel } from "./names";
 import { describeSettingCommand, settingsChoiceToken } from "./settings-view";
 import {
 	DISCORD_MODE_MAX_REPLY,
@@ -96,8 +96,11 @@ const SESSION_CONTROL = new RegExp(
 	`^haiso:s:(\\d{1,22}):([a-f0-9-]{36}):([A-Za-z0-9_-]{22})?:(status|stop|queue|steer|cancel|queue0|queue1|settings|discard|release|send-held|discard-held|review|review0|review1|${Object.keys(SETTINGS_ACTIONS).join("|")})$`,
 	"i",
 );
-/** Background launches: [Resume] on a closed card (`r:…:resume`), the resume picker (`r:…:pick`), the new form (`n:…:new`). */
-const LAUNCH_CONTROL = /^haiso:([rn]):(\d{1,22}):(resume|pick|new)$/;
+/**
+ * Channel forms and launches: [Resume] on a closed card (`r:…:resume`), the resume picker (`r:…:pick`), the new form
+ * (`n:…:new`), and the rename form (`m:…:rename`).
+ */
+const LAUNCH_CONTROL = /^haiso:([rnm]):(\d{1,22}):(resume|pick|new|rename)$/;
 const READ_PERMISSIONS = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
 const WRITE_PERMISSIONS = READ_PERMISSIONS | PermissionFlagsBits.SendMessages;
 const BOT_PERMISSIONS = WRITE_PERMISSIONS | PermissionFlagsBits.AttachFiles | PermissionFlagsBits.EmbedLinks;
@@ -231,6 +234,7 @@ export function sessionCommandDefinition() {
 		.addSubcommand(command =>
 			command.setName("close").setDescription("Close this session's background copy after its current turn"),
 		)
+		.addSubcommand(command => command.setName("rename").setDescription("Rename this channel"))
 		.toJSON();
 }
 
@@ -1694,10 +1698,38 @@ export class DiscordAdapter implements DiscordPort {
 			.catch(() => {});
 	}
 
-	/** [Resume] on a closed card, a pick from the resume list, or the submitted form; undefined when malformed. */
+	/** The rename form, prefilled with the channel's current name (without its app marker) when cached. */
+	async #renameForm(interaction: ChatInputCommandInteraction): Promise<void> {
+		if (!/^\d{1,22}$/.test(interaction.channelId)) return;
+		const input = new TextInputBuilder()
+			.setCustomId("name")
+			.setLabel("New name")
+			.setStyle(TextInputStyle.Short)
+			.setRequired(true)
+			.setMaxLength(100);
+		const current = interaction.channel && "name" in interaction.channel ? interaction.channel.name : undefined;
+		const label = current ? sessionLabel(current) : undefined;
+		if (label) input.setValue(label.slice(0, 100));
+		await interaction
+			.showModal(
+				new ModalBuilder()
+					.setCustomId(`${PREFIX}m:${interaction.channelId}:rename`)
+					.setTitle("Rename session")
+					.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input)),
+			)
+			.catch(() => {});
+	}
+
+	/** [Resume] on a closed card, a pick from the resume list, or a submitted form; undefined when malformed. */
 	#launchRequest(interaction: ReplyInteraction): LaunchRequest | undefined {
 		const match = "customId" in interaction ? LAUNCH_CONTROL.exec(interaction.customId) : null;
-		if (!match || match[2] !== interaction.channelId || (match[1] === "n") !== (match[3] === "new")) return undefined;
+		if (
+			!match ||
+			match[2] !== interaction.channelId ||
+			(match[1] === "n") !== (match[3] === "new") ||
+			(match[1] === "m") !== (match[3] === "rename")
+		)
+			return undefined;
 		if (match[3] === "resume") return interaction.isButton() ? { action: "resume" } : undefined;
 		if (match[3] === "pick")
 			return interaction.isStringSelectMenu() && interaction.values.length === 1 && UUID.test(interaction.values[0]!)
@@ -1708,6 +1740,7 @@ export class DiscordAdapter implements DiscordPort {
 			.getTextInputValue("name")
 			.replace(/[\x00-\x1f\x7f]/g, " ")
 			.trim();
+		if (match[3] === "rename") return name ? { action: "rename", name } : undefined;
 		const message = interaction.fields.getTextInputValue("message");
 		const model = interaction.fields.getTextInputValue("model").trim();
 		if (!name || !message.trim()) return undefined;
@@ -1734,7 +1767,8 @@ export class DiscordAdapter implements DiscordPort {
 					subcommand !== "settings" &&
 					subcommand !== "resume" &&
 					subcommand !== "new" &&
-					subcommand !== "close") ||
+					subcommand !== "close" &&
+					subcommand !== "rename") ||
 				(subcommand === "notify" && !notify)
 			) {
 				await this.#reply(
@@ -1743,9 +1777,13 @@ export class DiscordAdapter implements DiscordPort {
 				);
 				return;
 			}
-			// The form must be Discord's first response to the command, so it opens before any deferral.
+			// A form must be Discord's first response to the command, so it opens before any deferral.
 			if (subcommand === "new") {
 				await this.#newConversationForm(interaction);
+				return;
+			}
+			if (subcommand === "rename") {
+				await this.#renameForm(interaction);
 				return;
 			}
 			action = subcommand === "resume" ? "sessions" : subcommand;

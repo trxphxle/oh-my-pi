@@ -24,6 +24,7 @@ import {
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
+	DISCORD_MODE_MAX_WAIT_MS,
 	type ModeDelivery,
 	type ModeDialog,
 	type ModeEnrollment,
@@ -39,6 +40,8 @@ import {
 export interface DiscordSessionClient {
 	request(input: ModeRequest): Promise<ModeSnapshot>;
 	lookup(projectDir: string, sessionId: string): Promise<ModeEnrollment | undefined>;
+	/** Parks until the broker has work for the lease; only brokers advertising `wait` answer it. */
+	wait?(lease: ModeLease, timeoutMs: number, signal?: AbortSignal): Promise<boolean>;
 	close(): Promise<void>;
 }
 
@@ -138,6 +141,8 @@ export interface DiscordSessionOptions {
 	connect?: () => Promise<DiscordSessionClient>;
 	receiptRoot?: string;
 	pollIntervalMs?: number;
+	/** Longest broker wait between idle polls (default DISCORD_MODE_MAX_WAIT_MS); tests shorten it. */
+	waitMs?: number;
 	status?: (text: string | undefined) => void;
 	notify?: (text: string) => void;
 	pendingLocalInput?: () => boolean;
@@ -205,6 +210,8 @@ const QUIET_REJOIN_FAILURE = /automatic rejoin skipped|Session changed during Di
 const SETTINGS_REFRESH_MS = 5_000;
 /** Applied results remembered to re-send a lost acknowledgement instead of applying twice. */
 const SETTLED_COMMANDS = 32;
+/** A progress-only change ends a parked wait at most this often; the card itself updates every 10 s at most. */
+const PROGRESS_POLL_MS = 2_000;
 
 /** The broker's stored form: canonical directory plus basename. */
 async function canonicalSessionFile(file: string): Promise<string> {
@@ -269,6 +276,10 @@ export class DiscordModeSession {
 	#reconnectBlocked?: string;
 	#attemptedConnections = new Set<string>();
 	#timer?: NodeJS.Timeout;
+	/** A parked broker wait between polls; teardown or a local state change aborts it. */
+	#parked?: AbortController;
+	/** What the last poll reported; a local change ends a parked wait so the broker hears it promptly. */
+	#reported?: { state: string; progress: string; at: number };
 	#unsubscribe?: () => void;
 	#queue: ModeDelivery[] = [];
 	#active?: ActiveDelivery;
@@ -520,6 +531,9 @@ export class DiscordModeSession {
 		this.#progress.reset();
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
+		this.#parked?.abort();
+		this.#parked = undefined;
+		this.#reported = undefined;
 		if (this.#sessionFile && enrolledFiles.get(this.#sessionFile) === this) enrolledFiles.delete(this.#sessionFile);
 		this.#dialogs.unavailable();
 		this.#renderStatus();
@@ -653,13 +667,21 @@ export class DiscordModeSession {
 				await this.#reconnect(epoch);
 				return;
 			}
+			const busy = this.#busy();
+			const pendingInput = this.pendingInput;
+			const progress = this.#progressReport();
+			this.#reported = {
+				state: `${busy}|${pendingInput}`,
+				progress: JSON.stringify(progress.progress ?? null),
+				at: performance.now(),
+			};
 			const snapshot = await this.#request({
 				op: "poll",
 				lease: this.#requireLease(),
-				busy: this.#busy(),
-				pendingInput: this.pendingInput,
+				busy,
+				pendingInput,
 				...this.#settingsReport(),
-				...this.#progressReport(),
+				...progress,
 			});
 			// Settings apply first, so the next owner message already runs with them.
 			if (this.#current(epoch, generation)) this.#intakeCommands(snapshot.commands ?? [], epoch, generation);
@@ -989,16 +1011,86 @@ export class DiscordModeSession {
 		return epoch === this.#epoch && generation === this.#generation && this.enabled;
 	}
 
-	#schedulePoll(): void {
-		if (!this.enabled || this.#timer || this.#options.pollIntervalMs === 0) return;
+	/**
+	 * One loop per attachment: poll, then park on the broker's `/wait` while idle when it advertises `wait` (else the
+	 * 1 s cadence as before). Polls stay at least one interval apart either way.
+	 */
+	#schedulePoll(delay = this.#options.pollIntervalMs ?? 1000): void {
+		if (!this.enabled || this.#timer || this.#parked || this.#options.pollIntervalMs === 0) return;
 		const epoch = this.#epoch;
 		this.#timer = setTimeout(() => {
 			this.#timer = undefined;
-			void this.poll().finally(() => {
-				if (epoch === this.#epoch) this.#schedulePoll();
-			});
-		}, this.#options.pollIntervalMs ?? 1000);
+			const started = performance.now();
+			void this.poll()
+				.then(() => (epoch === this.#epoch ? this.#park(epoch) : undefined))
+				.finally(() => {
+					if (epoch === this.#epoch)
+						this.#schedulePoll(
+							Math.max(0, (this.#options.pollIntervalMs ?? 1000) - (performance.now() - started)),
+						);
+				});
+		}, delay);
 		this.#timer.unref();
+	}
+
+	/**
+	 * Waits for broker work instead of polling, while nothing local is pending. A 1 s local check (no IPC) ends the
+	 * wait early when busy/input state, the settings view, or (every 2 s at most) progress changed, so what the
+	 * broker shows stays as fresh as with polling. Any wait failure just falls back to the next poll.
+	 */
+	async #park(epoch: number): Promise<void> {
+		const client = this.#client;
+		const lease = this.#lease;
+		if (
+			!client?.wait ||
+			!lease ||
+			!this.#snapshot?.wait ||
+			!this.enabled ||
+			this.#reconnectAt !== undefined ||
+			this.#queue.length ||
+			this.#commands.length ||
+			this.#applying ||
+			this.#localChanged()
+		)
+			return;
+		const controller = new AbortController();
+		this.#parked = controller;
+		const watch = setInterval(
+			() => {
+				if (epoch !== this.#epoch || this.#localChanged()) controller.abort();
+			},
+			Math.max(this.#options.pollIntervalMs ?? 1000, 1),
+		);
+		watch.unref();
+		const aborted = Promise.withResolvers<void>();
+		controller.signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+		try {
+			await Promise.race([
+				client.wait(lease, this.#options.waitMs ?? DISCORD_MODE_MAX_WAIT_MS, controller.signal).catch(() => true),
+				aborted.promise,
+			]);
+		} finally {
+			clearInterval(watch);
+			controller.abort();
+			if (this.#parked === controller) this.#parked = undefined;
+		}
+	}
+
+	/** Whether the broker's view of this session is stale: what a poll would report differs from the last one. */
+	#localChanged(): boolean {
+		const reported = this.#reported;
+		if (!reported || `${this.#busy()}|${this.pendingInput}` !== reported.state) return true;
+		const revision = this.#snapshot?.settingsRevision;
+		if (
+			this.#options.settings &&
+			revision !== undefined &&
+			(this.#currentSettings()?.revision ?? revision) !== revision
+		)
+			return true;
+		return (
+			performance.now() - reported.at >= PROGRESS_POLL_MS &&
+			JSON.stringify(this.#progressReport().progress ?? null) !== reported.progress
+		);
 	}
 
 	#requireLease(): ModeLease {

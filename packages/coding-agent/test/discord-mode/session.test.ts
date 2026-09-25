@@ -278,7 +278,7 @@ async function fixture(
 			snapshot = { ...snapshot, progress };
 		},
 		/** Broker-level snapshot fields as the next response carries them (capabilities, step-aside). */
-		setBroker(patch: Partial<Pick<ModeSnapshot, "background" | "stepAside">>) {
+		setBroker(patch: Partial<Pick<ModeSnapshot, "background" | "stepAside" | "wait">>) {
 			snapshot = { ...snapshot, ...patch };
 		},
 		emit,
@@ -1282,5 +1282,103 @@ describe("background copies and the exit question", () => {
 		expect(f.mode.enabled).toBe(true);
 		expect(warnings).toHaveLength(1);
 		expect(warnings[0]).toContain("already running in the background");
+	});
+});
+
+describe("push waits instead of one-second polling", () => {
+	/** A broker `/wait`: parks until `wake`, the timeout, or the caller's abort. */
+	function waitingClient(base: DiscordSessionClient) {
+		const waits: number[] = [];
+		let wake: ((ready: boolean) => void) | undefined;
+		const client: DiscordSessionClient = {
+			...base,
+			wait: async (_lease, timeoutMs, signal) => {
+				waits.push(timeoutMs);
+				const { promise, resolve } = Promise.withResolvers<boolean>();
+				wake = resolve;
+				const timer = setTimeout(() => resolve(false), timeoutMs);
+				signal?.addEventListener("abort", () => resolve(false), { once: true });
+				try {
+					return await promise;
+				} finally {
+					clearTimeout(timer);
+				}
+			},
+		};
+		return { client, waits, wake: () => wake?.(true) };
+	}
+
+	async function looping(engine: DiscordSessionEngine, root: string, client: DiscordSessionClient) {
+		const mode = new DiscordModeSession(engine, {
+			connect: async () => client,
+			receiptRoot: root,
+			pollIntervalMs: 5,
+			waitMs: 60_000,
+		});
+		cleanups.push(() => mode.off());
+		await mode.on("Project", "Session");
+		return mode;
+	}
+
+	const polls = (requests: ModeRequest[]) =>
+		requests.filter((request): request is Extract<ModeRequest, { op: "poll" }> => request.op === "poll");
+
+	// The loop under test is driven by its own timers; short real waits keep this an honest end-to-end check.
+	test("an idle session parks on the broker instead of polling every interval", async () => {
+		const legacy = await fixture();
+		await looping(legacy.engine, legacy.root, waitingClient(legacy.client).client);
+		await until(() => polls(legacy.requests).length >= 10);
+
+		const f = await fixture();
+		f.setBroker({ wait: true });
+		const broker = waitingClient(f.client);
+		await looping(f.engine, f.root, broker.client);
+		await until(() => broker.waits.length === 1);
+		expect(broker.waits).toEqual([60_000]);
+		const parkedAt = polls(f.requests).length;
+		await Bun.sleep(100);
+		// The same idle stretch that cost the older broker 10+ polls costs none here.
+		expect(polls(f.requests).length).toBe(parkedAt);
+		expect(parkedAt).toBeLessThanOrEqual(2);
+	});
+
+	test("broker work wakes the wait and the next poll picks it up", async () => {
+		const f = await fixture();
+		f.setBroker({ wait: true });
+		const broker = waitingClient(f.client);
+		await looping(f.engine, f.root, broker.client);
+		await until(() => broker.waits.length === 1);
+		f.queue(f.delivery({ text: "from Discord" }));
+		broker.wake();
+		await until(() => f.prompts.length === 1);
+		expect(f.prompts[0]).toContain("from Discord");
+	});
+
+	test("a local state change ends the wait so the broker hears it at once", async () => {
+		const f = await fixture();
+		f.setBroker({ wait: true });
+		const broker = waitingClient(f.client);
+		await looping(f.engine, f.root, broker.client);
+		await until(() => broker.waits.length === 1);
+		expect(polls(f.requests).at(-1)?.busy).toBe(false);
+		f.state.busy = true;
+		await until(() => polls(f.requests).at(-1)?.busy === true);
+		// Busy is reported now; the session parks again until something else changes.
+		await until(() => broker.waits.length === 2);
+	});
+
+	test("a wait failure falls back to polling at the normal interval", async () => {
+		const f = await fixture();
+		f.setBroker({ wait: true });
+		let failures = 0;
+		await looping(f.engine, f.root, {
+			...f.client,
+			wait: async () => {
+				failures++;
+				throw new DiscordModeRequestError("not-started", "Discord mode did not accept the wait.");
+			},
+		});
+		await until(() => failures >= 3 && polls(f.requests).length >= 3);
+		expect(polls(f.requests).length).toBeGreaterThanOrEqual(failures);
 	});
 });

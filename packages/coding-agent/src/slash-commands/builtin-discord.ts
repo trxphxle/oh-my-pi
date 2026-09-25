@@ -1,9 +1,14 @@
 import * as path from "node:path";
 import { Container, Input, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { discordModePaths, loadDiscordModeConfig, saveDiscordModeConfig } from "../discord-mode/config";
-import { readDiscordServiceSettings, setDiscordServiceKeepOnline } from "../discord-mode/service";
+import {
+	readDiscordServiceSettings,
+	setDiscordServiceKeepAwake,
+	setDiscordServiceKeepOnline,
+} from "../discord-mode/service";
 import { ensureDiscordModeSession, getDiscordModeSession, type DiscordModeSession } from "../discord-mode/session";
 import { discordServiceUpdateReady } from "../discord-mode/switchover";
+import { formatDiscordDoctor, runDiscordDoctor } from "../discord-mode/doctor";
 import type { ModeSnapshot } from "@oh-my-pi/pi-wire/discord-mode";
 import { describeDiscordMode, type DiscordModePresentation } from "../discord-mode/presentation";
 import type { InteractiveModeContext } from "../modes/types";
@@ -51,15 +56,24 @@ function serviceLine(snapshot: ModeSnapshot, keepOnline: boolean): string {
 async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordModeSession): Promise<string | undefined> {
 	const presentation = mode.presentation;
 	const choices: Array<{ label: string; description: string; action: string }> = [];
-	const keepOnlineChoice = async () => {
-		const { keepOnline } = await readDiscordServiceSettings();
-		return {
-			label: `Keep Discord online: ${keepOnline ? "on" : "off"}`,
-			description: keepOnline
-				? "Turn off: the service stops shortly after your last Haiso/OMP window closes."
-				: "Turn on: the service stays online after your last terminal closes (until logout or reboot).",
-			action: keepOnline ? "service off" : "service on",
-		};
+	const serviceChoices = async () => {
+		const { keepOnline, keepAwake } = await readDiscordServiceSettings();
+		return [
+			{
+				label: `Keep Discord online: ${keepOnline ? "on" : "off"}`,
+				description: keepOnline
+					? "Turn off: the service stops shortly after your last Haiso/OMP window closes."
+					: "Turn on: the service stays online after your last terminal closes (until logout or reboot).",
+				action: keepOnline ? "service off" : "service on",
+			},
+			{
+				label: `Keep Mac awake while shared: ${keepAwake ? "on" : "off"}`,
+				description: keepAwake
+					? "Turn off: the Mac may idle-sleep while conversations are shared."
+					: "Turn on: the Mac stays awake while a shared conversation is open (closing the lid still sleeps).",
+				action: keepAwake ? "service awake off" : "service awake on",
+			},
+		];
 	};
 	if (!mode.enabled) {
 		let configured = false;
@@ -75,7 +89,7 @@ async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordMod
 					description: "Change the private credentials saved on this Mac.",
 					action: "setup",
 				},
-				await keepOnlineChoice(),
+				...(await serviceChoices()),
 			);
 		} else {
 			choices.push({
@@ -111,7 +125,7 @@ async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordMod
 				action: "rename",
 			});
 		}
-		choices.push(await keepOnlineChoice());
+		choices.push(...(await serviceChoices()));
 		choices.push({
 			label: "Turn off Discord",
 			description:
@@ -119,6 +133,11 @@ async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordMod
 			action: "off",
 		});
 	}
+	choices.push({
+		label: "Run diagnostics",
+		description: "Check the bot, server permissions, service and install. Nothing is changed.",
+		action: "doctor",
+	});
 	const endDialog = mode.beginLocalDialog();
 	try {
 		const selected = await ctx.showHookSelector(presentation.title, choices);
@@ -192,7 +211,7 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		getTuiAutocompleteDescription: ({ ctx }) =>
 			getDiscordModeSession(ctx.session)?.presentation.title ?? "Discord OFF",
 		allowArgs: true,
-		inlineHint: "[status|on|off|setup|repair|reconcile|saved|rename|service [on|off]]",
+		inlineHint: "[status|on|off|setup|repair|reconcile|saved|rename|doctor|service [on|off]|service awake [on|off]]",
 		subcommands: [
 			{ name: "on", description: "Turn on remote access for this session" },
 			{ name: "status", description: "Show whether Discord is off, connected, or needs attention" },
@@ -205,7 +224,11 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "saved", description: "Review messages sent from Discord while this session was closed" },
 			{ name: "rename", description: "Rename the group or session channel" },
 			{ name: "setup", description: "Configure private bot credentials using local masked input" },
-			{ name: "service", description: "Show or set whether the Discord service stays online: service on|off" },
+			{ name: "doctor", description: "Diagnose config, bot token, server permissions, service and install" },
+			{
+				name: "service",
+				description: "Show or set the Discord service: service on|off (keep online), service awake on|off",
+			},
 		],
 		handle: async (_command, runtime) => {
 			await runtime.output(
@@ -230,19 +253,32 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 					);
 				const mode = ensureDiscordModeSession(ctx);
 				if (!verb) {
-					[verb = "", rest = ""] = ((await chooseDiscordAction(ctx, mode)) ?? "").split(" ");
+					const [picked = "", ...args] = ((await chooseDiscordAction(ctx, mode)) ?? "").split(" ");
+					verb = picked;
+					rest = args.join(" ");
 					if (!verb) return;
 				}
 				if (verb === "service") {
 					if (!rest) {
-						const { keepOnline } = await readDiscordServiceSettings();
+						const { keepOnline, keepAwake } = await readDiscordServiceSettings();
 						ctx.showStatus(
-							`Discord service: keep online ${keepOnline ? "ON" : "OFF"}\nChange it with /discord service on|off.`,
+							`Discord service: keep online ${keepOnline ? "ON" : "OFF"} · keep Mac awake while shared ${keepAwake ? "ON" : "OFF"}\nChange them with /discord service on|off and /discord service awake on|off.`,
 							{ dim: false },
 						);
 						return;
 					}
-					if (rest !== "on" && rest !== "off") throw new Error("Usage: /discord service [on|off]");
+					if (rest === "awake on" || rest === "awake off") {
+						await setDiscordServiceKeepAwake(rest === "awake on");
+						ctx.showStatus(
+							rest === "awake on"
+								? "Discord service: keep Mac awake ON\nWhile a shared conversation is open or a background copy runs, the Mac won't idle-sleep (closing the lid still sleeps). Applies within 15 seconds."
+								: "Discord service: keep Mac awake OFF\nThe Mac sleeps normally. Applies within 15 seconds.",
+							{ dim: false },
+						);
+						return;
+					}
+					if (rest !== "on" && rest !== "off")
+						throw new Error("Usage: /discord service [on|off|awake on|awake off]");
 					const { live } = await setDiscordServiceKeepOnline(rest === "on");
 					ctx.showStatus(
 						[
@@ -255,6 +291,10 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 							.join("\n"),
 						{ dim: false },
 					);
+					return;
+				}
+				if (verb === "doctor") {
+					ctx.showStatus(formatDiscordDoctor(await runDiscordDoctor()), { dim: false });
 					return;
 				}
 				if (verb === "setup") {

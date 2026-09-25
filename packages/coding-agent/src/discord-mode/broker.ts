@@ -26,6 +26,7 @@ import {
 	DISCORD_MODE_MAX_SETTINGS_BYTES,
 	DISCORD_MODE_MAX_SHORTLIST,
 	DISCORD_MODE_MAX_TEXT,
+	DISCORD_MODE_MAX_WAIT_MS,
 	type BindingState,
 	type ChannelInspection,
 	type DiscordModeConfig,
@@ -429,7 +430,7 @@ const ControlShape = type({
 	channelId: RemoteId,
 	ownerId: RemoteId,
 	action:
-		"'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify' | 'settings' | 'setting' | 'discard' | 'release' | 'send-held' | 'discard-held' | 'review' | 'sessions' | 'resume' | 'new' | 'close'",
+		"'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify' | 'settings' | 'setting' | 'discard' | 'release' | 'send-held' | 'discard-held' | 'review' | 'sessions' | 'resume' | 'new' | 'close' | 'rename'",
 	"connectionId?": Id,
 	"deliveryId?": Id,
 	"notify?": Notify,
@@ -522,6 +523,11 @@ interface StepAside {
 	idleSince?: number;
 	stopped?: boolean;
 }
+/** One parked `/wait`: woken with `true` once its lease has work, or `false` at its timeout. */
+interface Waiter {
+	lease: ModeLease;
+	wake(ready: boolean): void;
+}
 
 /** Serialized durable routing for existing sessions; never owns or stops their engines. */
 export class DiscordModeBroker {
@@ -568,6 +574,13 @@ export class DiscordModeBroker {
 	#activeAt = 0;
 	/** Stopped to run an updated release: the overview says so, and refusals say it is coming back. */
 	#updating = false;
+	/** Parked `/wait`s; every finished mutation re-checks them, since only mutations create work. */
+	#waiters = new Set<Waiter>();
+	/** What each session's last poll told it (binding, gateway, step-aside); a change wakes its wait. */
+	#rung = new Map<string, string>();
+	/** Told whenever "something is shared" flips: a connected conversation or a background copy starting. */
+	readonly #onSharing: ((sharing: boolean) => void) | undefined;
+	#sharing = false;
 
 	constructor(options: {
 		config: DiscordModeConfig;
@@ -576,6 +589,7 @@ export class DiscordModeBroker {
 		hosts?: DiscordHostPort;
 		service?: ModeServiceInfo;
 		guide?: DiscordGuide;
+		onSharing?: (sharing: boolean) => void;
 	}) {
 		RemoteId.assert(options.config.guildId);
 		RemoteId.assert(options.config.ownerId);
@@ -585,6 +599,7 @@ export class DiscordModeBroker {
 		this.#hosts = options.hosts;
 		this.#service = options.service;
 		this.#guide = options.guide;
+		this.#onSharing = options.onSharing;
 		this.#journal = {
 			version: 1,
 			guildId: options.config.guildId,
@@ -632,6 +647,8 @@ export class DiscordModeBroker {
 				changed: () => this.#scheduleReconcile(),
 				connection: connected => {
 					this.#gateway = connected;
+					// Gateway state gates owner work; parked waits re-check it.
+					this.#ring();
 					if (!connected) return;
 					void this.#scheduleReconcile();
 					// Ready and resume both land here: fetch what the owner sent while the gateway was away.
@@ -657,6 +674,8 @@ export class DiscordModeBroker {
 		clearInterval(this.#timer);
 		this.#timer = undefined;
 		this.#running = false;
+		this.#ring();
+		this.#reportSharing();
 		await this.#serial;
 		for (const entry of this.#progress.values()) clearTimeout(entry.timer);
 		this.#progress.clear();
@@ -702,15 +721,8 @@ export class DiscordModeBroker {
 		// Heartbeats are ephemeral liveness, not queued effects. An authenticated poll arriving
 		// during a slow Discord mutation must not expire behind that same mutation.
 		if (parsed.op === "poll") {
-			const live = this.#journal.sessions.find(item => item.id === parsed.lease.sessionId);
-			if (
-				live?.enabled &&
-				live.connected &&
-				live.connectionId === parsed.lease.connectionId &&
-				equalTokens(live.token, parsed.lease.token) &&
-				Date.now() - live.seenAt < DISCORD_MODE_LEASE_MS
-			)
-				live.seenAt = Date.now();
+			const live = this.#leased(parsed.lease);
+			if (live) live.seenAt = Date.now();
 		}
 		return this.#mutate(async () => {
 			await this.#expire();
@@ -831,6 +843,123 @@ export class DiscordModeBroker {
 		});
 	}
 
+	/**
+	 * Parks an idle session until its lease has work (true) or `timeoutMs` passes (false). Never dispatches or
+	 * mutates beyond liveness: the lease is refreshed on entry and exit, and the client polls once afterwards. Runs
+	 * outside the serialized queue; an invalid or revoked lease answers true at once, so the client's poll reports it.
+	 */
+	async wait(lease: ModeLease, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+		LeaseShape.assert(lease);
+		const session = this.#leased(lease);
+		if (!session || !this.#running || this.#failed) return true;
+		session.seenAt = Date.now();
+		if (this.#hasWork(session)) return true;
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		const waiter: Waiter = { lease, wake: resolve };
+		const timer = setTimeout(() => resolve(false), Math.min(Math.max(timeoutMs, 0), DISCORD_MODE_MAX_WAIT_MS));
+		const abort = () => resolve(false);
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) resolve(false);
+		this.#waiters.add(waiter);
+		try {
+			return await promise;
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			this.#waiters.delete(waiter);
+			const current = this.#leased(lease);
+			if (current) current.seenAt = Date.now();
+		}
+	}
+
+	/** The session this lease still holds: enabled, connected, same connection and token, heard from in time. */
+	#leased(lease: ModeLease): Session | undefined {
+		const session = this.#journal.sessions.find(item => item.id === lease.sessionId);
+		return session &&
+			!session.retirement &&
+			session.enabled &&
+			session.connected &&
+			session.connectionId === lease.connectionId &&
+			equalTokens(session.token, lease.token) &&
+			Date.now() - session.seenAt < DISCORD_MODE_LEASE_MS
+			? session
+			: undefined;
+	}
+
+	/** Wakes every parked wait whose lease has work now, was revoked, or whose broker stopped. */
+	#ring(): void {
+		for (const waiter of this.#waiters) {
+			const session = this.#leased(waiter.lease);
+			if (!session || !this.#running || this.#failed || this.#hasWork(session)) waiter.wake(true);
+		}
+	}
+
+	/**
+	 * Whether a poll now would hand this session something: `#poll`'s dispatch rules applied to the state it last
+	 * reported (so a busy session with a queued message stays parked), or a snapshot change it has not seen.
+	 */
+	#hasWork(session: Session): boolean {
+		if (this.#rung.get(session.id) !== this.#doorbell(session)) return true;
+		const remote = this.#gateway && session.state === "ready" && this.#group(session.groupId).state === "ready";
+		const blocked =
+			session.busy ||
+			session.pendingInput ||
+			this.#stepAside.has(session.id) ||
+			this.#journal.deliveries.some(
+				item =>
+					item.sessionId === session.id &&
+					(item.state === "unknown" ||
+						(item.kind === "message" && (item.state === "dispatched" || item.state === "accepted"))),
+			);
+		for (const delivery of this.#journal.deliveries)
+			if (
+				delivery.sessionId === session.id &&
+				delivery.connectionId === session.connectionId &&
+				delivery.state === "queued" &&
+				!delivery.held &&
+				(delivery.source !== "owner" || remote) &&
+				(delivery.kind !== "message" || !blocked)
+			)
+				return true;
+		if (
+			remote &&
+			this.#journal.dialogs.some(
+				dialog => dialog.sessionId === session.id && dialog.connectionId === session.connectionId && dialog.answer,
+			)
+		)
+			return true;
+		return (this.#commands.get(session.id) ?? []).some(
+			item => item.connectionId === session.connectionId && !item.dispatched,
+		);
+	}
+
+	/** Snapshot fields a client acts on between polls: binding and gateway readiness, sharing, step-aside, label. */
+	#doorbell(session: Session): string {
+		return JSON.stringify([
+			this.#gateway,
+			session.enabled,
+			session.state,
+			this.#journal.groups.find(group => group.id === session.groupId)?.state,
+			session.label,
+			this.#stepAside.has(session.id),
+		]);
+	}
+
+	/** Keep-awake input: a conversation is connected, or a background copy is starting. */
+	#reportSharing(): void {
+		const sharing =
+			this.#running &&
+			(this.#journal.sessions.some(session => session.enabled && session.connected && !session.retirement) ||
+				(this.#journal.launches?.length ?? 0) > 0);
+		if (sharing === this.#sharing) return;
+		this.#sharing = sharing;
+		try {
+			this.#onSharing?.(sharing);
+		} catch {
+			/* Keep-awake is best-effort; routing never depends on it. */
+		}
+	}
+
 	#mutate<T>(run: () => Promise<T>): Promise<T> {
 		if (!this.#running || this.#failed)
 			return Promise.reject(
@@ -858,6 +987,8 @@ export class DiscordModeBroker {
 				// Revocation drops changes synchronously; tell the owner outside the serialized queue, never pinging.
 				for (const note of this.#settingNotes.splice(0))
 					void this.#port.settingsResult(note.channelId, note.commandId, note.text).catch(() => {});
+				this.#ring();
+				this.#reportSharing();
 			});
 		this.#serial = result.then(
 			() => undefined,
@@ -1286,6 +1417,7 @@ export class DiscordModeBroker {
 		clearTimeout(this.#progress.get(session.id)?.timer);
 		this.#progress.delete(session.id);
 		this.#stepAside.delete(session.id);
+		this.#rung.delete(session.id);
 	}
 
 	async #expire(): Promise<void> {
@@ -1457,6 +1589,7 @@ export class DiscordModeBroker {
 		if (changed || deliveries.length || answers.length) await this.#persist();
 		if (changed || deliveries.length) await this.#cards(this.#group(session.groupId));
 		else if (progressDue) await this.#sessionCard(session);
+		this.#rung.set(session.id, this.#doorbell(session));
 		return { ...this.#snapshot(session), deliveries, answers, ...(commands.length ? { commands } : {}) };
 	}
 
@@ -1835,8 +1968,8 @@ export class DiscordModeBroker {
 				(input.action === "setting" && !input.connectionId) ||
 				(input.query !== undefined && input.action !== "settings") ||
 				(input.action === "new" && (input.name === undefined || input.message === undefined)) ||
-				(input.action !== "new" &&
-					(input.name !== undefined || input.message !== undefined || input.model !== undefined)) ||
+				(input.action === "rename") !== (input.name !== undefined && input.action !== "new") ||
+				(input.action !== "new" && (input.message !== undefined || input.model !== undefined)) ||
 				(input.sessionId !== undefined && input.action !== "resume")
 			)
 				throw new Error("Invalid control fields");
@@ -1866,6 +1999,11 @@ export class DiscordModeBroker {
 		await this.#persist();
 		this.#requireRemote(session, false);
 		if (input.action === "close") return this.#closeControl(session);
+		// No lease needed: the broker owns the channel, so a closed conversation can be renamed too.
+		if (input.action === "rename") {
+			const name = await this.#renameBinding(session, "session", input.name!, `control:${input.id}`, input);
+			return { text: `Renamed this channel to #${name}.` };
+		}
 		// Saved-message buttons outlive the connection that was current when they were posted.
 		if (
 			input.action === "discard" ||
@@ -2495,24 +2633,40 @@ export class DiscordModeBroker {
 	async #rename(session: Session, input: Extract<ModeRequest, { op: "rename" }>): Promise<void> {
 		await this.#reconcileSession(session);
 		this.#requireRemote(session);
-		const binding = input.target === "session" ? session : this.#group(session.groupId);
-		const channelId = input.target === "session" ? session.channelId : this.#group(session.groupId).categoryId;
+		await this.#renameBinding(session, input.target, input.name, `request:${session.id}:${input.requestId}`, input);
+	}
+
+	/**
+	 * Renames the session channel (app-marked slug, same validation for terminal and Discord) or the project category
+	 * as one fenced Discord effect per `key`; the label is adopted back from the channel. Returns the applied name.
+	 */
+	async #renameBinding(
+		session: Session,
+		target: "session" | "group",
+		requested: string,
+		key: string,
+		input: unknown,
+	): Promise<string> {
+		const group = this.#group(session.groupId);
+		const binding = target === "session" ? session : group;
+		const channelId = target === "session" ? session.channelId : group.categoryId;
 		if (!channelId) throw new DiscordModeError("Cannot rename an unbound resource; repair explicitly.");
-		let name = input.name;
-		if (input.target === "session")
+		let name = requested;
+		if (target === "session")
 			try {
-				name = sessionChannelName(input.name, session.app);
+				name = sessionChannelName(requested, session.app);
 			} catch {
 				throw new DiscordModeError(
 					"Choose a session name containing usable letters, numbers, underscores, or hyphens.",
 				);
 			}
-		await this.#perform(`request:${session.id}:${input.requestId}`, input, async () => {
+		await this.#perform(key, input, async () => {
 			await this.#external(() => this.#port.rename(channelId, name), binding);
-			if (input.target === "session") await this.#reconcileSession(session);
-			else await this.#reconcileGroup(this.#group(session.groupId));
+			if (target === "session") await this.#reconcileSession(session);
+			else await this.#reconcileGroup(group);
 		});
-		await this.#cards(this.#group(session.groupId));
+		await this.#cards(group);
+		return name;
 	}
 
 	async #repair(session: Session, input: Extract<ModeRequest, { op: "repair" }>): Promise<void> {
@@ -3350,6 +3504,7 @@ export class DiscordModeBroker {
 			maxReply: DISCORD_MODE_MAX_REPLY,
 			settingsRevision: this.#settingsFor(session)?.view?.revision ?? "",
 			progress: true,
+			wait: true,
 			...(this.#hosts ? { background: true as const } : {}),
 			...(this.#stepAside.has(session.id) ? { stepAside: true as const } : {}),
 			...(this.#service ? { service: { ...this.#service } } : {}),

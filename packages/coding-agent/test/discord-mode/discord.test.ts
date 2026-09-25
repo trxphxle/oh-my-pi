@@ -535,6 +535,7 @@ describe("Discord mode gateway adapter (offline)", () => {
 			"resume",
 			"new",
 			"close",
+			"rename",
 		]);
 		const notify = session.options?.find(option => option.name === "notify");
 		const mode = notify && "options" in notify ? notify.options?.[0] : undefined;
@@ -2213,5 +2214,49 @@ describe("Discord adapter background conversations (offline)", () => {
 		]);
 		expect(picked.responses.at(-1)).toBe("Starting.");
 		expect(forged.responses[0]).toContain("nothing was started");
+	});
+
+	it("opens the rename form before any deferral, prefilled without the marker, and routes the trimmed name", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const command = f.slash("rename", { channel: { name: "🟣-old-name" } });
+		f.client.emit(Events.InteractionCreate, command.event);
+		await settleEvents();
+		expect(command.acknowledgements).toEqual([]);
+		expect(command.modals).toHaveLength(1);
+		const modal = (
+			command.modals[0] as {
+				toJSON(): {
+					custom_id: string;
+					components: Array<{ components: Array<{ custom_id: string; value?: string; max_length?: number }> }>;
+				};
+			}
+		).toJSON();
+		expect(modal.custom_id).toBe(`haiso:m:${CHANNEL}:rename`);
+		expect(modal.components.flatMap(row => row.components)).toEqual([
+			expect.objectContaining({ custom_id: "name", value: "old-name", max_length: 100 }),
+		]);
+		expect(f.controls).toEqual([]);
+		const submit = (customId: string, name: string) => {
+			const event = f.interaction(customId, {
+				isButton: () => false,
+				isMessageComponent: () => false,
+				isModalSubmit: () => true,
+				isFromMessage: () => false,
+				fields: { getTextInputValue: (id: string) => (id === "name" ? name : "") },
+			});
+			f.client.emit(Events.InteractionCreate, event.event);
+			return event;
+		};
+		const renamed = submit(modal.custom_id, " New\tname ");
+		const blank = submit(modal.custom_id, "  ");
+		const copied = submit("haiso:m:100000000000000099:rename", "Elsewhere");
+		const mismatched = submit(`haiso:n:${CHANNEL}:rename`, "Wrong kind");
+		await settleEvents();
+		expect(f.controls.map(({ action, channelId, name }) => ({ action, channelId, name }))).toEqual([
+			{ action: "rename", channelId: CHANNEL, name: "New name" },
+		]);
+		expect(renamed.acknowledgements).toEqual([{ flags: MessageFlags.Ephemeral }]);
+		for (const refused of [blank, copied, mismatched]) expect(refused.responses[0]).toContain("another channel");
 	});
 });
