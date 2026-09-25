@@ -20,6 +20,7 @@ import {
 	currentHaisoRelease,
 	defaultPrefix,
 	defaultStateDir,
+	ensureHaisoBridgeLoader,
 	type InstallReceipt,
 	rollbackHaiso,
 	shellQuote,
@@ -907,7 +908,7 @@ async function sandboxChecks(ctx: Context, binary: string): Promise<void> {
 	}
 }
 
-async function verify(ctx: Context, worktree: string, tagCommit: string): Promise<string> {
+async function verify(ctx: Context, worktree: string, tagCommit: string): Promise<{ binary: string; bridge: string }> {
 	const { session } = ctx;
 	// Unix-domain sockets need a short path, so the empty HOME lives in /tmp rather than the state dir.
 	const home = await fs.mkdtemp(path.join(await fs.realpath("/tmp"), "hu-"));
@@ -956,7 +957,14 @@ async function verify(ctx: Context, worktree: string, tagCommit: string): Promis
 		if (!smoke.stdout.includes("smoke-test: ok"))
 			throw new Error("the built binary's smoke test did not report success");
 		await sandboxChecks(ctx, binary);
-		return binary;
+		await session.step(
+			"Building the OMP bridge",
+			[bun, "scripts/build.ts"],
+			path.join(worktree, "packages/omp-bridge"),
+			env,
+			5 * MINUTE,
+		);
+		return { binary, bridge: path.join(worktree, "packages/omp-bridge/dist/index.js") };
 	} finally {
 		await forceRemove(home);
 	}
@@ -973,7 +981,7 @@ async function pipeline(ctx: Context, reason: string): Promise<number> {
 		worktree = await openCandidate(ctx, tagCommit);
 		commit = await mergeUpstream(ctx, worktree, tagCommit);
 		await prepare(ctx, worktree, tagCommit);
-		const binary = await verify(ctx, worktree, tagCommit);
+		const { binary, bridge } = await verify(ctx, worktree, tagCommit);
 		session.say("• Installing the verified release");
 		const staged = await stageHaiso({
 			binary,
@@ -983,8 +991,10 @@ async function pipeline(ctx: Context, reason: string): Promise<number> {
 			prefix: ctx.prefix,
 			binDir: ctx.current ? path.dirname(ctx.current.launcher) : undefined,
 			stateDir: ctx.stateDir,
+			bridge,
 		});
 		const active = await activateHaiso(staged.release, { expectedCurrent: ctx.current?.release ?? null });
+		const loader = await syncBridgeLoader(active.prefix, ctx.stateDir);
 		let adopt = "";
 		if (commit !== ctx.tip) {
 			try {
@@ -998,7 +1008,7 @@ async function pipeline(ctx: Context, reason: string): Promise<number> {
 		await removeCandidate(ctx.repo, worktree).catch(error =>
 			session.say(`warning: could not remove ${worktree}: ${errorMessage(error)}`),
 		);
-		const message = `Activated ${active.version} built from ${commit.slice(0, 12)} (${active.release}). New launches use it; running sessions keep their release.`;
+		const message = `Activated ${active.version} built from ${commit.slice(0, 12)} (${active.release}). New launches use it; running sessions keep their release; the Discord service switches once every session is idle.`;
 		await finish(ctx.stateDir, {
 			result: "ok",
 			message,
@@ -1009,6 +1019,7 @@ async function pipeline(ctx: Context, reason: string): Promise<number> {
 		});
 		session.say(message);
 		if (adopt) session.say(adopt);
+		if (loader) session.say(loader);
 		await session.flush();
 		return 0;
 	} catch (error) {
@@ -1152,6 +1163,7 @@ async function rollback(prefix: string, stateDir: string): Promise<number> {
 	}
 	try {
 		const restored = await rollbackHaiso({ prefix });
+		const loader = await syncBridgeLoader(restored.prefix, stateDir);
 		// Otherwise the next automatic check would immediately rebuild what was rolled back.
 		await writeJsonAtomic(path.join(stateDir, "settings.json"), { schemaVersion: 1, enabled: false });
 		console.log(
@@ -1159,11 +1171,30 @@ async function rollback(prefix: string, stateDir: string): Promise<number> {
 				`Rolled back to ${restored.version} (${restored.release}) for new launches.`,
 				"Automatic updates are now off; re-enable them with `haiso update --auto on`.",
 				"Shared ~/.omp data was not rolled back.",
+				...(loader ? [loader] : []),
 			].join("\n"),
 		);
 		return 0;
 	} finally {
 		lock.release();
+	}
+}
+
+/** Keeps OMP's bridge loader in step with the active release; never fails the activation it follows. */
+async function syncBridgeLoader(prefix: string, stateDir: string): Promise<string> {
+	try {
+		switch (await ensureHaisoBridgeLoader({ prefix, stateDir })) {
+			case "created":
+				return "Official OMP now loads the Haiso bridge (~/.omp/agent/extensions/haiso-bridge.ts; delete that file to stop).";
+			case "foreign":
+				return "OMP bridge loader left alone: ~/.omp/agent/extensions/haiso-bridge.ts was not created by Haiso.";
+			case "paused":
+				return "This release ships no OMP bridge; its loader was removed until a release does.";
+			default:
+				return "";
+		}
+	} catch (error) {
+		return `warning: could not maintain the OMP bridge loader: ${errorMessage(error)}`;
 	}
 }
 

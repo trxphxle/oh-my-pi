@@ -34,6 +34,7 @@ import {
 	type BridgePeer,
 	type BridgeSettingResult,
 } from "./host";
+import { type HaisoServiceStarter, startHaisoService } from "./service";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const REQUEST_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -349,6 +350,11 @@ export interface BridgeSessionOptions {
 	pollIntervalMs?: number;
 	/** Delay before the one automatic-rejoin retry while another window still holds the conversation's lease. */
 	rejoinRetryMs?: number;
+	/**
+	 * Starts Haiso's service when its socket is down; defaults to the installed Haiso, but only with the default
+	 * connector (an injected connector's service is not Haiso's to start).
+	 */
+	startService?: HaisoServiceStarter;
 }
 
 /** The public host owns generation/admission. Only observed, marked host events prove delivery. */
@@ -405,7 +411,7 @@ export class BridgeSession {
 			identity = await savedIdentity(state);
 			if (!(await sharedOffline(this.options.root, identity))) return undefined;
 			// Probe the broker before attaching, so a stale offline view leaves no receipt storage behind.
-			const client = await (this.options.connect ?? connectExistingDiscordMode)(this.options.root);
+			const client = await this.#connect();
 			try {
 				shared = (await client.lookup(identity.projectDir, identity.sessionId))?.session;
 			} finally {
@@ -485,7 +491,7 @@ export class BridgeSession {
 			);
 			await journal.load();
 			check();
-			client = await (this.options.connect ?? connectExistingDiscordMode)(this.options.root);
+			client = await this.#connect(() => this.host.notify("Starting Haiso's Discord service…", "info"));
 			check();
 			const enrollment = await client.lookup(identity.projectDir, identity.sessionId);
 			check();
@@ -608,6 +614,25 @@ export class BridgeSession {
 			throw error;
 		} finally {
 			this.#attaching = false;
+		}
+	}
+
+	/** The existing broker; when its service is down, starts it through the installed Haiso once, then adopts it. */
+	async #connect(starting?: () => void): Promise<BridgeConnection> {
+		const connect = this.options.connect ?? connectExistingDiscordMode;
+		try {
+			return await connect(this.options.root);
+		} catch (error) {
+			const start = this.options.startService ?? (this.options.connect ? undefined : startHaisoService);
+			if (!start || !(await start(this.options.root, starting))) throw error;
+			for (let attempt = 1; ; attempt++) {
+				try {
+					return await connect(this.options.root);
+				} catch (retry) {
+					if (attempt === 3) throw retry;
+					await Bun.sleep(500);
+				}
+			}
 		}
 	}
 

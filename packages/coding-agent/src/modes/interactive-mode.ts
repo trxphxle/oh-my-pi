@@ -72,6 +72,7 @@ import {
 	Settings,
 	settings,
 } from "../config/settings";
+import { confirmDiscordExit } from "../discord-mode/session";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
 	AutocompleteProviderFactory,
@@ -5784,6 +5785,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 			return;
 		}
+		// Haiso: a shared Discord conversation may keep running as a background copy instead of closing.
+		if (!(await confirmDiscordExit(this))) return;
 		this.#isShuttingDown = true;
 		try {
 			await this.#teardown();

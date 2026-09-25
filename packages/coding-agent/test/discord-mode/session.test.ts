@@ -76,7 +76,13 @@ function assistant(text: string): AssistantMessage {
 	};
 }
 
-async function fixture(options: { rejoinRetryMs?: number; offerSaved?: DiscordSessionOptions["offerSaved"] } = {}) {
+async function fixture(
+	options: {
+		rejoinRetryMs?: number;
+		offerSaved?: DiscordSessionOptions["offerSaved"];
+		background?: DiscordSessionOptions["background"];
+	} = {},
+) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-discord-session-"));
 	cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
 	const state = { id: crypto.randomUUID() as string, busy: false, admitted: false, queued: 0, aborts: 0 };
@@ -229,6 +235,7 @@ async function fixture(options: { rejoinRetryMs?: number; offerSaved?: DiscordSe
 		shared: async () => sharedOffline,
 		rejoinRetryMs: options.rejoinRetryMs,
 		offerSaved: options.offerSaved,
+		background: options.background,
 	});
 	cleanups.push(() => mode.off());
 	return {
@@ -269,6 +276,10 @@ async function fixture(options: { rejoinRetryMs?: number; offerSaved?: DiscordSe
 		/** Broker progress capability; older brokers omit it. */
 		setProgressCapability(progress: true | undefined) {
 			snapshot = { ...snapshot, progress };
+		},
+		/** Broker-level snapshot fields as the next response carries them (capabilities, step-aside). */
+		setBroker(patch: Partial<Pick<ModeSnapshot, "background" | "stepAside">>) {
+			snapshot = { ...snapshot, ...patch };
 		},
 		emit,
 		/** Broker state reset: the UUID is no longer enrolled. */
@@ -1156,5 +1167,120 @@ describe("automatic Discord rejoin hosts", () => {
 		await discordSessions.offDiscordModeSession(engine);
 		expect(f.requests.at(-1)).toMatchObject({ op: "disable", sessionId: sharedId });
 		expect(f.snapshot().session.enabled).toBe(false);
+	});
+});
+
+describe("background copies and the exit question", () => {
+	test("a background copy marks every registration and claims its launch only once", async () => {
+		const clock = fakeClock();
+		const launchId = crypto.randomUUID();
+		const f = await fixture({ background: { launchId, release: () => {} } });
+		await f.enroll();
+		// The broker lost the lease (a restart); the copy re-registers on its own.
+		f.setSession({ connected: false });
+		await f.mode.poll();
+		clock.advance(2_000);
+		await f.mode.poll();
+		const [first, second] = f.registers();
+		expect(first).toMatchObject({ launchId, host: "background" });
+		expect(second).toMatchObject({ host: "background" });
+		expect(second).not.toHaveProperty("launchId");
+		expect(f.mode.enabled).toBe(true);
+	});
+
+	test("a copy asked to step aside leaves once, at an idle point, after the work it already received", async () => {
+		let released = 0;
+		const f = await fixture({
+			background: {
+				release: () => {
+					released++;
+				},
+			},
+		});
+		await f.enroll();
+		f.setBroker({ stepAside: true });
+		f.state.busy = true;
+		await f.mode.poll();
+		expect(released).toBe(0);
+		f.state.busy = false;
+		f.queue(f.delivery({ text: "Dispatched before the close" }));
+		await f.mode.poll();
+		expect(f.prompts).toHaveLength(1);
+		expect(released).toBe(0);
+		f.finish("Done.");
+		await f.completed;
+		await f.mode.poll();
+		await f.mode.poll();
+		expect(released).toBe(1);
+	});
+
+	test("a terminal never leaves on a step-aside flag", async () => {
+		const f = await fixture();
+		await f.enroll();
+		f.setBroker({ stepAside: true });
+		await f.mode.poll();
+		expect(f.mode.enabled).toBe(true);
+	});
+
+	test("the exit question is offered to an attached terminal whose service can run it; Yes hands it over", async () => {
+		const f = await fixture();
+		const offers = discordSessions.offersDiscordBackground;
+		expect(offers(f.mode, false)).toBe(false);
+		await f.enroll();
+		expect(offers(f.mode, false)).toBe(false);
+		f.setBroker({ background: true });
+		await f.mode.poll();
+		expect(offers(f.mode, false)).toBe(true);
+		expect(offers(f.mode, true)).toBe(false);
+		const answers: Array<string | undefined> = [undefined, "No", "Yes"];
+		const asked: Array<{ title: string; pending: boolean }> = [];
+		const warnings: string[] = [];
+		const ctx = createInteractiveModeContext({
+			showHookSelector: async (title: string) => {
+				asked.push({ title, pending: f.mode.pendingInput });
+				return answers.shift();
+			},
+			showWarning: (text: string) => warnings.push(text),
+		});
+		// Dismissed: the terminal stays open and attached.
+		expect(await discordSessions.confirmDiscordExit(ctx, f.mode)).toBe(false);
+		expect(f.mode.enabled).toBe(true);
+		// No: closes as before, nothing is started.
+		expect(await discordSessions.confirmDiscordExit(ctx, f.mode)).toBe(true);
+		expect(f.ops()).not.toContain("background");
+		expect(f.mode.enabled).toBe(true);
+		// Yes: the broker starts the copy and this terminal lets go of the conversation.
+		expect(await discordSessions.confirmDiscordExit(ctx, f.mode)).toBe(true);
+		expect(f.ops().filter(op => op === "background")).toHaveLength(1);
+		expect(f.ops()).not.toContain("detach");
+		expect(f.mode.enabled).toBe(false);
+		expect(asked).toEqual(
+			Array.from({ length: 3 }, () => ({ title: "Keep running in the background?", pending: true })),
+		);
+		expect(warnings).toEqual([]);
+		// Nothing left to hand over: no question.
+		expect(await discordSessions.confirmDiscordExit(ctx, f.mode)).toBe(true);
+		expect(asked).toHaveLength(3);
+	});
+
+	test("a refused hand-over warns, closes as before, and keeps the terminal attached until then", async () => {
+		const f = await fixture();
+		await f.enroll();
+		f.setBroker({ background: true });
+		await f.mode.poll();
+		const request = f.client.request;
+		f.client.request = async input =>
+			input.op === "background"
+				? Promise.reject(new Error("4 conversations are already running in the background."))
+				: request(input);
+		const warnings: string[] = [];
+		const ctx = createInteractiveModeContext({
+			showHookSelector: async () => "Yes",
+			showWarning: (text: string) => warnings.push(text),
+		});
+		expect(await discordSessions.confirmDiscordExit(ctx, f.mode)).toBe(true);
+		expect(f.mode.enabled).toBe(true);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("already running in the background");
 	});
 });

@@ -4,11 +4,13 @@ import { createHash } from "node:crypto";
 import {
 	type APIEmbed,
 	ActionRowBuilder,
+	ApplicationCommandOptionType,
 	ApplicationCommandType,
 	AttachmentBuilder,
 	ButtonBuilder,
 	ButtonStyle,
 	ChannelType,
+	type ChatInputCommandInteraction,
 	Client,
 	type ClientEvents,
 	Colors,
@@ -35,6 +37,7 @@ import {
 } from "discord.js";
 import { formatNumber } from "@oh-my-pi/pi-utils/format";
 import { DiscordModeError } from "./broker";
+import type { DiscordGuideCommand } from "./guide";
 import { discordCategoryName, discordChannelName } from "./names";
 import { describeSettingCommand, settingsChoiceToken } from "./settings-view";
 import {
@@ -48,6 +51,7 @@ import {
 	type ModeControlRequest,
 	type ModeControlResult,
 	type ModeDialog,
+	type ModeGuidePlacement,
 	type ModeNoticeAction,
 	type ModeNotify,
 	type ModeOwnerMessage,
@@ -63,6 +67,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const HISTORY_LIMIT = 1_000;
 /** Missed-message catch-up scans at most this many 100-message pages per channel. */
 const CATCH_UP_PAGES = 5;
+/** Guide lookup reads the pins of at most this many text channels (`general` first). */
+const GUIDE_SCAN_LIMIT = 25;
 const EFFECT_LIMIT = 4_096;
 const CARD_LIMIT = 256;
 const DIALOG_LIMIT = 256;
@@ -90,6 +96,8 @@ const SESSION_CONTROL = new RegExp(
 	`^haiso:s:(\\d{1,22}):([a-f0-9-]{36}):([A-Za-z0-9_-]{22})?:(status|stop|queue|steer|cancel|queue0|queue1|settings|discard|release|send-held|discard-held|review|review0|review1|${Object.keys(SETTINGS_ACTIONS).join("|")})$`,
 	"i",
 );
+/** Background launches: [Resume] on a closed card (`r:…:resume`), the resume picker (`r:…:pick`), the new form (`n:…:new`). */
+const LAUNCH_CONTROL = /^haiso:([rn]):(\d{1,22}):(resume|pick|new)$/;
 const READ_PERMISSIONS = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
 const WRITE_PERMISSIONS = READ_PERMISSIONS | PermissionFlagsBits.SendMessages;
 const BOT_PERMISSIONS = WRITE_PERMISSIONS | PermissionFlagsBits.AttachFiles | PermissionFlagsBits.EmbedLinks;
@@ -106,6 +114,8 @@ type ControlPayload = Pick<MessageCreateOptions, "content" | "files" | "allowedM
 	components: ControlRows;
 	attachments: [];
 };
+/** What a launch control asks the broker for: resume one conversation, or start a new one. */
+type LaunchRequest = Pick<ModeControlRequest, "action" | "sessionId" | "name" | "message" | "model">;
 
 interface Card {
 	id?: string;
@@ -181,6 +191,66 @@ function replyPayload(text: string, reserve = 0): Pick<MessageCreateOptions, "co
 		content: `${preview}\n\n… full reply attached (${size} KB)`,
 		files: [new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "haiso-reply.md" })],
 	};
+}
+
+/** The guild `/session` command; also the source of the pinned guide's command list. */
+export function sessionCommandDefinition() {
+	return new SlashCommandBuilder()
+		.setName("session")
+		.setDescription("Inspect and control Haiso sessions in this project")
+		.setDefaultMemberPermissions(null)
+		.setNSFW(false)
+		.addSubcommand(command => command.setName("status").setDescription("Show the bound session's current state"))
+		.addSubcommand(command => command.setName("stop").setDescription("Request a stop of the current turn"))
+		.addSubcommand(command => command.setName("queue").setDescription("Inspect queued owner messages"))
+		.addSubcommand(command =>
+			command
+				.setName("notify")
+				.setDescription("Choose when Haiso mentions you in this session's channel")
+				.addStringOption(option =>
+					option
+						.setName("mode")
+						.setDescription("When to mention you")
+						.setRequired(true)
+						.addChoices(
+							{ name: "all — input requests and every final reply", value: "all" },
+							{ name: "needs-you — input requests and replies after long turns", value: "needs-you" },
+							{ name: "off — never mention", value: "off" },
+						),
+				),
+		)
+		.addSubcommand(command =>
+			command.setName("settings").setDescription("View and change the session's model, effort, and context"),
+		)
+		.addSubcommand(command =>
+			command.setName("resume").setDescription("Resume a closed conversation of this project in the background"),
+		)
+		.addSubcommand(command =>
+			command.setName("new").setDescription("Start a new conversation in this project, in the background"),
+		)
+		.addSubcommand(command =>
+			command.setName("close").setDescription("Close this session's background copy after its current turn"),
+		)
+		.toJSON();
+}
+
+/** `/session` subcommands as the guide lists them: name, choice values, description. */
+export function sessionCommandGuide(): DiscordGuideCommand[] {
+	return (sessionCommandDefinition().options ?? []).flatMap(option =>
+		option.type === ApplicationCommandOptionType.Subcommand
+			? [
+					{
+						name: option.name,
+						description: option.description,
+						choices: (option.options ?? []).flatMap(argument =>
+							argument.type === ApplicationCommandOptionType.String && argument.choices
+								? argument.choices.map(choice => String(choice.value))
+								: [],
+						),
+					},
+				]
+			: [],
+	);
 }
 
 /** A single gateway client; native sessions and durable routing remain in the broker. */
@@ -369,34 +439,7 @@ export class DiscordAdapter implements DiscordPort {
 		for (const command of guildCommands.values()) {
 			if (owned(command) && ["omp", "team", "tell"].includes(command.name)) await guild.commands.delete(command.id);
 		}
-		const definition = new SlashCommandBuilder()
-			.setName("session")
-			.setDescription("Inspect and control the Haiso session bound to this channel")
-			.setDefaultMemberPermissions(null)
-			.setNSFW(false)
-			.addSubcommand(command => command.setName("status").setDescription("Show the bound session's current state"))
-			.addSubcommand(command => command.setName("stop").setDescription("Request a stop of the current turn"))
-			.addSubcommand(command => command.setName("queue").setDescription("Inspect queued owner messages"))
-			.addSubcommand(command =>
-				command
-					.setName("notify")
-					.setDescription("Choose when Haiso mentions you in this session's channel")
-					.addStringOption(option =>
-						option
-							.setName("mode")
-							.setDescription("When to mention you")
-							.setRequired(true)
-							.addChoices(
-								{ name: "all — input requests and every final reply", value: "all" },
-								{ name: "needs-you — input requests and replies after long turns", value: "needs-you" },
-								{ name: "off — never mention", value: "off" },
-							),
-					),
-			)
-			.addSubcommand(command =>
-				command.setName("settings").setDescription("View and change the session's model, effort, and context"),
-			)
-			.toJSON();
+		const definition = sessionCommandDefinition();
 		const current = guildCommands.find(command => owned(command) && command.name === "session");
 		const registered = current
 			? current.equals({
@@ -854,6 +897,7 @@ export class DiscordAdapter implements DiscordPort {
 		messageId?: string,
 		existingOnly = false,
 		app?: ModeApp,
+		resumable = false,
 	): Promise<string> {
 		if (!text || text.length > 64_000)
 			return Promise.reject(new Error("Discord status exceeds its 64000-character limit."));
@@ -901,7 +945,11 @@ export class DiscordAdapter implements DiscordPort {
 				}
 				const payload = {
 					...this.#textPayload(text, "haiso-status.txt"),
-					components: connectionId ? this.#sessionComponents(channelId, connectionId) : [],
+					components: connectionId
+						? this.#sessionComponents(channelId, connectionId)
+						: resumable
+							? this.#closedComponents(channelId)
+							: [],
 					...(app ? { embeds: [APP_EMBEDS[app]] } : {}),
 				};
 				if (message) {
@@ -1069,6 +1117,86 @@ export class DiscordAdapter implements DiscordPort {
 				],
 			});
 		});
+	}
+
+	busy(): boolean {
+		return this.#inbound > 0;
+	}
+
+	/** See `DiscordPort.guide`. The only non-private channel this bot writes to; it never carries session data. */
+	async guide(input: {
+		text: string;
+		saved?: ModeGuidePlacement;
+		exclude: string[];
+		note?: { text: string; key: string };
+	}): Promise<ModeGuidePlacement | undefined> {
+		const header = input.text.split("\n", 1)[0]!;
+		if (
+			!header.trim() ||
+			input.text.length > 2_000 ||
+			(input.note && (!input.note.text.trim() || input.note.text.length > 2_000))
+		)
+			throw new Error("Discord guide is invalid.");
+		const guild = this.#requireGuild();
+		const botId = this.#botId();
+		const excluded = new Set(input.exclude);
+		const usable = (channel: GuildBasedChannel | null | undefined): channel is TextChannel =>
+			channel?.type === ChannelType.GuildText &&
+			channel.guildId === this.#config.guildId &&
+			!(channel.parentId && excluded.has(channel.parentId)) &&
+			!!channel.permissionsFor(botId)?.has(WRITE_PERMISSIONS);
+		const ours = (message: Message) =>
+			message.author.id === botId && !message.webhookId && message.content.split("\n", 1)[0] === header;
+		let channel: TextChannel | undefined;
+		let found: Message | undefined;
+		if (input.saved) {
+			try {
+				const saved = await guild.channels.fetch(input.saved.channelId, { force: true });
+				if (usable(saved)) {
+					const message = await saved.messages.fetch({ message: input.saved.messageId, force: true });
+					if (ours(message)) [channel, found] = [saved, message];
+				}
+			} catch (error) {
+				// A deleted channel or message is looked for again below; other failures are not guessed around.
+				if (apiCode(error) !== 10003 && apiCode(error) !== 10008) throw error;
+			}
+		}
+		let candidates: TextChannel[] = [];
+		if (!found) {
+			candidates = [...(await guild.channels.fetch()).values()]
+				.filter(usable)
+				.sort(
+					(left, right) =>
+						Number(right.name === "general") - Number(left.name === "general") ||
+						left.rawPosition - right.rawPosition,
+				);
+			for (const candidate of candidates.slice(0, GUIDE_SCAN_LIMIT)) {
+				const pins = await candidate.messages.fetchPins({ limit: 50, cache: false }).catch(() => undefined);
+				found = pins?.items.map(pin => pin.message).find(ours);
+				if (found) {
+					channel = candidate;
+					break;
+				}
+			}
+		}
+		if (!found || !channel) {
+			channel = candidates.find(candidate => candidate.name === "general");
+			if (!channel) return undefined;
+			found = await this.#send(channel, `${PREFIX}guide:${digest(input.text)}`, { content: input.text });
+		} else if (found.content !== input.text) {
+			await found.edit({ content: input.text, allowedMentions: MENTIONS });
+		}
+		// Pinning needs Pin Messages; without it the guide stays in place for the owner to pin.
+		if (!found.pinned) await found.pin().catch(() => {});
+		const note = input.note;
+		const target = channel;
+		if (note) {
+			const key = `${PREFIX}guide-note:${digest(note.key)}`;
+			await this.#once(key, async () => {
+				await this.#send(target, key, { content: note.text });
+			}).catch(() => {});
+		}
+		return { channelId: target.id, messageId: found.id };
 	}
 
 	async showDialog(channelId: string, dialog: ModeDialog, options?: { mention?: boolean }): Promise<void> {
@@ -1245,6 +1373,38 @@ export class DiscordAdapter implements DiscordPort {
 		];
 	}
 
+	/** A closed card's control: start the conversation again in the background. */
+	#closedComponents(channelId: string): ControlRows {
+		if (!/^\d{1,22}$/.test(channelId)) throw new Error("Discord session control identity is invalid.");
+		return [
+			new ActionRowBuilder<ButtonBuilder>().addComponents(
+				new ButtonBuilder()
+					.setCustomId(`${PREFIX}r:${channelId}:resume`)
+					.setLabel("Resume")
+					.setStyle(ButtonStyle.Primary),
+			),
+		];
+	}
+
+	/** Closed conversations of this project, one pick starts it in the background. */
+	#resumePicker(channelId: string, resumable: NonNullable<ModeControlResult["resumable"]>): ControlRows {
+		if (!/^\d{1,22}$/.test(channelId)) throw new Error("Discord session control identity is invalid.");
+		return [
+			new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+				new StringSelectMenuBuilder()
+					.setCustomId(`${PREFIX}r:${channelId}:pick`)
+					.setPlaceholder("Conversation to resume")
+					.addOptions(
+						resumable.slice(0, 25).map(item => ({
+							label: item.label.slice(0, 100),
+							description: `Session ${item.id.slice(0, 8)}`,
+							value: item.id,
+						})),
+					),
+			),
+		];
+	}
+
 	#queuedComponents(channelId: string, connectionId: string, deliveryId: string): ControlRows {
 		return [
 			new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -1326,6 +1486,13 @@ export class DiscordAdapter implements DiscordPort {
 			return {
 				...this.#textPayload(result.text),
 				components: this.#reviewRows(channelId, result.connectionId, result),
+				attachments: [],
+				allowedMentions: MENTIONS,
+			};
+		if (result.resumable?.length)
+			return {
+				...this.#textPayload(result.text),
+				components: this.#resumePicker(channelId, result.resumable),
 				attachments: [],
 				allowedMentions: MENTIONS,
 			};
@@ -1501,11 +1668,58 @@ export class DiscordAdapter implements DiscordPort {
 		};
 	}
 
+	/** The new-conversation form: name, first message, and an optional model the service validates. */
+	async #newConversationForm(interaction: ChatInputCommandInteraction): Promise<void> {
+		if (!/^\d{1,22}$/.test(interaction.channelId)) return;
+		const field = (id: string, label: string, style: TextInputStyle, max: number, required: boolean) =>
+			new ActionRowBuilder<TextInputBuilder>().addComponents(
+				new TextInputBuilder()
+					.setCustomId(id)
+					.setLabel(label)
+					.setStyle(style)
+					.setRequired(required)
+					.setMaxLength(max),
+			);
+		await interaction
+			.showModal(
+				new ModalBuilder()
+					.setCustomId(`${PREFIX}n:${interaction.channelId}:new`)
+					.setTitle("New conversation")
+					.addComponents(
+						field("name", "Name", TextInputStyle.Short, 100, true),
+						field("message", "First message", TextInputStyle.Paragraph, 4_000, true),
+						field("model", "Model (optional, provider/model)", TextInputStyle.Short, 200, false),
+					),
+			)
+			.catch(() => {});
+	}
+
+	/** [Resume] on a closed card, a pick from the resume list, or the submitted form; undefined when malformed. */
+	#launchRequest(interaction: ReplyInteraction): LaunchRequest | undefined {
+		const match = "customId" in interaction ? LAUNCH_CONTROL.exec(interaction.customId) : null;
+		if (!match || match[2] !== interaction.channelId || (match[1] === "n") !== (match[3] === "new")) return undefined;
+		if (match[3] === "resume") return interaction.isButton() ? { action: "resume" } : undefined;
+		if (match[3] === "pick")
+			return interaction.isStringSelectMenu() && interaction.values.length === 1 && UUID.test(interaction.values[0]!)
+				? { action: "resume", sessionId: interaction.values[0]! }
+				: undefined;
+		if (!interaction.isModalSubmit()) return undefined;
+		const name = interaction.fields
+			.getTextInputValue("name")
+			.replace(/[\x00-\x1f\x7f]/g, " ")
+			.trim();
+		const message = interaction.fields.getTextInputValue("message");
+		const model = interaction.fields.getTextInputValue("model").trim();
+		if (!name || !message.trim()) return undefined;
+		return { action: "new", name, message, ...(model ? { model } : {}) };
+	}
+
 	async #sessionInteraction(interaction: ReplyInteraction): Promise<void> {
 		let action: ModeControlRequest["action"];
 		let connectionId: string | undefined;
 		let deliveryId: string | undefined;
 		let notify: ModeNotify | undefined;
+		let launch: LaunchRequest | undefined;
 		if (interaction.isChatInputCommand()) {
 			const subcommand = interaction.options.getSubcommand(false);
 			const mode = subcommand === "notify" ? interaction.options.getString("mode", false) : null;
@@ -1517,7 +1731,10 @@ export class DiscordAdapter implements DiscordPort {
 					subcommand !== "stop" &&
 					subcommand !== "queue" &&
 					subcommand !== "notify" &&
-					subcommand !== "settings") ||
+					subcommand !== "settings" &&
+					subcommand !== "resume" &&
+					subcommand !== "new" &&
+					subcommand !== "close") ||
 				(subcommand === "notify" && !notify)
 			) {
 				await this.#reply(
@@ -1526,7 +1743,22 @@ export class DiscordAdapter implements DiscordPort {
 				);
 				return;
 			}
-			action = subcommand;
+			// The form must be Discord's first response to the command, so it opens before any deferral.
+			if (subcommand === "new") {
+				await this.#newConversationForm(interaction);
+				return;
+			}
+			action = subcommand === "resume" ? "sessions" : subcommand;
+		} else if ("customId" in interaction && LAUNCH_CONTROL.test(interaction.customId)) {
+			launch = this.#launchRequest(interaction);
+			if (!launch) {
+				await this.#reply(
+					interaction,
+					"This control is invalid or belongs to another channel; nothing was started.",
+				);
+				return;
+			}
+			action = launch.action;
 		} else {
 			const match = "customId" in interaction ? SESSION_CONTROL.exec(interaction.customId) : null;
 			if (!match || match[1] !== interaction.channelId || !UUID.test(match[2]!)) {
@@ -1593,6 +1825,7 @@ export class DiscordAdapter implements DiscordPort {
 				...(connectionId ? { connectionId } : {}),
 				...(deliveryId ? { deliveryId } : {}),
 				...(notify ? { notify } : {}),
+				...launch,
 			});
 			await this.#reply(interaction, result, interaction.channelId!);
 		} catch (error) {
@@ -1695,7 +1928,11 @@ export class DiscordAdapter implements DiscordPort {
 			await this.#reply(interaction, "This control is restricted to the configured Haiso owner and guild.");
 			return;
 		}
-		if (sessionCommand || ("customId" in interaction && interaction.customId.startsWith(SESSION_PREFIX))) {
+		if (
+			sessionCommand ||
+			("customId" in interaction &&
+				(interaction.customId.startsWith(SESSION_PREFIX) || LAUNCH_CONTROL.test(interaction.customId)))
+		) {
 			await this.#sessionInteraction(interaction);
 			return;
 		}

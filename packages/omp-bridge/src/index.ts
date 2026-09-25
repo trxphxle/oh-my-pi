@@ -21,12 +21,16 @@ import {
 	type BridgeHost,
 	type BridgeSettingResult,
 } from "./host";
+import type { HaisoServiceStarter } from "./service";
 import { BridgeSession } from "./session";
 
 export interface BridgeExtensionOptions {
 	connect?: (root: string) => Promise<BridgeConnection>;
 	receiptRoot?: string;
 	pollIntervalMs?: number;
+	startService?: HaisoServiceStarter;
+	/** Whether the host is Haiso itself; defaults to its process title. */
+	inHaiso?: boolean;
 }
 
 const TOOL_NAME = "bridge";
@@ -63,6 +67,8 @@ function availableModels(ctx: ExtensionContext): BridgeModel[] {
 
 /** Dependencies are injectable for isolated transport fixtures; production uses the shared connector. */
 export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions = {}): void {
+	// Haiso shares ~/.omp, so it loads this bridge too; its built-in Discord mode owns its conversations.
+	if (options.inHaiso ?? process.title === "haiso") return;
 	let latest: ExtensionContext | undefined;
 	let observedIdentity: string | undefined;
 	let session: BridgeSession | undefined;

@@ -9,6 +9,7 @@ import {
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_PROTOCOL,
 	type ModeEnrollment,
+	type ModeServiceInfo,
 } from "@oh-my-pi/pi-wire/discord-mode";
 
 import {
@@ -62,6 +63,8 @@ export async function startDiscordModeServer(options: {
 	token: string;
 	configKey?: string;
 	ready?: boolean;
+	/** The running build, reported by `/info`. */
+	service?: ModeServiceInfo;
 }): Promise<{ close(): Promise<void>; ready(): void }> {
 	if (!/^[A-Za-z0-9_-]{32,512}$/.test(options.token)) throw new Error("Invalid Discord IPC authentication token.");
 	if (process.platform === "win32") throw new Error("Discord mode currently requires Unix-domain sockets.");
@@ -96,6 +99,7 @@ export async function startDiscordModeServer(options: {
 					protocol: DISCORD_MODE_PROTOCOL,
 					configKey: options.configKey ?? "fixture",
 					instanceId,
+					...(options.service ? { service: options.service } : {}),
 				});
 			}
 			if (active >= DISCORD_MODE_MAX_PENDING) return failure(429, "not-started");

@@ -3,6 +3,7 @@ import { Container, Input, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { discordModePaths, loadDiscordModeConfig, saveDiscordModeConfig } from "../discord-mode/config";
 import { readDiscordServiceSettings, setDiscordServiceKeepOnline } from "../discord-mode/service";
 import { ensureDiscordModeSession, getDiscordModeSession, type DiscordModeSession } from "../discord-mode/session";
+import { discordServiceUpdateReady } from "../discord-mode/switchover";
 import type { ModeSnapshot } from "@oh-my-pi/pi-wire/discord-mode";
 import { describeDiscordMode, type DiscordModePresentation } from "../discord-mode/presentation";
 import type { InteractiveModeContext } from "../modes/types";
@@ -21,13 +22,29 @@ function formatStatus(
 		presentation.detail,
 		`Session: ${snapshot.session.pendingInput ? "waiting for your answer" : snapshot.session.busy ? "working" : "idle"}`,
 		`Peers: ${snapshot.peers.filter(peer => peer.connected && peer.enabled).length} connected in this project`,
-		keepOnline === undefined ? "" : `Service: keep online ${keepOnline ? "on" : "off"}`,
+		keepOnline === undefined ? "" : serviceLine(snapshot, keepOnline),
 		...snapshot.deliveries
 			.filter(delivery => delivery.state === "unknown")
 			.map(delivery => `Uncertain work: ${delivery.id} — inspect with /discord reconcile; do not resend.`),
 	]
 		.filter(Boolean)
 		.join("\n");
+}
+
+/** `Service: Haiso <version> (<commit>) · keep online on`, plus a pending update when the prefix moved on. */
+function serviceLine(snapshot: ModeSnapshot, keepOnline: boolean): string {
+	const service = snapshot.service;
+	return [
+		`Service: ${service ? `Haiso ${service.version}${service.commit ? ` (${service.commit})` : ""}` : "version unknown (older build)"}`,
+		`keep online ${keepOnline ? "on" : "off"}`,
+		discordServiceUpdateReady(service)
+			? keepOnline
+				? "update ready · switches when idle"
+				: "update ready · applies when the service next starts"
+			: "",
+	]
+		.filter(Boolean)
+		.join(" · ");
 }
 
 /** Opening controls never enables sharing or waits on a network request. */

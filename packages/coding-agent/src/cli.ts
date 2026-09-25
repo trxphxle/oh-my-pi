@@ -34,6 +34,7 @@ import {
 	BLOB_BROKER_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
 	DAEMON_BROKER_WORKER_ARG,
+	DISCORD_MODE_ENSURE_WORKER_ARG,
 	DISCORD_MODE_WORKER_ARG,
 	LSP_MUX_WORKER_ARG,
 	STATS_ACTIVITY_WORKER_ARG,
@@ -190,6 +191,11 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 	if (arg === DISCORD_MODE_WORKER_ARG) {
 		const { startDiscordModeWorker }: typeof DiscordWorker = require("./discord-mode/worker");
 		await startDiscordModeWorker();
+		return true;
+	}
+	if (arg === DISCORD_MODE_ENSURE_WORKER_ARG) {
+		const { ensureDiscordModeService }: typeof DiscordWorker = require("./discord-mode/worker");
+		await ensureDiscordModeService();
 		return true;
 	}
 	if (arg === TINY_WORKER_ARG) {

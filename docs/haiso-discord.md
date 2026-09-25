@@ -39,8 +39,7 @@ when it is not currently open. Print, RPC, and ACP runs never join. Use
 
 The mode uses a shared supervised local service and the original session's model,
 tools, conversation, and approval settings. It does not launch another coding
-engine. Sessions still end when their terminal exits; this mode does not install a
-login service.
+engine. This mode does not install a login service.
 
 ### Service and offline behavior
 
@@ -48,7 +47,7 @@ login service.
   closes, until logout or reboot. `/discord service off` (or the `/discord` menu)
   restores the old behavior of stopping with the last session.
 - **Honest cards:** a shared session shows `Online` while its terminal is attached and
-  `Closed · resume at your desk` otherwise. While working, the card shows a live line
+  `Closed` otherwise. While working, the card shows a live line
   such as `Working · 4m · editing 3 files · last: bun test (pass)` (tool names and
   outcomes only; at most one edit per 10 seconds). `#overview` shows
   `Discord service: Online`, `Offline since …` after a clean stop, and a one-time
@@ -60,7 +59,30 @@ login service.
 - **Messages sent while the service was offline** are picked up when it reconnects
   (owner messages only, up to 50 per channel from the last 7 days) and saved behind a
   card with **Send now / Discard**.
+- **Updates:** after `haiso update`, the service switches to the new release once
+  every session has been idle for 30 seconds (never mid-turn, dialog, or pending
+  message); sessions reconnect automatically. `/discord status` shows the service
+  version and `update ready · switches when idle` while one is waiting.
+- **Pinned guide:** the service keeps one bot-pinned guide in `#general` current and
+  posts a short *Haiso updated* note there when commands or guide sections change.
 - Keep the machine awake and online; sleep pauses everything until it wakes.
+
+### Background conversations from Discord
+
+- **Resume:** a closed Haiso session card has a **Resume** button; `/session resume`
+  lists the project's closed shared conversations. The conversation runs in the
+  background on your Mac (the normal Haiso UI in a hidden terminal) in its channel.
+- **New:** `/session new` (in a project's `#overview` or session channel) opens a form:
+  name, first message, optional model (`provider/model` a connected session already
+  offers). Only folders that already have a project category are allowed.
+- **Close:** `/session close` stops a background copy after its current turn; sharing
+  and history stay. Permanent delete stays terminal-only.
+- **One writer:** `haiso --resume` on a conversation running in the background asks it
+  to step aside at its next idle point, then opens it (waits up to 10 minutes). When
+  you exit a shared conversation's terminal, Haiso asks *Keep running in the
+  background?*
+- At most 4 background copies run at once. A copy that crashes shows `Closed`; nothing
+  restarts it automatically.
 
 ## Optional official OMP connector
 
@@ -68,18 +90,17 @@ login service.
 same OMP version Haiso is built on. It reuses this broker through private local IPC; it neither imports the
 Haiso application runtime nor runs a second Discord bot.
 
-Build from a prepared checkout and load explicitly:
+Every Haiso release ships the connector and installs a one-line loader at
+`~/.omp/agent/extensions/haiso-bridge.ts`, so official OMP loads it automatically; it
+is inert inside Haiso and does nothing until `/bridge on`. Delete that file to opt
+out; later updates respect the deletion. For development, load a local build with
+`omp --extension <checkout>/packages/omp-bridge/dist/index.js` after
+`bun packages/omp-bridge/scripts/build.ts`.
 
-```sh
-bun packages/omp-bridge/scripts/build.ts
-omp --extension /absolute/path/to/oh-my-pi/packages/omp-bridge/dist/index.js --resume
-```
-
-The normal Haiso account setup remains a one-time broker-side operation. A current
-Haiso `/discord on` connection publishes the private connector descriptor. Keep
-that configured broker running, then use `/bridge on [channel label]` in OMP.
-The OMP conversation must already be saved: resume one or complete a local turn
-first. The connector never creates or rewrites OMP's native session file.
+Use `/bridge on [channel label]` in OMP; the OMP conversation must already be saved
+(resume one or complete a local turn first). If Haiso's Discord service is down, the
+connector starts it with the installed `haiso`. Discord setup itself stays a one-time
+Haiso operation. The connector never creates or rewrites OMP's native session file.
 
 | OMP terminal command | Behavior |
 | --- | --- |
@@ -98,9 +119,7 @@ Existing project rules and conversation contents still apply normally.
 Use `--bridge-root /absolute/path/to/discord-mode` or `HAISO_BRIDGE_ROOT` for a
 different broker profile. The default is `~/.omp/agent/discord-mode`. The extension
 reads IPC credentials only, never `config.json` or the Discord bot token. It holds
-the existing managed service alive while attached, even after the original Haiso
-host exits. It does not start or replace a stopped service; start the configured
-broker from Haiso before attaching again.
+the existing managed service alive while attached.
 
 Approvals stay in OMP's terminal; the Discord settings panel offers model, effort,
 and context/compact for OMP sessions (no advisor, plan mode, or "make default").

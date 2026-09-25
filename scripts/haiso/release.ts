@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { getAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import * as ptree from "@oh-my-pi/pi-utils/ptree";
 
@@ -18,6 +20,11 @@ const SEMVER = /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/;
 
 /** The updater the launcher routes `haiso update` to, relative to the source repository. */
 export const UPDATER_ENTRY = "scripts/haiso/update.ts";
+/** Frozen OMP bridge bundle inside a release; OMP loads it through the stable prefix. */
+const BRIDGE_ENTRY = "omp-bridge/index.js";
+/** First line of the OMP extension file the installer maintains; a file without it is never touched. */
+export const BRIDGE_LOADER_MARKER =
+	"// Haiso OMP bridge loader, maintained by `haiso update`. Delete this file to stop loading it.";
 
 export interface InstallOptions {
 	binary: string;
@@ -29,6 +36,8 @@ export interface InstallOptions {
 	binDir?: string;
 	stateDir?: string;
 	replaceLegacy?: boolean;
+	/** Built OMP bridge bundle (packages/omp-bridge/dist/index.js), frozen into the release when given. */
+	bridge?: string;
 }
 
 interface ReceiptCommon {
@@ -53,6 +62,8 @@ export interface ReleaseReceipt extends ReceiptCommon {
 	schemaVersion: 3;
 	source: InstallOptions["source"];
 	stateDir: string;
+	/** Frozen OMP bridge bundle; absent from releases built before it was shipped. */
+	bridge?: { path: string; sha256: string };
 }
 
 /** A release rebuilt from a frozen fork.patch; still readable and a rollback target, never produced again. */
@@ -305,7 +316,10 @@ export async function readHaisoRelease(release: string): Promise<InstallReceipt>
 		!DIGEST.test(receipt.executableSha256) ||
 		!DIGEST.test(receipt.runtime.sha256) ||
 		(receipt.schemaVersion === 3
-			? !validSource(receipt.source) || !isNormalAbsolute(receipt.stateDir)
+			? !validSource(receipt.source) ||
+				!isNormalAbsolute(receipt.stateDir) ||
+				(receipt.bridge !== undefined &&
+					(receipt.bridge.path !== path.join(release, BRIDGE_ENTRY) || !DIGEST.test(receipt.bridge.sha256)))
 			: receipt.forkPatch !== path.join(release, "fork.patch") ||
 				!DIGEST.test(receipt.forkPatchSha256) ||
 				!DIGEST.test(receipt.compatibility?.state) ||
@@ -320,7 +334,9 @@ export async function readHaisoRelease(release: string): Promise<InstallReceipt>
 	if (receipt.version !== validatePins(receipt.upstream))
 		throw new Error(`Release version does not match pinned upstream: ${release}`);
 	checkLayout(receipt.prefix, receipt.launcher, release);
-	for (const directory of [path.join(release, "bin"), path.join(release, "runtime")]) {
+	const directories = [path.join(release, "bin"), path.join(release, "runtime")];
+	if (receipt.schemaVersion === 3 && receipt.bridge) directories.push(path.dirname(receipt.bridge.path));
+	for (const directory of directories) {
 		const directoryInfo = await fs.promises.lstat(directory);
 		assertOwner(directory, directoryInfo);
 		if (!directoryInfo.isDirectory() || (directoryInfo.mode & 0o222) !== 0)
@@ -331,6 +347,7 @@ export async function readHaisoRelease(release: string): Promise<InstallReceipt>
 		[receipt.runtime.installedPath, receipt.runtime.sha256, true],
 	];
 	if (receipt.schemaVersion === 2) frozen.push([receipt.forkPatch, receipt.forkPatchSha256, false]);
+	else if (receipt.bridge) frozen.push([receipt.bridge.path, receipt.bridge.sha256, false]);
 	for (const [file, expected, executable] of frozen) {
 		await ownedFile(file, executable);
 		if ((await fileHash(file)) !== expected) throw new Error(`Release hash mismatch: ${file}`);
@@ -542,6 +559,7 @@ export async function stageHaiso(options: InstallOptions): Promise<ReleaseReceip
 		throw new Error("Source repository must be an absolute path with full built and haiso commits.");
 	const binary = await fs.promises.realpath(path.resolve(options.binary));
 	const suppliedRuntime = await fs.promises.realpath(path.resolve(options.runtime));
+	const suppliedBridge = options.bridge ? await fs.promises.realpath(path.resolve(options.bridge)) : undefined;
 	await assertNative(binary, "binary");
 	await assertNative(suppliedRuntime, "runtime");
 	const requestedPrefix = path.resolve(options.prefix ?? defaultPrefix());
@@ -569,6 +587,13 @@ export async function stageHaiso(options: InstallOptions): Promise<ReleaseReceip
 			const runtime = path.join(release, "runtime/bun");
 			const executableSha256 = await copyFrozen(binary, executable);
 			const runtimeSha256 = await copyFrozen(suppliedRuntime, runtime);
+			let bridge: ReleaseReceipt["bridge"];
+			if (suppliedBridge) {
+				const bundle = path.join(release, BRIDGE_ENTRY);
+				await fs.promises.mkdir(path.dirname(bundle), { mode: 0o700 });
+				bridge = { path: bundle, sha256: await copyFrozen(suppliedBridge, bundle) };
+				await fs.promises.chmod(bundle, 0o400);
+			}
 			const source = { ...options.source };
 			const wrapper = path.join(release, "bin/launch");
 			await fs.promises.writeFile(
@@ -614,6 +639,7 @@ export async function stageHaiso(options: InstallOptions): Promise<ReleaseReceip
 				},
 				previousRelease: active?.receipt?.release ?? null,
 				activationBaseline: active?.target ?? null,
+				...(bridge ? { bridge } : {}),
 			};
 			const receiptPath = path.join(release, "receipt.json");
 			await fs.promises.writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o400, flag: "wx" });
@@ -621,7 +647,12 @@ export async function stageHaiso(options: InstallOptions): Promise<ReleaseReceip
 				mode: 0o400,
 				flag: "wx",
 			});
-			for (const directory of [path.join(release, "bin"), path.join(release, "runtime"), release])
+			for (const directory of [
+				path.join(release, "bin"),
+				path.join(release, "runtime"),
+				...(bridge ? [path.dirname(bridge.path)] : []),
+				release,
+			])
 				await fs.promises.chmod(directory, 0o500);
 			await unchanged(prefix, prefixBefore);
 			await unchanged(launcher, launcherBefore);
@@ -630,7 +661,12 @@ export async function stageHaiso(options: InstallOptions): Promise<ReleaseReceip
 			return receipt;
 		} finally {
 			if (!retained) {
-				for (const directory of [release, path.join(release, "bin"), path.join(release, "runtime")]) {
+				for (const directory of [
+					release,
+					path.join(release, "bin"),
+					path.join(release, "runtime"),
+					path.join(release, path.dirname(BRIDGE_ENTRY)),
+				]) {
 					if ((await inspect(directory))?.isDirectory()) await fs.promises.chmod(directory, 0o700);
 				}
 				await cleanup(release);
@@ -726,4 +762,65 @@ export async function rollbackHaiso(options: { prefix?: string }): Promise<Insta
 	if (previous.prefix !== current.prefix || previous.launcher !== current.launcher)
 		throw new Error("Rollback receipt does not belong to this installation.");
 	return activateHaiso(previous.release, { expectedCurrent: current.release });
+}
+
+/**
+ * What `ensureHaisoBridgeLoader` did: `declined` means the user deleted the managed file (never recreated), `foreign`
+ * a file without the marker (never touched), `paused` the active release ships no bridge (managed file removed until
+ * one does), `unavailable` neither a bridge nor a managed file.
+ */
+export type BridgeLoaderOutcome = "created" | "updated" | "current" | "declined" | "foreign" | "paused" | "unavailable";
+
+/**
+ * Keeps OMP's `extensions/haiso-bridge.ts` re-exporting the bridge through the stable prefix, so updates and
+ * rollbacks flow without rewriting it. Deleting the file turns the bridge off for good.
+ */
+export async function ensureHaisoBridgeLoader(options: {
+	prefix: string;
+	stateDir: string;
+	agentDir?: string;
+}): Promise<BridgeLoaderOutcome> {
+	const loader = path.join(options.agentDir ?? getAgentDir(), "extensions", "haiso-bridge.ts");
+	const bundle = path.join(options.prefix, BRIDGE_ENTRY);
+	const statePath = path.join(options.stateDir, "bridge-loader.json");
+	const available = (await inspect(bundle))?.isFile() === true;
+	const content = `${BRIDGE_LOADER_MARKER}\nexport { default } from ${JSON.stringify(pathToFileURL(bundle).href)};\n`;
+	const remember = async (installed: boolean) => {
+		await fs.promises.mkdir(options.stateDir, { recursive: true, mode: 0o700 });
+		await fs.promises.writeFile(statePath, `${JSON.stringify({ loader, installed })}\n`, { mode: 0o600 });
+	};
+	const info = await inspect(loader);
+	if (info) {
+		const existing = info.isFile() ? await fs.promises.readFile(loader, "utf8") : "";
+		if (!existing.startsWith(`${BRIDGE_LOADER_MARKER}\n`)) return "foreign";
+		if (!available) {
+			await fs.promises.unlink(loader);
+			await remember(false);
+			return "paused";
+		}
+		await remember(true);
+		if (existing === content) return "current";
+		const staged = `${loader}.${process.pid}.tmp`;
+		await fs.promises.writeFile(staged, content, { mode: 0o600, flag: "wx" });
+		await fs.promises.rename(staged, loader);
+		return "updated";
+	}
+	if (!available) return "unavailable";
+	let state: unknown;
+	try {
+		state = JSON.parse(await fs.promises.readFile(statePath, "utf8"));
+	} catch {}
+	if (
+		typeof state === "object" &&
+		state !== null &&
+		"loader" in state &&
+		state.loader === loader &&
+		"installed" in state &&
+		state.installed === true
+	)
+		return "declined";
+	await fs.promises.mkdir(path.dirname(loader), { recursive: true, mode: 0o700 });
+	await fs.promises.writeFile(loader, content, { mode: 0o600, flag: "wx" });
+	await remember(true);
+	return "created";
 }

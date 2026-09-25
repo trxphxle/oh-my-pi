@@ -9731,7 +9731,7 @@ export class AgentSession {
 			}
 		}
 
-		await invalidateDiscordModeSession(this);
+		await invalidateDiscordModeSession(this, sessionPath);
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
 		await this.#sessionBeforeSwitchReconciler?.();

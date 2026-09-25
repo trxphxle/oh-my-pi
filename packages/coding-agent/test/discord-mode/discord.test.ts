@@ -526,7 +526,16 @@ describe("Discord mode gateway adapter (offline)", () => {
 		const session = [...f.guildCommands.values()].find(command => command.name === "session")!;
 		expect(session.id).toBe(oldSession.id);
 		expect(session.default_member_permissions).toBeNull();
-		expect(session.options?.map(option => option.name)).toEqual(["status", "stop", "queue", "notify", "settings"]);
+		expect(session.options?.map(option => option.name)).toEqual([
+			"status",
+			"stop",
+			"queue",
+			"notify",
+			"settings",
+			"resume",
+			"new",
+			"close",
+		]);
 		const notify = session.options?.find(option => option.name === "notify");
 		const mode = notify && "options" in notify ? notify.options?.[0] : undefined;
 		expect(mode && { name: mode.name, required: mode.required }).toEqual({ name: "mode", required: true });
@@ -1925,5 +1934,284 @@ describe("Discord adapter saved and missed messages (offline)", () => {
 			["discard-held", undefined],
 		]);
 		await expect(f.adapter.notice(CHANNEL, "text", "bad", CONNECTION, [])).rejects.toThrow("invalid");
+	});
+});
+
+describe("Discord adapter maintained guide (offline)", () => {
+	const HEADER = "**Haiso — Discord guide**";
+	const GUIDE = `${HEADER}\n\n**Channels**\nOne category per project folder.`;
+	interface GuideMessage {
+		id: string;
+		channelId: string;
+		author: { id: string };
+		webhookId: null;
+		content: string;
+		pinned: boolean;
+		pin(): Promise<GuideMessage>;
+		edit(update: { content?: string }): Promise<GuideMessage>;
+	}
+	interface GuideChannel {
+		id: string;
+		all: Map<string, GuideMessage>;
+		sent: MessageCreateOptions[];
+	}
+
+	/** Top-level and project text channels with pins; channel ids come from `guild.channels.fetch()`. */
+	async function guideFixture() {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const guild = (await f.client.guilds.fetch(GUILD)) as unknown as {
+			channels: { fetch(id?: string, options?: unknown): Promise<unknown> };
+		};
+		let next = 7000;
+		const channels = new Collection<string, GuideChannel>();
+		const edits: string[] = [];
+		let pinFails = false;
+		function message(channelId: string, author: string, content: string, pinned = false): GuideMessage {
+			const created: GuideMessage = {
+				id: String(next++),
+				channelId,
+				author: { id: author },
+				webhookId: null,
+				content,
+				pinned,
+				async pin() {
+					if (pinFails) throw { code: 50013 };
+					created.pinned = true;
+					return created;
+				},
+				async edit(update) {
+					edits.push(update.content ?? "");
+					created.content = update.content ?? created.content;
+					return created;
+				},
+			};
+			channels.get(channelId)?.all.set(created.id, created);
+			return created;
+		}
+		function text(name: string, parentId: string | null = null, rawPosition = channels.size) {
+			const all = new Map<string, GuideMessage>();
+			const sent: MessageCreateOptions[] = [];
+			const channel = {
+				id: String(next++),
+				guildId: GUILD,
+				name,
+				type: ChannelType.GuildText,
+				parentId,
+				rawPosition,
+				all,
+				sent,
+				permissionsFor: () => new PermissionsBitField(ALL),
+				messages: {
+					fetch: async (options: { message: string }) => {
+						const found = all.get(options.message);
+						if (!found) throw { code: 10008 };
+						return found;
+					},
+					fetchPins: async () => ({
+						hasMore: false,
+						items: [...all.values()].filter(item => item.pinned).map(item => ({ message: item })),
+					}),
+				},
+				async send(payload: MessageCreateOptions) {
+					sent.push(payload);
+					return message(channel.id, BOT, payload.content ?? "");
+				},
+			};
+			channels.set(channel.id, channel);
+			return channel;
+		}
+		const original = guild.channels.fetch.bind(guild.channels);
+		guild.channels.fetch = async (id?: string, options?: unknown) =>
+			id === undefined ? channels : (channels.get(id) ?? original(id, options));
+		return {
+			adapter: f.adapter,
+			text,
+			message,
+			edits,
+			failPins: () => {
+				pinFails = true;
+			},
+		};
+	}
+
+	it("pins a new guide in #general, ignoring other authors, other headers, and project channels", async () => {
+		const g = await guideFixture();
+		const random = g.text("random");
+		const general = g.text("general");
+		const project = g.text("project-chat", "project-category");
+		g.message(random.id, OWNER, `${HEADER}\nowner copy`, true);
+		g.message(random.id, BOT, "**Other bot notes**", true);
+		const inProject = g.message(project.id, BOT, `${HEADER}\nold guide`, true);
+		const placed = await g.adapter.guide({ text: GUIDE, exclude: ["project-category"] });
+		expect(general.sent.map(payload => [payload.content, payload.allowedMentions])).toEqual([
+			[GUIDE, { parse: [], repliedUser: false }],
+		]);
+		expect(placed).toEqual({ channelId: general.id, messageId: [...general.all.keys()][0]! });
+		expect(general.all.get(placed!.messageId)?.pinned).toBe(true);
+		expect(random.sent).toEqual([]);
+		expect(inProject.content).toBe(`${HEADER}\nold guide`);
+		expect(g.edits).toEqual([]);
+	});
+
+	it("edits the saved or pinned guide only when its text differs and notes an update once", async () => {
+		const g = await guideFixture();
+		const lounge = g.text("lounge");
+		g.text("general");
+		const pinned = g.message(lounge.id, BOT, `${HEADER}\nprevious text`, true);
+		const saved = { channelId: lounge.id, messageId: pinned.id };
+		expect(await g.adapter.guide({ text: GUIDE, exclude: [] })).toEqual(saved);
+		expect(await g.adapter.guide({ text: GUIDE, saved, exclude: [] })).toEqual(saved);
+		expect(g.edits).toEqual([GUIDE]);
+		const note = { text: "Haiso updated · new: `/session resume`", key: "whatsnew:1" };
+		await g.adapter.guide({ text: GUIDE, saved, exclude: [], note });
+		await g.adapter.guide({ text: GUIDE, saved, exclude: [], note });
+		expect(lounge.sent.map(payload => payload.content)).toEqual([note.text]);
+		// A saved guide that was unpinned is still maintained in place, and pinned again.
+		pinned.pinned = false;
+		expect(await g.adapter.guide({ text: `${GUIDE}\nmore`, saved, exclude: [] })).toEqual(saved);
+		expect(pinned).toMatchObject({ content: `${GUIDE}\nmore`, pinned: true });
+	});
+
+	it("keeps an unpinnable guide and places nothing without a #general channel", async () => {
+		const g = await guideFixture();
+		g.text("random");
+		expect(await g.adapter.guide({ text: GUIDE, exclude: [] })).toBeUndefined();
+		const general = g.text("general");
+		g.failPins();
+		const placed = await g.adapter.guide({ text: GUIDE, exclude: [] });
+		expect(placed?.channelId).toBe(general.id);
+		expect(general.all.get(placed!.messageId)?.pinned).toBe(false);
+		await expect(g.adapter.guide({ text: "", exclude: [] })).rejects.toThrow("invalid");
+	});
+});
+
+describe("Discord adapter background conversations (offline)", () => {
+	const ALPHA = "11111111-1111-4111-8111-111111111111";
+	const BETA = "22222222-2222-4222-8222-222222222222";
+
+	function customIds(payload: MessageCreateOptions | InteractionEditReplyOptions): string[] {
+		const ids: string[] = [];
+		for (const row of payload.components ?? []) {
+			const data = "toJSON" in row ? row.toJSON() : row;
+			if (!("components" in data)) continue;
+			for (const component of data.components)
+				if ("custom_id" in component && component.custom_id) ids.push(component.custom_id);
+		}
+		return ids;
+	}
+
+	it("opens the new-conversation form before any deferral and routes its trimmed fields", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const command = f.slash("new");
+		f.client.emit(Events.InteractionCreate, command.event);
+		await settleEvents();
+		expect(command.acknowledgements).toEqual([]);
+		expect(command.modals).toHaveLength(1);
+		const modal = (
+			command.modals[0] as {
+				toJSON(): {
+					custom_id: string;
+					components: Array<{ components: Array<{ custom_id: string; required?: boolean }> }>;
+				};
+			}
+		).toJSON();
+		expect(modal.custom_id).toBe(`haiso:n:${CHANNEL}:new`);
+		expect(modal.components.flatMap(row => row.components.map(input => [input.custom_id, input.required]))).toEqual([
+			["name", true],
+			["message", true],
+			["model", false],
+		]);
+		expect(f.controls).toEqual([]);
+		const submit = (customId: string, values: Record<string, string>) => {
+			const event = f.interaction(customId, {
+				isButton: () => false,
+				isMessageComponent: () => false,
+				isModalSubmit: () => true,
+				fields: { getTextInputValue: (id: string) => values[id] ?? "" },
+			});
+			f.client.emit(Events.InteractionCreate, event.event);
+			return event;
+		};
+		submit(modal.custom_id, { name: " Fix\tlogin ", message: "Please fix it.\nThanks", model: " anthropic/sonnet " });
+		const blank = submit(modal.custom_id, { name: "Fix login", message: "   ", model: "" });
+		const copied = submit("haiso:n:100000000000000099:new", { name: "Fix login", message: "Please" });
+		await settleEvents();
+		expect(
+			f.controls.map(({ action, channelId, name, message, model }) => ({ action, channelId, name, message, model })),
+		).toEqual([
+			{
+				action: "new",
+				channelId: CHANNEL,
+				name: "Fix login",
+				message: "Please fix it.\nThanks",
+				model: "anthropic/sonnet",
+			},
+		]);
+		expect(blank.responses[0]).toContain("nothing was started");
+		expect(copied.responses[0]).toContain("belongs to another channel");
+	});
+
+	it("gives only a closed resumable card its Resume button, which resumes this channel's conversation", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		await f.adapter.status(
+			CHANNEL,
+			"Closed · resume here or at your desk",
+			"closed",
+			undefined,
+			undefined,
+			false,
+			"haiso",
+			true,
+		);
+		const resume = customIds(f.sent.at(-1)!);
+		expect(resume).toEqual([`haiso:r:${CHANNEL}:resume`]);
+		await f.adapter.status(CHANNEL, "Online · Idle", "live", CONNECTION, undefined, false, "haiso", true);
+		expect(customIds(f.sent.at(-1)!).some(id => id.startsWith("haiso:r:"))).toBe(false);
+		await f.adapter.status(CHANNEL, "Closed · resume at your desk", "plain", undefined, undefined, false, "haiso");
+		expect(customIds(f.sent.at(-1)!)).toEqual([]);
+		f.client.emit(Events.InteractionCreate, f.interaction(resume[0]!).event);
+		await settleEvents();
+		expect(f.controls).toEqual([expect.objectContaining({ action: "resume", channelId: CHANNEL })]);
+		expect(f.controls[0]!.sessionId).toBeUndefined();
+	});
+
+	it("lists closed conversations for /session resume and resumes the picked one; /session close routes too", async () => {
+		const f = fixture();
+		f.handlers.control = async input => {
+			f.controls.push(input);
+			return input.action === "sessions"
+				? {
+						text: "2 closed conversations can be resumed.",
+						resumable: [
+							{ id: ALPHA, label: "alpha" },
+							{ id: BETA, label: "beta" },
+						],
+					}
+				: { text: "Starting." };
+		};
+		await f.adapter.start(f.handlers);
+		const listed = f.slash("resume");
+		f.client.emit(Events.InteractionCreate, listed.event);
+		await settleEvents();
+		const picker = customIds(listed.payloads[0]!);
+		expect(picker).toEqual([`haiso:r:${CHANNEL}:pick`]);
+		const select = (value: string) =>
+			f.interaction(picker[0]!, { isButton: () => false, isStringSelectMenu: () => true, values: [value] });
+		const picked = select(BETA);
+		const forged = select("not-a-session");
+		f.client.emit(Events.InteractionCreate, picked.event);
+		f.client.emit(Events.InteractionCreate, forged.event);
+		f.client.emit(Events.InteractionCreate, f.slash("close").event);
+		await settleEvents();
+		expect(f.controls.map(({ action, sessionId }) => [action, sessionId])).toEqual([
+			["sessions", undefined],
+			["resume", BETA],
+			["close", undefined],
+		]);
+		expect(picked.responses.at(-1)).toBe("Starting.");
+		expect(forged.responses[0]).toContain("nothing was started");
 	});
 });

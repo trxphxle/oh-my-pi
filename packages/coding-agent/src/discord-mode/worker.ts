@@ -10,7 +10,7 @@ import {
 	readDiscordModeToken,
 	DISCORD_MODE_AUTH_HEADER,
 } from "@oh-my-pi/pi-utils/discord-client";
-import { resolveDiscordModeWorkerCommand } from "./client";
+import { connectDiscordMode, resolveDiscordModeWorkerCommand } from "./client";
 import {
 	DISCORD_MODE_ROOT_ENV,
 	DISCORD_MODE_SOCKET_ENV,
@@ -18,12 +18,24 @@ import {
 	discordModePaths,
 	loadDiscordModeConfig,
 } from "./config";
-import { DiscordAdapter } from "./discord";
+import { DiscordAdapter, sessionCommandGuide } from "./discord";
+import { renderDiscordGuide } from "./guide";
+import { DiscordHostLauncher } from "./launcher";
+import { readDiscordServiceSettings } from "./service";
+import {
+	DISCORD_REPLACES_ENV,
+	DiscordServiceSwitchover,
+	discordServiceTarget,
+	readDiscordServiceRelease,
+	spawnDiscordServiceReplacement,
+} from "./switchover";
 import { createPrivateJson, ensurePrivateDirectory } from "@oh-my-pi/pi-utils/discord-private-files";
 import { DISCORD_MODE_PROTOCOL, DISCORD_MODE_READY } from "@oh-my-pi/pi-wire/discord-mode";
 import { startDiscordModeServer } from "./server";
 
 const SMOKE_ARG = "--discord-mode-smoke";
+/** A replacement waits at most this long for the service it replaces to exit. */
+const REPLACE_WAIT_MS = 60_000;
 
 /** Only contention during first publication is retried; unsafe or incomplete tokens are never replaced. */
 export async function ensureDiscordModeToken(tokenPath: string): Promise<string> {
@@ -47,6 +59,9 @@ export async function startDiscordModeWorker(): Promise<void> {
 	const smoke = process.argv.includes(SMOKE_ARG);
 	let server: { close(): Promise<void>; ready(): void } | undefined;
 	let broker: DiscordModeBroker | undefined;
+	let switchover: DiscordServiceSwitchover | undefined;
+	/** Set once the service stopped for an update: hand over to the prefix's release after closing. */
+	let handover: string | undefined;
 	const stopped = Promise.withResolvers<void>();
 	const stop = () => stopped.resolve();
 	process.once("SIGTERM", stop);
@@ -71,7 +86,15 @@ export async function startDiscordModeWorker(): Promise<void> {
 			});
 		} else {
 			const config = await loadDiscordModeConfig();
-			broker = new DiscordModeBroker({ config, storePath: paths.statePath, port: new DiscordAdapter(config) });
+			const release = readDiscordServiceRelease();
+			broker = new DiscordModeBroker({
+				config,
+				storePath: paths.statePath,
+				port: new DiscordAdapter(config),
+				service: release.info,
+				guide: renderDiscordGuide(sessionCommandGuide()),
+				hosts: new DiscordHostLauncher(),
+			});
 			// Claim IPC before logging into Discord, so a startup loser cannot create another gateway connection.
 			server = await startDiscordModeServer({
 				broker,
@@ -79,8 +102,23 @@ export async function startDiscordModeWorker(): Promise<void> {
 				token,
 				configKey: discordModeConfigKey(config),
 				ready: false,
+				service: release.info,
 			});
 			await broker.start();
+			const prefix = process.env.HAISO_PREFIX;
+			if (release.release && prefix) {
+				switchover = new DiscordServiceSwitchover({
+					running: release.release,
+					target: () => discordServiceTarget(prefix),
+					keepOnline: async () => (await readDiscordServiceSettings()).keepOnline,
+					broker,
+					switched: () => {
+						handover = prefix;
+						stop();
+					},
+				});
+				switchover.start();
+			}
 		}
 		server.ready();
 		const probe = await connectDiscordModeAt(paths.socketPath, token);
@@ -94,12 +132,47 @@ export async function startDiscordModeWorker(): Promise<void> {
 	} finally {
 		process.removeListener("SIGTERM", stop);
 		process.removeListener("SIGINT", stop);
+		switchover?.stop();
 		try {
 			await server?.close();
 		} finally {
 			await broker?.close();
 		}
 	}
+	if (handover) {
+		spawnDiscordServiceReplacement(handover);
+		process.exit(0);
+	}
+}
+
+/**
+ * Hidden entry (the only argument) for the OMP bridge and service updates: start or adopt the account service through
+ * the normal path, print DISCORD_MODE_READY, and exit. A replacement first waits for the service it replaces to exit.
+ */
+export async function ensureDiscordModeService(): Promise<void> {
+	const replaces = Number(process.env[DISCORD_REPLACES_ENV]);
+	delete process.env[DISCORD_REPLACES_ENV];
+	if (Number.isSafeInteger(replaces) && replaces > 1 && replaces !== process.pid) {
+		const deadline = Date.now() + REPLACE_WAIT_MS;
+		while (Date.now() < deadline) {
+			try {
+				process.kill(replaces, 0);
+			} catch {
+				break;
+			}
+			await Bun.sleep(200);
+		}
+	}
+	try {
+		const client = await connectDiscordMode();
+		await client.close();
+	} catch (error) {
+		process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+		process.exit(1);
+	}
+	await Bun.write(Bun.stdout, `${DISCORD_MODE_READY}\n`);
+	// The shared supervisor client would keep this one-shot process alive.
+	process.exit(0);
 }
 
 /** Launches the actual worker selector and verifies private authenticated IPC without credentials or Discord. */

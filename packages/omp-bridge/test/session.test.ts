@@ -28,6 +28,7 @@ import {
 	type BridgeHostState,
 	type BridgeSettingResult,
 } from "../src/host";
+import type { HaisoServiceStarter } from "../src/service";
 import { BridgeSession } from "../src/session";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -78,6 +79,7 @@ async function fixture(
 		/** Broker advertises settings. */ settings?: boolean;
 		/** Interactive host choice; absent like hosts without a UI. */
 		select?: BridgeHost["select"];
+		startService?: HaisoServiceStarter;
 	} = {},
 ) {
 	const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-session-"));
@@ -360,7 +362,13 @@ async function fixture(
 		},
 		...(options.select ? { select: options.select } : {}),
 	};
-	const create = () => new BridgeSession(host, { root, connect, pollIntervalMs: options.timers ? 1000 : 0 });
+	const create = () =>
+		new BridgeSession(host, {
+			root,
+			connect,
+			pollIntervalMs: options.timers ? 1000 : 0,
+			...(options.startService ? { startService: options.startService } : {}),
+		});
 	mode = create();
 	cleanups.push(async () => {
 		beforeRequest = undefined;
@@ -1140,5 +1148,61 @@ describe("BridgeSession Discord settings", () => {
 		await f.mode.poll();
 		expect(f.applied).toEqual([command]);
 		expect(f.results).toMatchObject([{ commandId: command.id, outcome: "applied", text: "Applied effort." }]);
+	});
+});
+
+describe("BridgeSession starts Haiso's stopped service", () => {
+	function starter(started: boolean) {
+		const roots: string[] = [];
+		const start: HaisoServiceStarter = async (root, starting) => {
+			starting?.();
+			roots.push(root);
+			return started;
+		};
+		return { roots, start };
+	}
+	/** The first connection fails like a missing connector; later ones reach the started service. */
+	function stoppedOnce(f: { connectHook: (() => Promise<void>) | undefined }) {
+		let down = true;
+		f.connectHook = async () => {
+			if (!down) return;
+			down = false;
+			throw new Error(
+				"Discord bridge connector is missing or invalid; update/bootstrap the configured Haiso broker first.",
+			);
+		};
+	}
+
+	test("/bridge on starts it once, says so, then attaches", async () => {
+		const s = starter(true);
+		const f = await fixture({ startService: s.start });
+		stoppedOnce(f);
+		expect((await f.mode.on()).session.connected).toBe(true);
+		expect(s.roots).toEqual([f.root]);
+		expect(f.notices[0]).toBe("Starting Haiso's Discord service…");
+	});
+
+	test("keeps today's error when the service could not be started", async () => {
+		const s = starter(false);
+		const f = await fixture({ startService: s.start });
+		stoppedOnce(f);
+		await expect(f.mode.on()).rejects.toThrow("connector is missing or invalid");
+		expect(s.roots).toEqual([f.root]);
+		expect(f.mode.enabled).toBe(false);
+	});
+
+	test("rejoin starts it only for a conversation that is still shared", async () => {
+		const s = starter(true);
+		const f = await fixture({ startService: s.start });
+		stoppedOnce(f);
+		expect(await f.mode.rejoin()).toBeUndefined();
+		expect(s.roots).toEqual([]);
+		expect(f.connects).toBe(0);
+		await f.share();
+		f.setSession({ enabled: true });
+		expect((await f.mode.rejoin())?.session.connected).toBe(true);
+		expect(s.roots).toEqual([f.root]);
+		// Automatic rejoin stays quiet: no starting notice.
+		expect(f.notices).not.toContain("Starting Haiso's Discord service…");
 	});
 });

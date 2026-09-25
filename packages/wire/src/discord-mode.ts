@@ -20,11 +20,28 @@ export const DISCORD_MODE_MAX_SETTING_COMMANDS = 8;
 export const DISCORD_MODE_MAX_PROGRESS_LABEL = 48;
 export const DISCORD_MODE_MAX_PROGRESS_FILES = 999;
 
+/**
+ * Hidden Haiso CLI selector (the only argument) that starts or adopts the account service, prints
+ * DISCORD_MODE_READY, and exits; the OMP bridge runs it when the service is down. Mirrors worker-selectors.ts.
+ */
+export const DISCORD_MODE_ENSURE_WORKER_ARG = "__omp_worker_discord_ensure";
+
+/** The running account service's build; absent from older services. */
+export interface ModeServiceInfo {
+	/** Upstream version the release was built on. */
+	version: string;
+	/** Source commit (12 hex) from the release receipt; absent outside an installed release. */
+	commit?: string;
+	/** Installed release directory the service runs from; absent outside an installed release. */
+	release?: string;
+}
+
 /** Private attachment identity; stable across service restarts, never model-visible. */
 export interface DiscordModeInfo {
 	protocol: typeof DISCORD_MODE_PROTOCOL;
 	instanceId: string;
 	configKey: string;
+	service?: ModeServiceInfo;
 }
 
 /** Published only after native authenticated adoption of an existing account service. */
@@ -99,6 +116,8 @@ export interface ModeSession {
 	retirement?: ModeRetirement;
 	notify?: ModeNotify;
 	app?: ModeApp;
+	/** Supervisor daemon name of the background copy that holds (or last held) the lease; absent for terminals. */
+	host?: string;
 }
 export interface ModeEnrollment {
 	group: ModeGroup;
@@ -156,6 +175,12 @@ export interface ModeSnapshot {
 	commands?: ModeSettingCommand[];
 	/** Present only from brokers that accept `progress` on poll; older brokers reject the field. */
 	progress?: true;
+	/** This broker can start conversations in the background (`background` op, Discord resume/new/close). */
+	background?: true;
+	/** Poll/status only: the owner or a terminal asked this background copy to leave at its next idle point. */
+	stepAside?: true;
+	/** The service's build, so a client can tell it is running an older release than the one installed. */
+	service?: ModeServiceInfo;
 }
 /** Owner-queued session settings changes. Approval policy, credentials, and logins never cross this boundary. */
 export type ModeSettingKind = "model" | "effort" | "default" | "compact" | "advisor" | "advisor-model" | "plan";
@@ -251,6 +276,13 @@ export type ModeRequest =
 			 * never creates a session. Older brokers reject the field.
 			 */
 			rejoin?: true;
+			/**
+			 * Single-use claim of a Discord-started launch: a resume must match its conversation; a new conversation takes
+			 * the launch's label and project group. Only brokers advertising `background` accept it.
+			 */
+			launchId?: string;
+			/** Sent by a background copy on every registration; brokers advertising `background` accept it. */
+			host?: "background";
 	  }
 	| {
 			op: "poll";
@@ -307,7 +339,17 @@ export type ModeRequest =
 	 * Release (`send`, in arrival order) or drop (`discard`) this session's saved owner messages; all of them when
 	 * `deliveryIds` is absent. Older brokers reject the op unexecuted.
 	 */
-	| { op: "held"; lease: ModeLease; requestId: string; action: "send" | "discard"; deliveryIds?: string[] };
+	| { op: "held"; lease: ModeLease; requestId: string; action: "send" | "discard"; deliveryIds?: string[] }
+	/**
+	 * A terminal opening a conversation held by a background copy asks that copy to leave at its next idle point. By
+	 * native identity like `disable`; refused unless a background copy holds the live lease.
+	 */
+	| { op: "step-aside"; sessionId: string; sessionFile: string; projectDir: string }
+	/**
+	 * Close this terminal but keep the conversation running: the broker starts a background copy for it (which waits
+	 * for this process to release the conversation) and drops this connection like `detach`.
+	 */
+	| { op: "background"; lease: ModeLease };
 
 export interface RemoteChannel {
 	id: string;
@@ -338,6 +380,8 @@ export interface ModeControlResult {
 	saved?: true;
 	/** `queued` lists saved messages to review one by one. */
 	review?: true;
+	/** `sessions`: closed conversations of this project the owner can resume, most recent first. */
+	resumable?: Array<{ id: string; label: string }>;
 }
 export interface ModeControlRequest {
 	id: string;
@@ -346,6 +390,9 @@ export interface ModeControlRequest {
 	/**
 	 * `discard`/`release`: one saved message (`deliveryId`); `send-held`/`discard-held`: every saved message;
 	 * `review`: list saved messages, or show one (`deliveryId`). These accept a revoked `connectionId`.
+	 * `sessions`/`resume`/`new` work in a project's overview or any of its session channels; `resume` takes
+	 * `sessionId` (else this channel's conversation); `new` takes `name`, `message`, and optional `model`. `close`
+	 * detaches a background copy at its next idle point.
 	 */
 	action:
 		| "status"
@@ -360,7 +407,11 @@ export interface ModeControlRequest {
 		| "release"
 		| "send-held"
 		| "discard-held"
-		| "review";
+		| "review"
+		| "sessions"
+		| "resume"
+		| "new"
+		| "close";
 	connectionId?: string;
 	deliveryId?: string;
 	notify?: ModeNotify;
@@ -368,6 +419,11 @@ export interface ModeControlRequest {
 	setting?: { kind: ModeSettingKind; value?: string | boolean };
 	/** `settings` only: rank the reported models against this text. */
 	query?: string;
+	sessionId?: string;
+	/** `new` only: the conversation's name, its first owner message, and an optional `provider/model` selector. */
+	name?: string;
+	message?: string;
+	model?: string;
 }
 /** One owner message as parsed from Discord; `rejected` carries the refusal text for unsupported content. */
 export interface ModeOwnerMessage {
@@ -420,6 +476,8 @@ export interface DiscordPort {
 		existingOnly?: boolean,
 		/** Session cards carry the attaching app's color; overview cards omit it. */
 		app?: ModeApp,
+		/** A closed session card offers [Resume] (owner starts it in the background); ignored with `connectionId`. */
+		resumable?: boolean,
 	): Promise<string>;
 	/** `mention` pings the owner; the broker decides per session notify mode. */
 	showDialog(channelId: string, dialog: ModeDialog, options?: { mention?: boolean }): Promise<void>;
@@ -437,4 +495,22 @@ export interface DiscordPort {
 		connectionId: string,
 		actions: ModeNoticeAction[],
 	): Promise<void>;
+	/**
+	 * Maintained pinned guide, the one non-private channel the bot writes to (no session data): the bot's pinned
+	 * message whose first line matches `text`'s, in a text channel outside `exclude` categories, else a new one pinned
+	 * in a channel named `general`. Edited only when `text` differs; `note` is posted beside it once, never pinging.
+	 * Resolves undefined when there is no such channel. Absent from fixtures without a guide.
+	 */
+	guide?(input: {
+		text: string;
+		saved?: ModeGuidePlacement;
+		exclude: string[];
+		note?: { text: string; key: string };
+	}): Promise<ModeGuidePlacement | undefined>;
+	/** Whether Discord events are still being handled; a service restart waits until they are done. */
+	busy?(): boolean;
+}
+export interface ModeGuidePlacement {
+	channelId: string;
+	messageId: string;
 }

@@ -5,7 +5,9 @@ import * as path from "node:path";
 import { readLines } from "@oh-my-pi/pi-utils/stream";
 import {
 	activateHaiso,
+	BRIDGE_LOADER_MARKER,
 	currentHaisoRelease,
+	ensureHaisoBridgeLoader,
 	type InstallOptions,
 	type InstallReceipt,
 	readHaisoRelease,
@@ -511,4 +513,68 @@ describe("Haiso compiled releases", () => {
 		expect(await fs.readFile(launcher, "utf8")).toBe("concurrent-owner\n");
 		await expect(fs.lstat(options.prefix!)).rejects.toHaveProperty("code", "ENOENT");
 	}, 120_000);
+
+	it("freezes and seals the OMP bridge bundle, and keeps bridge-less receipts valid", async () => {
+		const { root, options } = await fixture();
+		const bundle = path.join(root, "bridge dist ' index.js");
+		await fs.writeFile(bundle, 'export default () => "bridge";\n', { mode: 0o600 });
+		const plain = await install(options);
+		expect(plain.schemaVersion === 3 && plain.bridge).toBeUndefined();
+		expect(await readHaisoRelease(plain.release)).toEqual(plain);
+		const staged = await stageHaiso({ ...options, bridge: bundle });
+		const frozen = path.join(staged.release, "omp-bridge/index.js");
+		expect(staged.bridge).toEqual({ path: frozen, sha256: await sha256(bundle) });
+		expect((await fs.lstat(frozen)).mode & 0o777).toBe(0o400);
+		expect((await fs.lstat(path.dirname(frozen))).mode & 0o777).toBe(0o500);
+		expect(await readHaisoRelease(staged.release)).toEqual(staged);
+		await fs.chmod(path.dirname(frozen), 0o700);
+		await fs.chmod(frozen, 0o600);
+		await fs.appendFile(frozen, "globalThis.tampered = true;\n");
+		await fs.chmod(frozen, 0o400);
+		await fs.chmod(path.dirname(frozen), 0o500);
+		await expect(activateHaiso(staged.release, {})).rejects.toThrow("hash mismatch");
+	}, 120_000);
+
+	it("keeps OMP's bridge loader on the stable prefix across updates and rollback, never against the user", async () => {
+		const { root, options } = await fixture();
+		const agentDir = path.join(root, "omp agent");
+		const loader = path.join(agentDir, "extensions", "haiso-bridge.ts");
+		const stateDir = options.stateDir!;
+		const bundle = async (label: string) => {
+			const file = path.join(root, `bridge-${label}.js`);
+			await fs.writeFile(file, `export default () => ${JSON.stringify(label)};\n`, { mode: 0o600 });
+			return file;
+		};
+		const sync = () => ensureHaisoBridgeLoader({ prefix: first.prefix, stateDir, agentDir });
+		const loaded = () =>
+			execute([process.execPath, "-e", `console.log((await import(${JSON.stringify(loader)})).default())`], root);
+		const first = await install({ ...options, bridge: await bundle("one") });
+		expect(await sync()).toBe("created");
+		const content = await fs.readFile(loader, "utf8");
+		expect(content.split("\n", 1)[0]).toBe(BRIDGE_LOADER_MARKER);
+		expect(content).toContain(JSON.stringify(Bun.pathToFileURL(path.join(first.prefix, "omp-bridge/index.js")).href));
+		expect(await loaded()).toBe("one");
+		expect(await sync()).toBe("current");
+		// The loader names the prefix, so an update needs no rewrite.
+		await install({ ...options, bridge: await bundle("two") });
+		expect(await sync()).toBe("current");
+		expect(await loaded()).toBe("two");
+		// A release without a bridge takes the managed loader away until one ships again.
+		await install(options);
+		expect(await sync()).toBe("paused");
+		await expect(fs.lstat(loader)).rejects.toHaveProperty("code", "ENOENT");
+		await rollbackHaiso({ prefix: options.prefix });
+		expect(await sync()).toBe("created");
+		expect(await loaded()).toBe("two");
+		await fs.writeFile(loader, `${BRIDGE_LOADER_MARKER}\nexport { default } from "file:///elsewhere/index.js";\n`);
+		expect(await sync()).toBe("updated");
+		expect(await fs.readFile(loader, "utf8")).toBe(content);
+		// Deleting the file is the off switch; a file Haiso did not write is never touched.
+		await fs.unlink(loader);
+		expect(await sync()).toBe("declined");
+		await expect(fs.lstat(loader)).rejects.toHaveProperty("code", "ENOENT");
+		await fs.writeFile(loader, "export { default } from './mine.ts';\n");
+		expect(await sync()).toBe("foreign");
+		expect(await fs.readFile(loader, "utf8")).toBe("export { default } from './mine.ts';\n");
+	}, 180_000);
 });

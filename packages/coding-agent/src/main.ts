@@ -46,6 +46,7 @@ import {
 import { ModelsConfigFile } from "./config/models-config";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
+import { claimDiscordConversation } from "./discord-mode/claim";
 import { discordDeletionPolicy, getDiscordDeletionChoices } from "./discord-mode/deletion-ui";
 import { deleteSessionWithDiscord, resumeDiscordRetirements } from "./discord-mode/retirement";
 import { loadDiscordSessionBadges } from "./discord-mode/retirement-events";
@@ -2061,6 +2062,13 @@ export async function runRootCommand(
 				scopedModels = await resolveScopedModels(parsedArgs, modelRegistry, settingsInstance);
 			}
 		}
+		// Haiso: one writer per shared Discord conversation; takes over from a background copy before loading it.
+		if (sessionManager)
+			sessionManager = await claimDiscordConversation(sessionManager, {
+				interactive: isInteractive,
+				pause: pauseStartupWatchdog,
+				resume: resumeStartupWatchdog,
+			}).catch(error => exitForSessionResolutionError(new SessionResolutionError(error.message)));
 
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {
 			const pendingToolWarning = describePendingToolCalls(sessionManager.getBranch());

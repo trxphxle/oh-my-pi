@@ -9,8 +9,10 @@ import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import type { InteractiveModeContext } from "../modes/types";
 import { canonicalProjectDir } from "../launch/paths";
+import { claimDiscordConversationFile } from "./claim";
 import { connectDiscordMode } from "./client";
 import { discordModePaths, loadDiscordModeConfig } from "./config";
+import { isDiscordBackgroundHost, releaseDiscordConversations, takeDiscordLaunch } from "./hosts";
 import { DiscordDialogs, type DiscordDialogResult } from "./dialog";
 import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import { describeDiscordMode, type DiscordModePresentation } from "./presentation";
@@ -152,6 +154,12 @@ export interface DiscordSessionOptions {
 	 * to the channel.
 	 */
 	offerSaved?: (messages: ModeDelivery[]) => Promise<DiscordSavedDecision[] | undefined>;
+	/**
+	 * Background copy started by the Discord service: every registration says so, the first one claims `launchId`,
+	 * and `release` ends the process once Discord no longer needs it (a step-aside at an idle point, or a connection
+	 * that cannot be restored).
+	 */
+	background?: { launchId?: string; release: () => void };
 }
 
 export interface DiscordSavedDecision {
@@ -282,12 +290,16 @@ export class DiscordModeSession {
 	#acknowledging = new Set<string>();
 	#applying = false;
 	#settingsView?: { at: number; view: ModeSettingsView };
+	/** Background copy: the launch its first registration claims, then undefined. */
+	#launchId?: string;
+	#released = false;
 
 	constructor(
 		readonly engine: DiscordSessionEngine,
 		options: DiscordSessionOptions = {},
 	) {
 		this.#options = options;
+		this.#launchId = options.background?.launchId;
 		this.#dialogs = new DiscordDialogs(
 			async dialog => {
 				await this.#request({ op: "dialog", lease: this.#requireLease(), dialog });
@@ -370,6 +382,9 @@ export class DiscordModeSession {
 		let snapshot: ModeSnapshot;
 		try {
 			if (!current()) throw new Error("Session changed during Discord enrollment.");
+			// Single use: a refused claim is never presented again.
+			const launchId = this.#launchId;
+			this.#launchId = undefined;
 			snapshot = await client.request({
 				op: "register",
 				requestId: crypto.randomUUID(),
@@ -380,6 +395,8 @@ export class DiscordModeSession {
 				label,
 				groupName,
 				...(options.rejoin ? { rejoin: true as const } : {}),
+				...(this.#options.background ? { host: "background" as const } : {}),
+				...(launchId ? { launchId } : {}),
 			});
 			if (!snapshot.lease) throw new Error("Discord broker did not grant a session lease.");
 			if (!current()) {
@@ -521,6 +538,16 @@ export class DiscordModeSession {
 			});
 	}
 
+	/**
+	 * Keep this conversation running after this terminal closes: the broker starts a background copy, which waits for
+	 * this process to release the conversation, and drops this connection. Throws, still attached, when refused.
+	 */
+	async keepInBackground(): Promise<void> {
+		await this.#request({ op: "background", lease: this.#requireLease() });
+		const { client } = this.#teardown();
+		await client?.close().catch(() => {});
+	}
+
 	/** Explicit and sticky: sharing stays off, also across resume, until /discord on. Works when not attached here. */
 	async off(): Promise<void> {
 		const { client, lease } = this.#teardown();
@@ -637,6 +664,9 @@ export class DiscordModeSession {
 			// Settings apply first, so the next owner message already runs with them.
 			if (this.#current(epoch, generation)) this.#intakeCommands(snapshot.commands ?? [], epoch, generation);
 			if (this.#current(epoch, generation) && !this.#intakeHeld) await this.#drain(epoch, generation);
+			// A background copy asked to leave goes at its next idle point, after the work it already received.
+			if (snapshot.stepAside && this.#current(epoch, generation) && !this.#busy() && !this.#queue.length)
+				this.#release();
 		} catch {
 			if (epoch === this.#epoch && generation === this.#generation) {
 				this.#dialogs.unavailable();
@@ -795,6 +825,7 @@ export class DiscordModeSession {
 			if (retained.retirement) {
 				await this.detach();
 				this.#options.notify?.("This conversation was deleted from Discord; Discord mode is off.");
+				this.#release();
 				return;
 			}
 			if (!retained.enabled) {
@@ -833,6 +864,7 @@ export class DiscordModeSession {
 					connectionId,
 					label: retained.label,
 					groupName: enrollment.group.name,
+					...(this.#options.background ? { host: "background" as const } : {}),
 				});
 				if (!snapshot.lease) throw new Error("Discord broker did not grant a session lease.");
 				if (!live()) {
@@ -943,6 +975,14 @@ export class DiscordModeSession {
 		this.#transportAvailable = false;
 		this.#renderStatus();
 		this.#options.notify?.(`${reason} Automatic Discord reconnect stopped; use /discord off, then /discord on.`);
+		this.#release();
+	}
+
+	/** A background copy ends its process once Discord no longer needs it; terminals never do. */
+	#release(): void {
+		if (this.#released || !this.#options.background) return;
+		this.#released = true;
+		this.#options.background.release();
 	}
 
 	#current(epoch: number, generation: number): boolean {
@@ -1256,7 +1296,10 @@ export function ensureDiscordModeSession(ctx: InteractiveModeContext): DiscordMo
 				ctx.session.isGeneratingHandoff ||
 				ctx.session.isRetrying,
 			settings: createDiscordSettingsHost(ctx),
-			offerSaved: messages => chooseSavedMessages(ctx, messages),
+			// Nobody watches a background copy's terminal: its saved messages are offered on Discord only.
+			...(isDiscordBackgroundHost()
+				? { background: { launchId: takeDiscordLaunch(), release: () => ctx.requestShutdown() } }
+				: { offerSaved: (messages: ModeDelivery[]) => chooseSavedMessages(ctx, messages) }),
 		});
 		sessions.set(ctx.session, mode);
 	}
@@ -1286,18 +1329,93 @@ async function rejoinDiscordModeSession(engine: DiscordSessionEngine): Promise<v
 /** Remember the interactive host and rejoin a resumed conversation that is still shared with Discord. */
 export function startDiscordModeAutoRejoin(ctx: InteractiveModeContext): void {
 	hosts.set(ctx.session, ctx);
-	void rejoinDiscordModeSession(ctx.session).catch(() => {});
+	if (isDiscordBackgroundHost()) void attachBackgroundCopy(ctx);
+	else void rejoinDiscordModeSession(ctx.session).catch(() => {});
 }
 
-/** Session transitions close the previous conversation but keep it shared; the next one rejoins if it is shared. */
-export async function invalidateDiscordModeSession(session: DiscordSessionEngine): Promise<void> {
+/**
+ * A background copy attaches as soon as it starts: a shared conversation rejoins its channel, a new one enrolls under
+ * its launch's name and project. A copy that cannot attach has nothing to do, so it exits.
+ */
+async function attachBackgroundCopy(ctx: InteractiveModeContext): Promise<void> {
+	const mode = ensureDiscordModeSession(ctx);
+	try {
+		if (await sharedOffline(ctx.session)) await mode.rejoin();
+		else {
+			// The broker names and places a new conversation from its launch; these placeholders only pass validation.
+			const snapshot = await mode.on("background", "background");
+			await ctx.sessionManager.setSessionName(snapshot.session.label, "user");
+		}
+	} catch (error) {
+		ctx.showWarning(
+			`Discord couldn't attach this background copy: ${error instanceof Error ? error.message : error}`,
+		);
+	}
+	if (!mode.enabled) ctx.requestShutdown();
+}
+
+/**
+ * Session transitions close the previous conversation but keep it shared; the next one rejoins if it is shared.
+ * Switching to a shared conversation (`targetFile`) first takes it over from a background copy holding it, and a
+ * refusal throws before anything changes. Afterwards this process holds only its current conversation.
+ */
+export async function invalidateDiscordModeSession(session: DiscordSessionEngine, targetFile?: string): Promise<void> {
+	const ctx = hosts.get(session);
+	if (ctx && targetFile !== undefined)
+		await claimDiscordConversationFile(targetFile, { notify: text => ctx.showStatus(text) });
 	await sessions.get(session)?.detach();
-	// Called inside the transition, so rejoin only after it (or its rollback) settles.
+	// Called inside the transition, so rejoin only after it (or its rollback) settles: the old file is flushed by then.
 	if (hosts.has(session))
 		void session
 			.waitForSessionTransition()
-			.then(() => rejoinDiscordModeSession(session))
+			.then(() => {
+				releaseDiscordConversations(session.sessionManager.getSessionId());
+				return rejoinDiscordModeSession(session);
+			})
 			.catch(() => {});
+}
+
+/** The exit question is offered only by a terminal attached to a service that can run the conversation itself. */
+export function offersDiscordBackground(
+	mode: DiscordModeSession | undefined,
+	backgroundHost = isDiscordBackgroundHost(),
+): boolean {
+	return !backgroundHost && mode?.enabled === true && mode.snapshot?.background === true;
+}
+
+let exitPrompt = false;
+/**
+ * Interactive exit: when the conversation is shared and the Discord service can run it, ask whether it keeps running
+ * in the background. False keeps the TUI open (question dismissed, or already showing).
+ */
+export async function confirmDiscordExit(
+	ctx: InteractiveModeContext,
+	mode = getDiscordModeSession(ctx.session),
+): Promise<boolean> {
+	if (exitPrompt) return false;
+	if (!offersDiscordBackground(mode)) return true;
+	exitPrompt = true;
+	const endDialog = mode!.beginLocalDialog();
+	let choice: string | undefined;
+	try {
+		choice = await ctx.showHookSelector("Keep running in the background?", [
+			{ label: "Yes", description: "Keep this conversation running on Discord after this terminal closes." },
+			{ label: "No", description: "Close it here. It stays shared: resume it from Discord or at your desk." },
+		]);
+	} finally {
+		endDialog();
+		exitPrompt = false;
+	}
+	if (choice === undefined) return false;
+	if (choice === "Yes")
+		try {
+			await mode!.keepInBackground();
+		} catch (error) {
+			ctx.showWarning(
+				`Couldn't keep it running in the background: ${error instanceof Error ? error.message : error} Closing it here; it stays shared.`,
+			);
+		}
+	return true;
 }
 
 /** A moved conversation file can never be rebound by the broker, so sharing it stops for good. */

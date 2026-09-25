@@ -22,6 +22,7 @@ import {
 	type ModeGroup,
 	type ModeRequest,
 	type ModeModelChoice,
+	type ModeServiceInfo,
 	type ModeSession,
 	type ModeSettingsView,
 	type ModeSnapshot,
@@ -210,10 +211,12 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 			text(value.label, 100) &&
 			text(value.groupName, 100) &&
 			(value.app === undefined || value.app === "haiso" || value.app === "omp") &&
-			(value.rejoin === undefined || value.rejoin === true)
+			(value.rejoin === undefined || value.rejoin === true) &&
+			(value.launchId === undefined || identifier(value.launchId)) &&
+			(value.host === undefined || value.host === "background")
 		);
 	}
-	if (value.op === "disable")
+	if (value.op === "disable" || value.op === "step-aside")
 		return identifier(value.sessionId) && absolutePath(value.sessionFile) && absolutePath(value.projectDir);
 	if (
 		!record(value.lease) ||
@@ -242,6 +245,7 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 		case "status":
 		case "off":
 		case "detach":
+		case "background":
 			return true;
 		case "receipt":
 			return (
@@ -479,7 +483,19 @@ function snapshot(value: unknown): value is ModeSnapshot {
 			(Array.isArray(value.commands) &&
 				value.commands.length <= DISCORD_MODE_MAX_SETTING_COMMANDS &&
 				value.commands.every(settingCommand))) &&
-		(value.progress === undefined || value.progress === true)
+		(value.progress === undefined || value.progress === true) &&
+		(value.background === undefined || value.background === true) &&
+		(value.stepAside === undefined || value.stepAside === true) &&
+		(value.service === undefined || serviceInfo(value.service))
+	);
+}
+
+function serviceInfo(value: unknown): value is ModeServiceInfo {
+	return (
+		record(value) &&
+		plain(value.version, 64) &&
+		(value.commit === undefined || (typeof value.commit === "string" && /^[a-f0-9]{7,40}$/.test(value.commit))) &&
+		(value.release === undefined || absolutePath(value.release))
 	);
 }
 
@@ -590,7 +606,12 @@ export class DiscordModeClient {
 				"Discord mode configuration differs from the running service. Stop that service explicitly before reconnecting; it was not replaced.",
 			);
 		this.#configKey = body.configKey;
-		return { protocol: DISCORD_MODE_PROTOCOL, instanceId: body.instanceId, configKey: body.configKey };
+		return {
+			protocol: DISCORD_MODE_PROTOCOL,
+			instanceId: body.instanceId,
+			configKey: body.configKey,
+			...(serviceInfo(body.service) ? { service: body.service } : {}),
+		};
 	}
 
 	async request(input: ModeRequest, signal?: AbortSignal): Promise<ModeSnapshot> {
@@ -720,6 +741,7 @@ async function snapshotMatches(value: ModeSnapshot, input: ModeRequest): Promise
 			!value.session.connected &&
 			value.lease === undefined
 		);
+	if (input.op === "step-aside") return value.session.id === input.sessionId && value.lease === undefined;
 	return value.session.id === input.lease.sessionId && value.session.connectionId === input.lease.connectionId;
 }
 

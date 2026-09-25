@@ -683,3 +683,26 @@ describe("official OMP bridge adapter", () => {
 		expect(lastPoll()).not.toHaveProperty("progress");
 	});
 });
+
+describe("bridge loaded by Haiso", () => {
+	test("registers nothing inside Haiso, which shares ~/.omp and has its own Discord mode", () => {
+		const calls: string[] = [];
+		const pi = new Proxy(
+			{},
+			{
+				get: (_target, name) => () => {
+					calls.push(String(name));
+				},
+			},
+		) as unknown as ExtensionAPI;
+		const title = process.title;
+		process.title = "haiso";
+		try {
+			installBridge(pi);
+		} finally {
+			process.title = title;
+		}
+		installBridge(pi, { inHaiso: true });
+		expect(calls).toEqual([]);
+	});
+});

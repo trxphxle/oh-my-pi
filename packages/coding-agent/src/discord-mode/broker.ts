@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { canonicalProjectDir } from "../launch/paths";
@@ -11,6 +12,7 @@ import {
 	readDiscordDeletionEvents,
 	withDiscordDeletionLock,
 } from "./retirement-events";
+import { type DiscordGuide, discordGuideWhatsNew } from "./guide";
 import { describeSettingCommand, findSettingsChoice, findSettingsModel, rankSettingsModels } from "./settings-view";
 import {
 	DISCORD_MODE_MAX_FRAME,
@@ -42,6 +44,7 @@ import {
 	type ModeLease,
 	type ModeRequest,
 	type ModeNotify,
+	type ModeServiceInfo,
 	type ModeSession,
 	type ModeProgress,
 	type ModeSettingCommand,
@@ -71,11 +74,31 @@ export const CLOSED_SAVED_TEXT =
 /** Missed-message catch-up bounds per bound channel. */
 export const DISCORD_MODE_CATCH_UP_LIMIT = 50;
 export const DISCORD_MODE_CATCH_UP_MS = 7 * 24 * 60 * 60 * 1000;
+/** A service update switches only after nothing has been in flight for this long. */
+export const DISCORD_MODE_SWITCH_QUIET_MS = 30_000;
+/** Owner-facing refusal while the service stops to run an updated release. */
+export const SERVICE_UPDATING_TEXT =
+	"Haiso's Discord service is restarting for an update. This message will be offered again in a moment.";
 const SESSION_CARD_FOOTER =
 	"Normal messages wait for idle; queued messages can become guidance or be cancelled before dispatch. !steer sends guidance; !abort and Stop turn cancel the current turn, not the process.";
 /** Graceful-stop card edits race the supervisor's stop grace. */
 const STOP_CARDS_MS = 1_500;
 const DISCORD_EPOCH = 1_420_070_400_000n;
+/** Conversations running as background copies at once, whichever way they were started. */
+export const DISCORD_MODE_MAX_BACKGROUND = 4;
+/** A launch its copy has not claimed within this long is dropped, and a copy still starting is stopped. */
+export const DISCORD_MODE_LAUNCH_TTL_MS = 10 * 60_000;
+/** A launch whose copy is no longer running after this long without claiming it failed to start. */
+export const DISCORD_MODE_LAUNCH_GRACE_MS = 15_000;
+/** A background copy asked to leave that stays idle this long is stopped through its supervisor (graceful). */
+export const DISCORD_MODE_STEP_ASIDE_STOP_MS = 60_000;
+const MAX_LAUNCHES = 16;
+/** `provider/model` for `--model`: never an option, never whitespace or shell syntax. */
+const ModelSelector = type("string")
+	.matching(/^[A-Za-z0-9._-]{1,64}\/[A-Za-z0-9._:@+/-]{1,160}$/)
+	.narrow(value => !value.startsWith("-"));
+/** Supervisor daemon name of a background copy: `haiso-s-<conversation>` or `haiso-n-<launch>`. */
+const HostName = type("string").matching(/^haiso-[sn]-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 const Notify = type("'all' | 'needs-you' | 'off'");
 const App = type("'haiso' | 'omp'");
 /** Card header and overview section tag per attaching app. */
@@ -181,6 +204,8 @@ const RequestShape = type.or(
 		groupName: Label,
 		"app?": App,
 		"rejoin?": "true",
+		"launchId?": Id,
+		"host?": "'background'",
 		"+": "reject",
 	},
 	{ op: "'retire'", eventId: Id, "+": "reject" },
@@ -211,6 +236,8 @@ const RequestShape = type.or(
 	{ op: "'off'", lease: LeaseShape, "+": "reject" },
 	{ op: "'detach'", lease: LeaseShape, "+": "reject" },
 	{ op: "'disable'", sessionId: Id, sessionFile: SafePath, projectDir: SafePath, "+": "reject" },
+	{ op: "'step-aside'", sessionId: Id, sessionFile: SafePath, projectDir: SafePath, "+": "reject" },
+	{ op: "'background'", lease: LeaseShape, "+": "reject" },
 	{
 		op: "'receipt'",
 		lease: LeaseShape,
@@ -292,6 +319,8 @@ const SessionShape = type({
 	"retirement?": RetirementShape,
 	"notify?": Notify,
 	"app?": App,
+	/** Daemon name of the background copy holding (or last holding) the lease; absent for terminal hosts. */
+	"host?": HostName,
 	"+": "delete",
 });
 const DeliveryShape = type({
@@ -340,6 +369,23 @@ const WatermarksShape = type({ "[string]": RemoteId }).narrow(
 		Object.keys(marks).length <= DISCORD_MODE_MAX_SESSIONS * 2 &&
 		Object.keys(marks).every(key => /^\d{1,22}$/.test(key)),
 );
+/**
+ * A background copy the owner started from Discord (or a terminal chose to keep running), until the copy's single-use
+ * registration claims it. `new` carries the conversation's name and first message; `channelId` hears about failures.
+ */
+const LaunchShape = type({
+	id: Id,
+	kind: "'resume' | 'new'",
+	groupId: Id,
+	"sessionId?": Id,
+	"label?": Label,
+	"message?": Text,
+	"model?": ModelSelector,
+	name: HostName,
+	channelId: RemoteId,
+	createdAt: Timestamp,
+	"+": "delete",
+});
 const JournalShape = type({
 	version: "1",
 	guildId: RemoteId,
@@ -351,8 +397,22 @@ const JournalShape = type({
 	operations: OperationsShape,
 	cards: CardShape.array().atMostLength(DISCORD_MODE_MAX_SESSIONS * 2),
 	"watermarks?": WatermarksShape,
+	"launches?": LaunchShape.array().atMostLength(MAX_LAUNCHES),
 	/** Service liveness: last heartbeat, and when a graceful stop began (cleared once back online). */
 	"service?": { "heartbeatAt?": Timestamp, "stoppedAt?": Timestamp, "+": "delete" },
+	/**
+	 * The maintained pinned guide, and what the last start announced: the guide hash plus its subcommands and sections
+	 * (a later hash change posts one what's-new note naming additions), and that start's service version.
+	 */
+	"guide?": {
+		"channelId?": RemoteId,
+		"messageId?": RemoteId,
+		"hash?": Token,
+		"commands?": Plain(64).array().atMostLength(64),
+		"sections?": Plain(100).array().atMostLength(64),
+		"version?": Plain(64),
+		"+": "delete",
+	},
 	"+": "delete",
 });
 const OwnerMessageShape = type({
@@ -369,12 +429,16 @@ const ControlShape = type({
 	channelId: RemoteId,
 	ownerId: RemoteId,
 	action:
-		"'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify' | 'settings' | 'setting' | 'discard' | 'release' | 'send-held' | 'discard-held' | 'review'",
+		"'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify' | 'settings' | 'setting' | 'discard' | 'release' | 'send-held' | 'discard-held' | 'review' | 'sessions' | 'resume' | 'new' | 'close'",
 	"connectionId?": Id,
 	"deliveryId?": Id,
 	"notify?": Notify,
 	"setting?": { kind: SettingKind, "value?": Selector.or("boolean"), "+": "reject" },
 	"query?": Plain(100),
+	"sessionId?": Id,
+	"name?": Label,
+	"message?": Text,
+	"model?": ModelSelector,
 	"+": "reject",
 });
 const RemoteAnswerShape = type({
@@ -390,6 +454,7 @@ type Session = typeof SessionShape.infer;
 type Group = typeof GroupShape.infer;
 type Delivery = typeof DeliveryShape.infer;
 type Operation = typeof OperationShape.infer;
+type Launch = typeof LaunchShape.infer;
 /** Only broker-authored, credential-free messages may cross the authenticated IPC error boundary. */
 export class DiscordModeError extends Error {}
 class UnknownEffect extends DiscordModeError {}
@@ -427,12 +492,44 @@ interface ProgressReport {
 	/** Trailing edit for a change that arrived inside the spacing window. */
 	timer?: NodeJS.Timeout;
 }
+/** One background copy to start: fixed arguments only, never names or message text. */
+export interface DiscordHostSpec {
+	/** Single-use launch id the copy presents when it registers. */
+	launchId: string;
+	/** Supervisor daemon name. */
+	name: string;
+	/** Canonical project folder from the journal; the copy's working directory. */
+	projectDir: string;
+	/** Resume: the journal's session file. Absent for a new conversation. */
+	sessionFile?: string;
+	/** New conversation only: a validated `provider/model` selector. */
+	model?: string;
+}
+/** Starts and inspects background copies; the Discord service implements it over its process supervisor. */
+export interface DiscordHostPort {
+	start(spec: DiscordHostSpec): Promise<void>;
+	/** Graceful stop (the copy tears down like a closed terminal). */
+	stop(name: string): Promise<void>;
+	/** Daemon names of background copies still starting or running. */
+	running(): Promise<string[]>;
+	/** Who holds a conversation's single-writer lock right now. */
+	holder(sessionId: string): Promise<"terminal" | "background" | undefined>;
+}
+/** A background copy asked to leave at its next idle point; never journaled. */
+interface StepAside {
+	at: number;
+	/** Since when the copy has reported idle while asked to leave. */
+	idleSince?: number;
+	stopped?: boolean;
+}
 
 /** Serialized durable routing for existing sessions; never owns or stops their engines. */
 export class DiscordModeBroker {
 	readonly #config: DiscordModeConfig;
 	readonly #storePath: string;
 	readonly #port: DiscordPort;
+	/** Present in the Discord service: starts conversations in the background. */
+	readonly #hosts: DiscordHostPort | undefined;
 	#journal: Journal;
 	#serial: Promise<void> = Promise.resolve();
 	#backlog = 0;
@@ -459,13 +556,35 @@ export class DiscordModeBroker {
 	#catchingUp = false;
 	/** Live run progress per session, never journaled; drives one line on the session card only. */
 	#progress = new Map<string, ProgressReport>();
+	/** Background copies asked to leave (owner close or terminal takeover), by session id. */
+	#stepAside = new Map<string, StepAside>();
+	/** The running build; reported in snapshots so clients can tell an update is pending. */
+	readonly #service: ModeServiceInfo | undefined;
+	/** The pinned guide this build maintains; placed once per process, on the first connected gateway. */
+	readonly #guide: DiscordGuide | undefined;
+	#guidePlaced = false;
+	#guidePending = false;
+	/** Last time a session was busy, waiting for input, or given work; a service update needs a quiet spell. */
+	#activeAt = 0;
+	/** Stopped to run an updated release: the overview says so, and refusals say it is coming back. */
+	#updating = false;
 
-	constructor(options: { config: DiscordModeConfig; storePath: string; port: DiscordPort }) {
+	constructor(options: {
+		config: DiscordModeConfig;
+		storePath: string;
+		port: DiscordPort;
+		hosts?: DiscordHostPort;
+		service?: ModeServiceInfo;
+		guide?: DiscordGuide;
+	}) {
 		RemoteId.assert(options.config.guildId);
 		RemoteId.assert(options.config.ownerId);
 		this.#config = options.config;
 		this.#storePath = options.storePath;
 		this.#port = options.port;
+		this.#hosts = options.hosts;
+		this.#service = options.service;
+		this.#guide = options.guide;
 		this.#journal = {
 			version: 1,
 			guildId: options.config.guildId,
@@ -517,10 +636,12 @@ export class DiscordModeBroker {
 					void this.#scheduleReconcile();
 					// Ready and resume both land here: fetch what the owner sent while the gateway was away.
 					this.#scheduleCatchUp();
+					void this.#scheduleGuide();
 				},
 			});
 			await this.#mutate(() => this.#reconcile(true));
 			if (crashedAt !== undefined) await this.#mutate(() => this.#announceOffline(crashedAt));
+			await this.#scheduleGuide();
 			this.#timer = setInterval(() => {
 				void this.#scheduleReconcile();
 			}, DISCORD_MODE_RECONCILE_MS);
@@ -605,10 +726,13 @@ export class DiscordModeBroker {
 			}
 			if (parsed.op === "register") return this.#register(parsed);
 			if (parsed.op === "disable") return this.#disable(parsed);
+			if (parsed.op === "step-aside") return this.#stepAsideRequest(parsed);
 			const session = this.#authorize(parsed.lease);
 			switch (parsed.op) {
 				case "poll":
 					return this.#poll(session, parsed);
+				case "background":
+					return this.#background(session);
 				case "command-result":
 					await this.#commandResult(session, parsed);
 					break;
@@ -710,7 +834,11 @@ export class DiscordModeBroker {
 	#mutate<T>(run: () => Promise<T>): Promise<T> {
 		if (!this.#running || this.#failed)
 			return Promise.reject(
-				new DiscordModeError("Discord broker is offline or private persistence failed; reconnect after repair."),
+				new DiscordModeError(
+					this.#updating
+						? SERVICE_UPDATING_TEXT
+						: "Discord broker is offline or private persistence failed; reconnect after repair.",
+				),
 			);
 		if (this.#backlog >= MAX_BACKLOG)
 			return Promise.reject(
@@ -720,7 +848,9 @@ export class DiscordModeBroker {
 		const result = this.#serial
 			.then(() => {
 				if (!this.#running || this.#failed)
-					throw new DiscordModeError("Discord broker stopped; no request was executed.");
+					throw new DiscordModeError(
+						this.#updating ? SERVICE_UPDATING_TEXT : "Discord broker stopped; no request was executed.",
+					);
 				return run();
 			})
 			.finally(() => {
@@ -880,6 +1010,12 @@ export class DiscordModeBroker {
 			throw new DiscordModeError(
 				"Project membership metadata exceeds its bounded IPC budget; use shorter absolute session paths or another explicit project directory.",
 			);
+		// A launch is single-use: a resume claims its own conversation, a new conversation its project's group and name.
+		const launch =
+			input.launchId === undefined
+				? undefined
+				: this.#claimLaunch(input.launchId, input.sessionId, session, projectDir);
+		const label = launch?.kind === "new" ? launch.label! : input.label;
 		let group = this.#journal.groups.find(item => item.projectDir === projectDir);
 		if (group && !session) this.#requireCategoryCapacity(group);
 		const newGroup = !group;
@@ -901,7 +1037,7 @@ export class DiscordModeBroker {
 				groupId: group.id,
 				sessionFile,
 				projectDir,
-				label: sessionLabel(input.label) ?? input.label,
+				label: sessionLabel(label) ?? label,
 				connectionId: input.connectionId,
 				enabled: true,
 				connected: true,
@@ -925,6 +1061,9 @@ export class DiscordModeBroker {
 			if (input.app === "omp") session.app = input.app;
 			else delete session.app;
 		}
+		// Only a background copy names its supervisor daemon; a terminal registration clears the marker.
+		if (input.host === "background") session.host = launch?.name ?? session.host ?? `haiso-s-${session.id}`;
+		else delete session.host;
 		const registered = session;
 		const selectedGroup = group;
 		await this.#perform(`register:${input.sessionId}:${input.requestId}`, registration, async () => {
@@ -958,6 +1097,7 @@ export class DiscordModeBroker {
 					{ action: "discard-held", label: "Discard" },
 				],
 			);
+		if (launch?.kind === "new") await this.#firstMessage(registered, launch);
 		registered.seenAt = Date.now();
 		return this.#snapshot(registered, true);
 	}
@@ -1145,6 +1285,7 @@ export class DiscordModeBroker {
 		this.#commands.delete(session.id);
 		clearTimeout(this.#progress.get(session.id)?.timer);
 		this.#progress.delete(session.id);
+		this.#stepAside.delete(session.id);
 	}
 
 	async #expire(): Promise<void> {
@@ -1248,6 +1389,9 @@ export class DiscordModeBroker {
 		session.seenAt = Date.now();
 		session.busy = busy;
 		session.pendingInput = pendingInput;
+		// A copy asked to leave gets no new owner turns; how long it has been idle decides a supervisor stop.
+		const leaving = this.#stepAside.get(session.id);
+		if (leaving) leaving.idleSince = busy || pendingInput ? undefined : (leaving.idleSince ?? Date.now());
 		if (input.settings || input.usage) this.#report(session, input.settings, input.usage);
 		// A progress-only change edits just this session's card, throttled; state flips re-render everything below.
 		const progressDue = this.#reportProgress(session, busy ? input.progress : undefined, changed);
@@ -1283,7 +1427,7 @@ export class DiscordModeBroker {
 				(!this.#gateway || session.state !== "ready" || this.#group(session.groupId).state !== "ready")
 			)
 				continue;
-			if (delivery.kind === "message" && (busy || pendingInput || dispatchedMessage)) continue;
+			if (delivery.kind === "message" && (busy || pendingInput || dispatchedMessage || leaving)) continue;
 			const bytes = Buffer.byteLength(JSON.stringify(publicDelivery(delivery))) + 1;
 			if (responseBytes + bytes > DISCORD_MODE_MAX_FRAME - 2048) break;
 			responseBytes += bytes;
@@ -1309,6 +1453,7 @@ export class DiscordModeBroker {
 				answers.push({ ...dialog.answer });
 				delete dialog.answer;
 			}
+		if (busy || pendingInput || deliveries.length || answers.length || commands.length) this.#activeAt = Date.now();
 		if (changed || deliveries.length || answers.length) await this.#persist();
 		if (changed || deliveries.length) await this.#cards(this.#group(session.groupId));
 		else if (progressDue) await this.#sessionCard(session);
@@ -1688,7 +1833,11 @@ export class DiscordModeBroker {
 				(input.action === "notify") !== (input.notify !== undefined) ||
 				(input.action === "setting") !== (input.setting !== undefined) ||
 				(input.action === "setting" && !input.connectionId) ||
-				(input.query !== undefined && input.action !== "settings")
+				(input.query !== undefined && input.action !== "settings") ||
+				(input.action === "new" && (input.name === undefined || input.message === undefined)) ||
+				(input.action !== "new" &&
+					(input.name !== undefined || input.message !== undefined || input.model !== undefined)) ||
+				(input.sessionId !== undefined && input.action !== "resume")
 			)
 				throw new Error("Invalid control fields");
 		} catch {
@@ -1698,6 +1847,9 @@ export class DiscordModeBroker {
 			throw new DiscordModeError("Only the configured owner can use session controls.");
 		await this.#expire();
 		await this.#consumeRetirements();
+		// Project-wide actions work in a project's overview and in any of its session channels.
+		if (input.action === "sessions" || input.action === "resume" || input.action === "new")
+			return this.#launchControl(input);
 		const session = this.#journal.sessions.find(item => item.channelId === input.channelId);
 		if (!session) throw new DiscordModeError("This channel is not bound to a session.");
 		if (session.retirement) {
@@ -1713,6 +1865,7 @@ export class DiscordModeBroker {
 		await this.#expire();
 		await this.#persist();
 		this.#requireRemote(session, false);
+		if (input.action === "close") return this.#closeControl(session);
 		// Saved-message buttons outlive the connection that was current when they were posted.
 		if (
 			input.action === "discard" ||
@@ -1839,6 +1992,382 @@ export class DiscordModeBroker {
 		return {
 			text: send ? `Sending ${noun} in order as the session becomes idle.` : `Discarded ${noun}.`,
 		};
+	}
+
+	/**
+	 * `sessions`, `resume`, `new`: owner-only (checked by the caller), inside one project the journal knows; nothing
+	 * here reaches a folder, file, or argument that did not come from the journal or a strict pattern.
+	 */
+	async #launchControl(input: ModeControlRequest): Promise<ModeControlResult> {
+		if (!this.#hosts)
+			throw new DiscordModeError(
+				"This Discord service can't start conversations in the background. Update Haiso, then restart the service.",
+			);
+		const group = await this.#controlGroup(input.channelId);
+		if (input.action === "sessions") {
+			const resumable = this.#journal.sessions
+				.filter(session => session.groupId === group.id && this.#resumable(session))
+				.sort((left, right) => right.seenAt - left.seenAt)
+				.slice(0, DISCORD_MODE_MAX_SHORTLIST)
+				.map(session => ({ id: session.id, label: session.label }));
+			return {
+				text: resumable.length
+					? `${resumable.length} closed conversation${resumable.length === 1 ? "" : "s"} in ${group.name} can be resumed. Pick one to start it in the background.`
+					: `No closed conversation in ${group.name} can be resumed from Discord right now.`,
+				resumable,
+			};
+		}
+		let result: ModeControlResult = { text: "This request was already handled; nothing new was started." };
+		await this.#perform(`control:${input.id}`, input, async () => {
+			result = input.action === "new" ? await this.#launchNew(group, input) : await this.#launchResume(group, input);
+		});
+		await this.#cards(group);
+		return result;
+	}
+
+	/** The project a channel belongs to: its overview, a bound session channel, or another channel in its category. */
+	async #controlGroup(channelId: string): Promise<Group> {
+		const bound = this.#journal.sessions.find(session => session.channelId === channelId);
+		let group = this.#journal.groups.find(item => item.overviewId === channelId || item.id === bound?.groupId);
+		if (!group) {
+			const inspected = await this.#inspect(channelId);
+			const parentId = inspected.state === "found" ? inspected.channel.parentId : undefined;
+			if (parentId) group = this.#journal.groups.find(item => item.categoryId === parentId);
+		}
+		if (!group)
+			throw new DiscordModeError("Use this in a Haiso project's #overview or in one of its session channels.");
+		await this.#reconcileGroup(group);
+		if (!this.#gateway || group.state !== "ready")
+			throw new DiscordModeError(
+				"This project's Discord category needs repair first (/discord repair at your desk); nothing was started.",
+			);
+		return group;
+	}
+
+	/** A closed, still shared Haiso conversation with a usable channel: the only kind Discord may resume. */
+	#resumable(session: Session): boolean {
+		return (
+			session.enabled &&
+			!session.retirement &&
+			!this.#live(session) &&
+			(session.app ?? "haiso") === "haiso" &&
+			session.state === "ready" &&
+			session.channelId !== undefined &&
+			!this.#journal.launches?.some(launch => launch.sessionId === session.id)
+		);
+	}
+
+	async #launchResume(group: Group, input: ModeControlRequest): Promise<ModeControlResult> {
+		const session = this.#journal.sessions.find(item =>
+			input.sessionId === undefined ? item.channelId === input.channelId : item.id === input.sessionId,
+		);
+		if (!session || session.groupId !== group.id)
+			throw new DiscordModeError("That conversation isn't part of this project; nothing was started.");
+		if (session.retirement)
+			throw new DiscordModeError("This conversation was permanently deleted; it can't be resumed.");
+		await this.#reconcileSession(session, false);
+		if (this.#live(session))
+			return {
+				text: session.host
+					? "It's already running in the background."
+					: "It's open at your desk right now; nothing was started.",
+			};
+		if (this.#journal.launches?.some(launch => launch.sessionId === session.id))
+			return { text: "It's already starting in the background." };
+		if ((session.app ?? "haiso") !== "haiso")
+			throw new DiscordModeError("This is an OMP session; resume it in OMP at your desk.");
+		if (!session.enabled)
+			throw new DiscordModeError("Sharing is off for this conversation; turn it on at your desk first.");
+		if (!this.#resumable(session))
+			throw new DiscordModeError(
+				"This conversation's channel needs repair first (/discord repair at your desk); nothing was started.",
+			);
+		const holder = await this.#hosts!.holder(session.id);
+		if (holder)
+			return {
+				text:
+					holder === "terminal"
+						? "It's open in a terminal right now; close it there first."
+						: "It's already running in the background.",
+			};
+		const [file, folder] = await Promise.all([
+			fs.stat(session.sessionFile).catch(() => undefined),
+			fs.stat(session.projectDir).catch(() => undefined),
+		]);
+		if (!file?.isFile() || !folder?.isDirectory())
+			throw new DiscordModeError(
+				"Its conversation file or project folder is missing on this computer; nothing was started.",
+			);
+		await this.#launch(
+			{
+				kind: "resume",
+				groupId: group.id,
+				sessionId: session.id,
+				name: `haiso-s-${session.id}`,
+				channelId: session.channelId!,
+			},
+			{ projectDir: session.projectDir, sessionFile: session.sessionFile },
+		);
+		return {
+			text: `Starting ${session.label} in the background. It reconnects in <#${session.channelId}> shortly; messages saved while it was closed are offered there.`,
+		};
+	}
+
+	async #launchNew(group: Group, input: ModeControlRequest): Promise<ModeControlResult> {
+		const name = input.name!.trim();
+		try {
+			sessionChannelName(name);
+		} catch {
+			throw new DiscordModeError(
+				"Choose a name with letters, numbers, underscores, or hyphens; nothing was started.",
+			);
+		}
+		if (input.model !== undefined && !this.#knownModels().has(input.model))
+			throw new DiscordModeError(
+				`Model ${input.model} isn't one a running session offers. Leave it empty for the default model; nothing was started.`,
+			);
+		this.#requireCategoryCapacity(group);
+		if (!(await fs.stat(group.projectDir).catch(() => undefined))?.isDirectory())
+			throw new DiscordModeError("This project's folder is missing on this computer; nothing was started.");
+		const id = randomUUID();
+		await this.#launch(
+			{
+				kind: "new",
+				groupId: group.id,
+				label: name,
+				message: input.message!,
+				...(input.model === undefined ? {} : { model: input.model }),
+				name: `haiso-n-${id}`,
+				channelId: input.channelId,
+			},
+			{ projectDir: group.projectDir },
+			id,
+		);
+		return {
+			text: `Starting ${name} in the background. Its channel appears in this project shortly, and your first message runs there.`,
+		};
+	}
+
+	/** Models a connected session reported: the only `--model` values a new conversation may start with. */
+	#knownModels(): Set<string> {
+		const known = new Set<string>();
+		for (const report of this.#settings.values())
+			for (const model of [...(report.view?.models ?? []), ...(report.view?.shortlist ?? [])])
+				known.add(model.selector);
+		return known;
+	}
+
+	/** Journal the launch, then start its copy; a copy that can't be started drops the launch again. */
+	async #launch(
+		fields: Omit<Launch, "id" | "createdAt">,
+		target: { projectDir: string; sessionFile?: string },
+		id: string = randomUUID(),
+	): Promise<void> {
+		const hosts = this.#hosts!;
+		let running: string[];
+		try {
+			running = await hosts.running();
+		} catch {
+			throw new DiscordModeError("The process supervisor is unavailable; nothing was started.");
+		}
+		if (running.includes(fields.name)) throw new DiscordModeError("It's already starting in the background.");
+		if (running.length >= DISCORD_MODE_MAX_BACKGROUND)
+			throw new DiscordModeError(
+				`${DISCORD_MODE_MAX_BACKGROUND} conversations are already running in the background. Close one with /session close first; nothing was started.`,
+			);
+		const launches = this.#journal.launches ?? [];
+		if (launches.length >= MAX_LAUNCHES)
+			throw new DiscordModeError("Too many conversations are starting at once; try again in a minute.");
+		const launch: Launch = { ...fields, id, createdAt: Date.now() };
+		this.#journal.launches = [...launches, launch];
+		await this.#persist();
+		try {
+			await hosts.start({
+				launchId: launch.id,
+				name: launch.name,
+				projectDir: target.projectDir,
+				...(target.sessionFile === undefined ? {} : { sessionFile: target.sessionFile }),
+				...(launch.model === undefined ? {} : { model: launch.model }),
+			});
+		} catch {
+			this.#journal.launches = this.#journal.launches?.filter(item => item.id !== launch.id);
+			await this.#persist();
+			throw new DiscordModeError("The process supervisor couldn't start the background copy; nothing was started.");
+		}
+	}
+
+	/** Takes the launch a registration claims (single use); a mismatched or expired one attaches nothing. */
+	#claimLaunch(launchId: string, sessionId: string, session: Session | undefined, projectDir: string): Launch {
+		const launches = this.#journal.launches ?? [];
+		const launch = launches.find(item => item.id === launchId);
+		const group = this.#journal.groups.find(item => item.id === launch?.groupId);
+		if (
+			!launch ||
+			!group ||
+			Date.now() - launch.createdAt >= DISCORD_MODE_LAUNCH_TTL_MS ||
+			(launch.kind === "resume"
+				? launch.sessionId !== sessionId || session?.groupId !== group.id
+				: session !== undefined || group.projectDir !== projectDir)
+		)
+			throw new DiscordModeError(
+				"This background launch is unknown, expired, or for another conversation; nothing was attached.",
+			);
+		this.#journal.launches = launches.filter(item => item !== launch);
+		return launch;
+	}
+
+	/** A new conversation's first owner message, queued like any other once its copy is attached. */
+	async #firstMessage(session: Session, launch: Launch): Promise<void> {
+		const group = this.#group(session.groupId);
+		let queued = true;
+		try {
+			await this.#perform(`launch:${launch.id}`, { launchId: launch.id, sessionId: session.id }, async () => {
+				this.#enqueue(session, this.#config.ownerId, "owner", "message", launch.message!);
+			});
+		} catch {
+			queued = false;
+		}
+		await this.#cards(group);
+		const overviewId = group.overviewId;
+		if (!overviewId || !this.#gateway) return;
+		const where = session.channelId ? `<#${session.channelId}>` : session.label;
+		try {
+			await this.#external(() =>
+				this.#port.publish(
+					overviewId,
+					queued
+						? `Started ${where} in the background; your first message runs there.`
+						: `Started ${where} in the background, but its first message couldn't be queued; send it again there.`,
+					`launch:${launch.id}`,
+				),
+			);
+		} catch {
+			/* The new channel and its card show the conversation either way. */
+		}
+	}
+
+	/** Close a background copy at its next idle point; history and sharing stay. Terminals close at the desk. */
+	#closeControl(session: Session): ModeControlResult {
+		if (!this.#live(session))
+			return {
+				text: "This session is already closed. History and sharing are kept; Resume starts it again.",
+			};
+		if (!session.host) return { text: "This session is open in a terminal; close it there." };
+		if (!this.#stepAside.has(session.id)) this.#stepAside.set(session.id, { at: Date.now() });
+		return {
+			text:
+				session.busy || session.pendingInput
+					? "It will close after this turn. History and sharing are kept."
+					: "Closing it now. History and sharing are kept.",
+		};
+	}
+
+	/** A terminal takes over from a background copy: by native identity like `disable`, never with a lease. */
+	async #stepAsideRequest(input: Extract<ModeRequest, { op: "step-aside" }>): Promise<ModeSnapshot> {
+		const session = this.#journal.sessions.find(item => item.id === input.sessionId);
+		if (!session) throw new DiscordModeError("This conversation is not shared with Discord.");
+		const sessionFile = path.join(
+			await canonicalProjectDir(path.dirname(input.sessionFile)),
+			path.basename(input.sessionFile),
+		);
+		if (session.projectDir !== (await canonicalProjectDir(input.projectDir)) || session.sessionFile !== sessionFile)
+			throw new DiscordModeError(
+				"Persistent session UUID is bound to a different project directory or session file.",
+			);
+		if (this.#live(session)) {
+			if (!session.host)
+				throw new DiscordModeError("Another terminal holds this conversation's Discord connection.");
+			if (!this.#stepAside.has(session.id)) this.#stepAside.set(session.id, { at: Date.now() });
+		}
+		return this.#snapshot(session);
+	}
+
+	/** The terminal closes but its conversation keeps running: start a background copy, then drop this lease. */
+	async #background(session: Session): Promise<ModeSnapshot> {
+		if (!this.#hosts)
+			throw new DiscordModeError("This Discord service can't keep conversations running in the background.");
+		if ((session.app ?? "haiso") !== "haiso")
+			throw new DiscordModeError("Only Haiso conversations can keep running in the background.");
+		await this.#reconcileSession(session);
+		this.#requireRemote(session);
+		await this.#launch(
+			{
+				kind: "resume",
+				groupId: session.groupId,
+				sessionId: session.id,
+				name: `haiso-s-${session.id}`,
+				channelId: session.channelId!,
+			},
+			{ projectDir: session.projectDir, sessionFile: session.sessionFile },
+		);
+		// The copy waits for this terminal to release the conversation, then claims the launch.
+		this.#revoke(session);
+		await this.#persist();
+		await this.#cards(this.#group(session.groupId));
+		return this.#snapshot(session);
+	}
+
+	/**
+	 * Launches whose copy stopped before claiming them failed to start: say so where the owner asked. A copy still
+	 * starting when its launch expires is stopped.
+	 */
+	async #checkLaunches(): Promise<void> {
+		const hosts = this.#hosts;
+		const launches = this.#journal.launches ?? [];
+		const now = Date.now();
+		if (!hosts || !launches.some(launch => now - launch.createdAt >= DISCORD_MODE_LAUNCH_GRACE_MS)) return;
+		let running: string[];
+		try {
+			running = await hosts.running();
+		} catch {
+			return;
+		}
+		const failed = launches.filter(
+			launch =>
+				now - launch.createdAt >= DISCORD_MODE_LAUNCH_GRACE_MS &&
+				(!running.includes(launch.name) || now - launch.createdAt >= DISCORD_MODE_LAUNCH_TTL_MS),
+		);
+		if (!failed.length) return;
+		this.#journal.launches = launches.filter(launch => !failed.includes(launch));
+		await this.#persist();
+		for (const launch of failed) {
+			if (running.includes(launch.name)) await hosts.stop(launch.name).catch(() => {});
+			const label = launch.label ?? this.#journal.sessions.find(session => session.id === launch.sessionId)?.label;
+			try {
+				await this.#external(() =>
+					this.#port.publish(
+						launch.channelId,
+						`Couldn't start ${label ?? "the conversation"} in the background: it stopped before reconnecting to Discord. Check that its model and project still open at your desk, then try again.`,
+						`launch-failed:${launch.id}`,
+					),
+				);
+			} catch {
+				/* Its card reads Closed again either way. */
+			}
+			const group = this.#journal.groups.find(item => item.id === launch.groupId);
+			if (group) await this.#cards(group);
+		}
+	}
+
+	/** A copy asked to leave that stays idle without leaving (a stuck exit) is stopped gracefully by its supervisor. */
+	async #checkStepAside(): Promise<void> {
+		const hosts = this.#hosts;
+		if (!hosts) return;
+		for (const [sessionId, leaving] of this.#stepAside) {
+			const session = this.#journal.sessions.find(item => item.id === sessionId);
+			if (!session?.host || !this.#live(session)) {
+				this.#stepAside.delete(sessionId);
+				continue;
+			}
+			if (
+				leaving.stopped ||
+				leaving.idleSince === undefined ||
+				Date.now() - leaving.idleSince < DISCORD_MODE_STEP_ASIDE_STOP_MS
+			)
+				continue;
+			leaving.stopped = true;
+			await hosts.stop(session.host).catch(() => {});
+		}
 	}
 
 	/** One best-effort saved-message notice; never repeated for its key, never fails the caller. */
@@ -2567,6 +3096,8 @@ export class DiscordModeBroker {
 				touched.add(session.groupId);
 			}
 		}
+		await this.#checkLaunches();
+		await this.#checkStepAside();
 		this.#journal.service = { heartbeatAt: Date.now() };
 		await this.#persist();
 		for (const groupId of touched) {
@@ -2579,9 +3110,16 @@ export class DiscordModeBroker {
 	#sessionActivity(session: Session): string {
 		if (session.retirement) return "Permanently deleted";
 		if (!session.enabled) return "Off";
-		if (!this.#live(session)) return "Closed · resume at your desk";
-		if (session.pendingInput) return "Online · Waiting for input";
-		return session.busy ? "Online · Working" : "Online · Idle";
+		if (!this.#live(session)) {
+			if (this.#journal.launches?.some(launch => launch.sessionId === session.id))
+				return "Starting in the background…";
+			return this.#hosts && (session.app ?? "haiso") === "haiso"
+				? "Closed · resume here or at your desk"
+				: "Closed · resume at your desk";
+		}
+		const online = session.host ? "Online in the background" : "Online";
+		if (session.pendingInput) return `${online} · Waiting for input`;
+		return session.busy ? `${online} · Working` : `${online} · Idle`;
 	}
 
 	/** `progress` replaces the `<activity> · <state>` line on the session card; cards render only ready bindings. */
@@ -2622,7 +3160,11 @@ export class DiscordModeBroker {
 			return rows.length ? [`\n${APP_TAGS[app]} sessions\n${rows.join("\n")}`] : [];
 		});
 		const service =
-			this.#stoppedAt === undefined ? "Online" : `Offline since <t:${Math.floor(this.#stoppedAt / 1000)}:f>`;
+			this.#stoppedAt === undefined
+				? "Online"
+				: this.#updating
+					? "Updating — back in a moment"
+					: `Offline since <t:${Math.floor(this.#stoppedAt / 1000)}:f>`;
 		return `Haiso · ${group.name}\n${group.projectDir}\nDiscord service: ${service}\n${sections.join("\n")}`;
 	}
 
@@ -2649,6 +3191,7 @@ export class DiscordModeBroker {
 			this.#controlConnection(session),
 			false,
 			session.app ?? "haiso",
+			this.#hosts !== undefined && this.#resumable(session),
 		);
 	}
 
@@ -2658,8 +3201,10 @@ export class DiscordModeBroker {
 		connectionId?: string,
 		existingOnly = false,
 		app?: ModeApp,
+		/** Closed session card with [Resume]; only brokers that can start background copies set it. */
+		resumable = false,
 	): Promise<void> {
-		const fingerprint = digest([text, connectionId, app]);
+		const fingerprint = digest(resumable ? [text, connectionId, app, resumable] : [text, connectionId, app]);
 		let card = this.#journal.cards.find(item => item.channelId === channelId);
 		// Only exact saved-message replacement is retryable. This mode cannot create
 		// a notice when inspection fails or the saved message has disappeared.
@@ -2695,6 +3240,7 @@ export class DiscordModeBroker {
 					previousMessageId,
 					existingOnly,
 					app,
+					resumable,
 				),
 			);
 			if (existingOnly && messageId !== previousMessageId)
@@ -2704,6 +3250,87 @@ export class DiscordModeBroker {
 		} catch {
 			card.state = "unknown";
 		}
+		await this.#persist();
+	}
+
+	/**
+	 * Stops taking work, atomically with every other request, only when nothing is in flight and nothing was for
+	 * DISCORD_MODE_SWITCH_QUIET_MS: no busy or input-waiting session, no dispatched, accepted, or dispatchable delivery,
+	 * no open dialog, no pending settings change, no Discord event being handled. The caller then closes the service to
+	 * run the updated release; until then every request is refused as "restarting for an update".
+	 */
+	stopIfQuiescent(): Promise<boolean> {
+		return this.#mutate(async () => {
+			const live = new Set(this.#journal.sessions.filter(session => this.#live(session)).map(session => session.id));
+			const quiet =
+				Date.now() - this.#activeAt >= DISCORD_MODE_SWITCH_QUIET_MS &&
+				// This mutation is the only one queued.
+				this.#backlog === 1 &&
+				!this.#reconcilePending &&
+				!this.#catchingUp &&
+				!this.#port.busy?.() &&
+				!this.#journal.dialogs.length &&
+				![...this.#commands.values()].some(queue => queue.length) &&
+				!this.#journal.sessions.some(session => live.has(session.id) && (session.busy || session.pendingInput)) &&
+				!this.#journal.deliveries.some(
+					delivery =>
+						delivery.state === "dispatched" ||
+						delivery.state === "accepted" ||
+						(delivery.state === "queued" && !delivery.held && live.has(delivery.sessionId)),
+				);
+			if (!quiet) return false;
+			this.#running = false;
+			this.#updating = true;
+			return true;
+		}).catch(() => false);
+	}
+
+	/** Places the pinned guide once per process on a connected gateway; a failed attempt retries on reconnect. */
+	#scheduleGuide(): Promise<void> {
+		if (
+			!this.#guide ||
+			!this.#port.guide ||
+			this.#guidePlaced ||
+			this.#guidePending ||
+			!this.#gateway ||
+			!this.#running
+		)
+			return Promise.resolve();
+		this.#guidePending = true;
+		return this.#mutate(() => this.#maintainGuide())
+			.catch(() => {})
+			.finally(() => {
+				this.#guidePending = false;
+			});
+	}
+
+	/** Ensures the guide; after an update that changed it (never on the first start), posts one what's-new note. */
+	async #maintainGuide(): Promise<void> {
+		const guide = this.#guide;
+		if (!guide || this.#guidePlaced || !this.#gateway) return;
+		const saved = this.#journal.guide;
+		const note =
+			saved?.hash !== undefined && saved.hash !== guide.hash
+				? { text: discordGuideWhatsNew(saved, guide), key: `whatsnew:${guide.hash}` }
+				: undefined;
+		const placement = await this.#external(async () =>
+			this.#port.guide?.({
+				text: guide.text,
+				...(saved?.channelId && saved.messageId
+					? { saved: { channelId: saved.channelId, messageId: saved.messageId } }
+					: {}),
+				exclude: this.#journal.groups.flatMap(group => group.categoryId ?? []),
+				...(note ? { note } : {}),
+			}),
+		);
+		this.#guidePlaced = true;
+		this.#journal.guide = {
+			...(placement ? { channelId: placement.channelId, messageId: placement.messageId } : {}),
+			hash: guide.hash,
+			commands: guide.commands,
+			sections: guide.sections,
+			...(this.#service ? { version: this.#service.version } : {}),
+		};
 		await this.#persist();
 	}
 
@@ -2723,6 +3350,9 @@ export class DiscordModeBroker {
 			maxReply: DISCORD_MODE_MAX_REPLY,
 			settingsRevision: this.#settingsFor(session)?.view?.revision ?? "",
 			progress: true,
+			...(this.#hosts ? { background: true as const } : {}),
+			...(this.#stepAside.has(session.id) ? { stepAside: true as const } : {}),
+			...(this.#service ? { service: { ...this.#service } } : {}),
 		};
 	}
 

@@ -8,10 +8,12 @@ const allowedInputs: Record<string, true> = {
 	"packages/omp-bridge/src/index.ts": true,
 	"packages/omp-bridge/src/host.ts": true,
 	"packages/omp-bridge/src/session.ts": true,
+	"packages/omp-bridge/src/service.ts": true,
 	"packages/omp-bridge/prompts/bridge.md": true,
 	"packages/omp-bridge/prompts/peer.md": true,
 	"packages/utils/src/discord-client.ts": true,
 	"packages/utils/src/discord-private-files.ts": true,
+	"packages/utils/src/discord-progress.ts": true,
 	"packages/wire/src/discord-mode.ts": true,
 };
 

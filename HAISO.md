@@ -54,7 +54,7 @@ First install, from this checkout, with any Bun ≥ 1.4: `bun scripts/haiso/upda
 
 ## Changes vs OMP
 
-- Discord session mode: project categories, one channel per session, remote replies/approvals, `/session status|stop|queue|notify|settings` (model, effort, context; advisor and plan mode for Haiso), owner pings when a session needs you, long replies attached as `.md`, automatic reconnect after sleep or broker restarts, sharing remembered per conversation (rejoins on resume), 🟣 Haiso / 🔵 OMP channel markers, peer messaging, and a choice to keep or delete the Discord channel when a session is deleted.
+- Discord session mode: project categories, one channel per session, remote replies/approvals, `/session status|stop|queue|notify|settings` (model, effort, context; advisor and plan mode for Haiso), owner pings when a session needs you, long replies attached as `.md`, automatic reconnect after sleep or broker restarts, sharing remembered per conversation (rejoins on resume), 🟣 Haiso / 🔵 OMP channel markers, an always-on service with saved and missed messages, live progress on cards, background conversations started or resumed from Discord, a self-updating pinned guide, OMP bridge auto-loaded, peer messaging, and a choice to keep or delete the Discord channel when a session is deleted.
 - `omp-bridge` connector for official OMP.
 - Separate `haiso` command, immutable releases, guarded updates that follow the installed `omp` version.
 - Session pickers support custom delete choices.

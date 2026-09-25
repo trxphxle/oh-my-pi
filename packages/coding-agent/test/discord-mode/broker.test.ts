@@ -8,10 +8,19 @@ import {
 	DISCORD_MODE_CATCH_UP_LIMIT,
 	DISCORD_MODE_CATCH_UP_MS,
 	DISCORD_MODE_LONG_TURN_MS,
+	DISCORD_MODE_LAUNCH_GRACE_MS,
+	DISCORD_MODE_LAUNCH_TTL_MS,
+	DISCORD_MODE_MAX_BACKGROUND,
 	DISCORD_MODE_PROGRESS_CARD_MS,
+	DISCORD_MODE_STEP_ASIDE_STOP_MS,
+	DISCORD_MODE_SWITCH_QUIET_MS,
 	DiscordModeBroker,
 	DiscordModeError,
+	type DiscordHostPort,
+	type DiscordHostSpec,
+	SERVICE_UPDATING_TEXT,
 } from "../../src/discord-mode/broker";
+import { renderDiscordGuide } from "../../src/discord-mode/guide";
 import { DiscordModeSession, type DiscordSessionEngine } from "../../src/discord-mode/session";
 import { settingsChoiceToken } from "../../src/discord-mode/settings-view";
 import { connectDiscordModeAt, sealModeSettingsView } from "@oh-my-pi/pi-utils/discord-client";
@@ -61,7 +70,10 @@ class FixtureDiscord implements DiscordPort {
 		key: string;
 		mention: boolean;
 	}> = [];
-	readonly cards = new Map<string, { id: string; text: string; connectionId?: string; app?: ModeApp }>();
+	readonly cards = new Map<
+		string,
+		{ id: string; text: string; connectionId?: string; app?: ModeApp; resumable?: true }
+	>();
 	readonly legacyCards = new Set<string>();
 	readonly dialogs = new Map<string, ModeDialog>();
 	readonly shownDialogs: Array<{ title: string; mention: boolean }> = [];
@@ -191,6 +203,7 @@ class FixtureDiscord implements DiscordPort {
 		messageId?: string,
 		existingOnly = false,
 		app?: ModeApp,
+		resumable = false,
 	): Promise<string> {
 		if (this.failNextStatusInspection) {
 			this.failNextStatusInspection = false;
@@ -201,7 +214,7 @@ class FixtureDiscord implements DiscordPort {
 			throw new Error("exact saved status message unavailable; replacement is forbidden");
 		if (messageId && existing?.id !== messageId) messageId = undefined;
 		const id = messageId ?? (this.legacyCards.has(channelId) ? existing?.id : undefined);
-		const card = { id: id ?? String(this.#next++), text, connectionId, app };
+		const card = { id: id ?? String(this.#next++), text, connectionId, app, ...(resumable ? { resumable } : {}) };
 		if (!id) this.statusCreates++;
 		this.cards.set(channelId, card);
 		this.legacyCards.delete(channelId);
@@ -3078,6 +3091,600 @@ describe("service liveness, saved and missed messages", () => {
 			const written = await journal(storePath);
 			expect(JSON.stringify(written)).not.toContain("future");
 			expect(written.deliveries.map((item: { text: string }) => item.text)).toEqual(["pending across versions"]);
+		} finally {
+			await broker.close();
+		}
+	});
+});
+
+describe("service updates: version, pinned guide, and idle switchover", () => {
+	type GuideInput = Parameters<NonNullable<DiscordPort["guide"]>>[0];
+	/** Records guide requests; the adapter's placement rules are covered in discord.test.ts. */
+	class GuideDiscord extends FixtureDiscord {
+		readonly guides: GuideInput[] = [];
+		inbound = false;
+		async guide(input: GuideInput) {
+			this.guides.push(structuredClone(input));
+			return { channelId: "900", messageId: "901" };
+		}
+		busy() {
+			return this.inbound;
+		}
+	}
+	const TEMPLATE = "**Haiso — Discord guide**\n\n**In a session channel**\n{{commands}}";
+	function guideWith(names: string[], extra = "") {
+		return renderDiscordGuide(
+			names.map(name => ({ name, description: `Do ${name}`, choices: [] })),
+			TEMPLATE + extra,
+		);
+	}
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("reports its build, maintains the guide, and notes only what a later release added", async () => {
+		using temporary = TempDir.createSync("@discord-guide-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new GuideDiscord();
+		const first = guideWith(["status", "stop"]);
+		const service = { version: "18.3.0", commit: "a63bfb949a12", release: path.join(root, "release") };
+		let broker = new DiscordModeBroker({ config, storePath, port, guide: first, service });
+		await broker.start();
+		try {
+			// First ever start: no saved placement, no what's-new note.
+			expect(port.guides).toEqual([{ text: first.text, exclude: [] }]);
+			const session = await broker.request(registration(root, "guide"));
+			expect(session.service).toEqual(service);
+			await broker.close();
+			expect(JSON.parse(await fs.readFile(storePath, "utf8")).guide).toEqual({
+				channelId: "900",
+				messageId: "901",
+				hash: first.hash,
+				commands: ["status", "stop"],
+				sections: ["In a session channel"],
+				version: "18.3.0",
+			});
+
+			broker = new DiscordModeBroker({ config, storePath, port, guide: first });
+			await broker.start();
+			expect(port.guides[1]).toEqual({
+				text: first.text,
+				saved: { channelId: "900", messageId: "901" },
+				exclude: [session.group.categoryId!],
+			});
+			await broker.close();
+
+			const next = guideWith(["status", "stop", "resume"], "\n\n**Sessions**\nStart them from Discord.");
+			broker = new DiscordModeBroker({ config, storePath, port, guide: next });
+			await broker.start();
+			expect(port.guides[2]?.note).toEqual({
+				text: "Haiso updated · new: `/session resume`, Sessions",
+				key: `whatsnew:${next.hash}`,
+			});
+			await broker.close();
+
+			broker = new DiscordModeBroker({ config, storePath, port, guide: next });
+			await broker.start();
+			expect(port.guides).toHaveLength(4);
+			expect(port.guides[3]?.note).toBeUndefined();
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("places the guide once Discord connects when it was offline at start", async () => {
+		using temporary = TempDir.createSync("@discord-guide-offline-");
+		const root = temporary.path();
+		const port = new GuideDiscord();
+		port.online = false;
+		const broker = new DiscordModeBroker({
+			config,
+			storePath: path.join(root, "private", "state.json"),
+			port,
+			guide: guideWith(["status"]),
+		});
+		await broker.start();
+		try {
+			expect(port.guides).toEqual([]);
+			port.handlers!.connection(true);
+			await broker.lookup(root, randomUUID()); // Serialized after the guide.
+			port.handlers!.connection(true);
+			await broker.lookup(root, randomUUID());
+			expect(port.guides).toHaveLength(1);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("stops for an update only after a quiet spell, never with work in flight", async () => {
+		using temporary = TempDir.createSync("@discord-switch-quiet-");
+		const root = temporary.path();
+		const port = new GuideDiscord();
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "switch"));
+			const overviewId = session.group.overviewId!;
+			// Every request below lands within one lease of the previous poll.
+			await poll(broker, session, true);
+			now += DISCORD_MODE_SWITCH_QUIET_MS;
+			expect(await broker.stopIfQuiescent()).toBe(false); // Mid-turn.
+			await broker.request({ op: "poll", lease: lease(session), busy: false, pendingInput: true });
+			now += DISCORD_MODE_SWITCH_QUIET_MS;
+			expect(await broker.stopIfQuiescent()).toBe(false); // Waiting for the owner.
+			await poll(broker, session);
+
+			// Queued owner work, then its dispatched and accepted turn.
+			const queued = await port.owner(session, "one more thing");
+			now += DISCORD_MODE_SWITCH_QUIET_MS;
+			expect(await broker.stopIfQuiescent()).toBe(false);
+			expect((await poll(broker, session)).deliveries).toHaveLength(1);
+			now += DISCORD_MODE_SWITCH_QUIET_MS;
+			expect(await broker.stopIfQuiescent()).toBe(false);
+			await broker.request({
+				op: "receipt",
+				lease: lease(session),
+				deliveryId: queued.deliveryId!,
+				state: "accepted",
+			});
+			await poll(broker, session);
+			now += DISCORD_MODE_SWITCH_QUIET_MS;
+			expect(await broker.stopIfQuiescent()).toBe(false);
+			await broker.request({
+				op: "receipt",
+				lease: lease(session),
+				deliveryId: queued.deliveryId!,
+				state: "completed",
+			});
+			await poll(broker, session);
+
+			// An open dialog, then a Discord event still being handled.
+			await broker.request({
+				op: "dialog",
+				lease: lease(session),
+				dialog: { id: "ask-1", kind: "confirm", title: "Proceed?" },
+			});
+			now += DISCORD_MODE_SWITCH_QUIET_MS;
+			await poll(broker, session);
+			expect(await broker.stopIfQuiescent()).toBe(false);
+			await broker.request({ op: "dialog-end", lease: lease(session), dialogId: "ask-1" });
+			port.inbound = true;
+			now += DISCORD_MODE_SWITCH_QUIET_MS;
+			await poll(broker, session);
+			expect(await broker.stopIfQuiescent()).toBe(false);
+			port.inbound = false;
+
+			// Idle now, but only a full quiet spell after the last activity counts.
+			await poll(broker, session, true);
+			const lastActive = now;
+			now = lastActive + 1_000;
+			await poll(broker, session);
+			now = lastActive + DISCORD_MODE_SWITCH_QUIET_MS - 1;
+			expect(await broker.stopIfQuiescent()).toBe(false);
+			now = lastActive + DISCORD_MODE_SWITCH_QUIET_MS;
+			expect(await broker.stopIfQuiescent()).toBe(true);
+			await expect(poll(broker, session)).rejects.toThrow(SERVICE_UPDATING_TEXT);
+			await expect(port.owner(session, "during the switch")).rejects.toThrow(SERVICE_UPDATING_TEXT);
+			await broker.close();
+			expect(port.cards.get(overviewId)?.text).toContain("Discord service: Updating — back in a moment");
+		} finally {
+			await broker.close();
+		}
+	});
+});
+
+describe("background conversations from Discord", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	/** Records supervisor starts and stops; `live` are copies still running, `holders` the conversation locks. */
+	class FakeHosts implements DiscordHostPort {
+		readonly started: DiscordHostSpec[] = [];
+		readonly stopped: string[] = [];
+		readonly live = new Set<string>();
+		readonly holders = new Map<string, "terminal" | "background">();
+		async start(spec: DiscordHostSpec): Promise<void> {
+			this.started.push(spec);
+			this.live.add(spec.name);
+		}
+		async stop(name: string): Promise<void> {
+			this.stopped.push(name);
+			this.live.delete(name);
+		}
+		async running(): Promise<string[]> {
+			return [...this.live];
+		}
+		async holder(sessionId: string): Promise<"terminal" | "background" | undefined> {
+			return this.holders.get(sessionId);
+		}
+	}
+
+	async function serviceBroker(root: string, hosts: FakeHosts | null = new FakeHosts(), port = new FixtureDiscord()) {
+		const storePath = path.join(root, "private", "state.json");
+		const broker = new DiscordModeBroker({ config, storePath, port, ...(hosts ? { hosts } : {}) });
+		await broker.start();
+		return { storePath, port, hosts: hosts ?? new FakeHosts(), broker };
+	}
+
+	/** An enrolled conversation whose file and project exist on disk, closed (still shared) unless `open`. */
+	async function conversation(
+		broker: DiscordModeBroker,
+		root: string,
+		label: string,
+		options: { open?: boolean; app?: "omp"; projectDir?: string } = {},
+	) {
+		const input = { ...registration(root, label, options.projectDir), ...(options.app ? { app: options.app } : {}) };
+		await fs.mkdir(input.projectDir, { recursive: true });
+		await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+		const snapshot = await broker.request(input);
+		if (!options.open) await broker.request({ op: "detach", lease: lease(snapshot) });
+		return { input, snapshot };
+	}
+
+	function claim(input: Extract<ModeRequest, { op: "register" }>, launchId: string) {
+		return { ...resumed(input), rejoin: true as const, launchId, host: "background" as const };
+	}
+
+	function clock(start = Date.now()) {
+		let now = start;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		return {
+			advance(ms: number) {
+				now += ms;
+			},
+		};
+	}
+
+	it("offers Resume only on closed shared Haiso cards, and only from a service that can start copies", async () => {
+		using temporary = TempDir.createSync("@discord-background-cards-");
+		const root = temporary.path();
+		const plain = await serviceBroker(path.join(root, "plain"), null);
+		try {
+			const { snapshot } = await conversation(plain.broker, path.join(root, "plain"), "desk-only");
+			const card = plain.port.cards.get(snapshot.session.channelId!)!;
+			expect(card.resumable).toBeUndefined();
+			expect(card.text).toContain("Closed · resume at your desk");
+			await expect(plain.port.control(snapshot, "sessions")).rejects.toThrow("can't start conversations");
+		} finally {
+			await plain.broker.close();
+		}
+		const { port, broker } = await serviceBroker(path.join(root, "service"));
+		try {
+			const base = path.join(root, "service");
+			const closed = await conversation(broker, base, "closed-work");
+			const open = await conversation(broker, base, "open-work", { open: true });
+			const omp = await conversation(broker, base, "omp-work", { app: "omp" });
+			const off = await conversation(broker, base, "off-work", { open: true });
+			await broker.request({ op: "off", lease: lease(off.snapshot) });
+			expect(port.cards.get(closed.snapshot.session.channelId!)).toMatchObject({ resumable: true });
+			expect(port.cards.get(closed.snapshot.session.channelId!)!.text).toContain(
+				"Closed · resume here or at your desk",
+			);
+			expect(port.cards.get(open.snapshot.session.channelId!)!.resumable).toBeUndefined();
+			expect(port.cards.get(open.snapshot.session.channelId!)!.connectionId).toBe(
+				open.snapshot.session.connectionId,
+			);
+			expect(port.cards.get(omp.snapshot.session.channelId!)!.resumable).toBeUndefined();
+			expect(port.cards.get(off.snapshot.session.channelId!)!.resumable).toBeUndefined();
+			const listed = await port.control(open.snapshot, "sessions");
+			expect(listed.resumable).toEqual([{ id: closed.input.sessionId, label: "closed-work" }]);
+			// The overview offers the same project-wide list.
+			const overview = await port.handlers!.control({
+				id: randomUUID(),
+				channelId: closed.snapshot.group.overviewId!,
+				ownerId: config.ownerId,
+				action: "sessions",
+			});
+			expect(overview.resumable).toEqual(listed.resumable);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("resumes a closed conversation from journal paths, and its copy claims the launch exactly once", async () => {
+		using temporary = TempDir.createSync("@discord-background-resume-");
+		const root = temporary.path();
+		const { port, hosts, broker } = await serviceBroker(root);
+		try {
+			const { input, snapshot } = await conversation(broker, root, "closed-work");
+			const channelId = snapshot.session.channelId!;
+			expect((await port.control(snapshot, "resume")).text).toContain("Starting closed-work in the background");
+			expect(hosts.started).toEqual([
+				{
+					launchId: expect.any(String),
+					name: `haiso-s-${input.sessionId}`,
+					projectDir: snapshot.session.projectDir,
+					sessionFile: snapshot.session.sessionFile,
+				},
+			]);
+			const launchId = hosts.started[0]!.launchId;
+			expect(port.cards.get(channelId)!.text).toContain("Starting in the background…");
+			expect(port.cards.get(channelId)!.resumable).toBeUndefined();
+			expect((await port.control(snapshot, "resume")).text).toContain("already starting");
+			expect(hosts.started).toHaveLength(1);
+			await expect(broker.request({ ...claim(input, launchId), sessionId: randomUUID() })).rejects.toThrow();
+			const copy = await broker.request(claim(input, launchId));
+			expect(copy.session).toMatchObject({ connected: true, host: `haiso-s-${input.sessionId}` });
+			expect(port.cards.get(channelId)!.text).toContain("Online in the background · Idle");
+			expect((await port.control(copy, "resume")).text).toContain("already running in the background");
+			await broker.request({ op: "detach", lease: lease(copy) });
+			await expect(broker.request(claim(input, launchId))).rejects.toThrow("unknown, expired");
+			// A terminal registration clears the background marker.
+			const desk = await broker.request(resumed(input));
+			expect(desk.session.host).toBeUndefined();
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("refuses resumes Discord must not start, and never starts anything for them", async () => {
+		using temporary = TempDir.createSync("@discord-background-refuse-");
+		const root = temporary.path();
+		const { port, hosts, broker } = await serviceBroker(root);
+		try {
+			const closed = await conversation(broker, root, "closed-work");
+			const open = await conversation(broker, root, "open-work", { open: true });
+			const held = await conversation(broker, root, "held-work");
+			const omp = await conversation(broker, root, "omp-work", { app: "omp" });
+			const off = await conversation(broker, root, "off-work", { open: true });
+			await broker.request({ op: "off", lease: lease(off.snapshot) });
+			const missing = await conversation(broker, root, "missing-work");
+			await fs.rm(missing.input.sessionFile);
+			const elsewhere = await conversation(broker, root, "elsewhere", { projectDir: path.join(root, "other") });
+			hosts.holders.set(held.input.sessionId, "terminal");
+			expect((await port.control(open.snapshot, "resume")).text).toContain("open at your desk");
+			expect((await port.control(held.snapshot, "resume")).text).toContain("open in a terminal");
+			await expect(port.control(omp.snapshot, "resume")).rejects.toThrow("OMP session");
+			await expect(port.control(off.snapshot, "resume")).rejects.toThrow("Sharing is off");
+			await expect(port.control(missing.snapshot, "resume")).rejects.toThrow("missing on this computer");
+			await expect(
+				port.control(closed.snapshot, "resume", { sessionId: elsewhere.input.sessionId }),
+			).rejects.toThrow("isn't part of this project");
+			await expect(
+				port.handlers!.control({
+					id: randomUUID(),
+					channelId: closed.snapshot.session.channelId!,
+					ownerId: "999",
+					action: "resume",
+				}),
+			).rejects.toThrow("Only the configured owner");
+			await expect(
+				port.handlers!.control({ id: randomUUID(), channelId: "4242", ownerId: config.ownerId, action: "resume" }),
+			).rejects.toThrow("Use this in a Haiso project's");
+			for (let index = 0; index < DISCORD_MODE_MAX_BACKGROUND; index++) hosts.live.add(`haiso-s-${randomUUID()}`);
+			await expect(port.control(closed.snapshot, "resume")).rejects.toThrow(
+				`${DISCORD_MODE_MAX_BACKGROUND} conversations are already running in the background`,
+			);
+			expect(hosts.started).toEqual([]);
+			expect(port.cards.get(closed.snapshot.session.channelId!)).toMatchObject({ resumable: true });
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("starts a new conversation only in a known project, with a validated name and model, and runs its first message once", async () => {
+		using temporary = TempDir.createSync("@discord-background-new-");
+		const root = temporary.path();
+		const { port, hosts, broker } = await serviceBroker(root);
+		try {
+			const { input, snapshot } = await conversation(broker, root, "reporter", { open: true });
+			const model = { selector: "anthropic/claude-sonnet", name: "Sonnet", efforts: [] };
+			await broker.request({
+				op: "poll",
+				lease: lease(snapshot),
+				busy: false,
+				pendingInput: false,
+				settings: sealModeSettingsView({
+					model,
+					capabilities: { persist: false, compact: false, advisor: false, plan: false },
+					shortlist: [model],
+					models: [model],
+				}),
+			});
+			const overviewId = snapshot.group.overviewId!;
+			const start = (fields: Partial<ModeControlRequest>, channelId = overviewId, ownerId = config.ownerId) =>
+				port.handlers!.control({ id: randomUUID(), channelId, ownerId, action: "new", ...fields });
+			const first = "Please fix the login bug.";
+			for (const selector of ["a/b c", "--x", "-a/b", "anthropic"])
+				await expect(start({ name: "Fix login", message: first, model: selector })).rejects.toThrow(
+					"Invalid session control",
+				);
+			await expect(start({ name: "Fix login", message: first, model: "anthropic/unknown" })).rejects.toThrow(
+				"isn't one a running session offers",
+			);
+			await expect(start({ name: "Fix login" })).rejects.toThrow("Invalid session control");
+			await expect(start({ name: "!!!", message: first })).rejects.toThrow("Choose a name");
+			await expect(start({ name: "Fix login", message: first }, "4242")).rejects.toThrow(
+				"Use this in a Haiso project's",
+			);
+			await expect(start({ name: "Fix login", message: first }, overviewId, "999")).rejects.toThrow(
+				"Only the configured owner",
+			);
+			expect(hosts.started).toEqual([]);
+			expect((await start({ name: "Fix login", message: first, model: model.selector })).text).toContain(
+				"Starting Fix login in the background",
+			);
+			const spec = hosts.started[0]!;
+			expect(spec).toEqual({
+				launchId: expect.any(String),
+				name: `haiso-n-${spec.launchId}`,
+				projectDir: snapshot.group.projectDir,
+				model: model.selector,
+			});
+			// The copy creates its own conversation in the project and registers with placeholders.
+			const register = (launchId: string) => {
+				const sessionId = randomUUID();
+				return broker.request({
+					op: "register",
+					requestId: randomUUID(),
+					sessionId,
+					sessionFile: path.join(input.projectDir, `${sessionId}.jsonl`),
+					projectDir: input.projectDir,
+					connectionId: randomUUID(),
+					label: "background",
+					groupName: "background",
+					launchId,
+					host: "background",
+				});
+			};
+			// A new conversation's launch never attaches an existing one.
+			const closed = await conversation(broker, root, "closed-work");
+			await expect(broker.request(claim(closed.input, spec.launchId))).rejects.toThrow("unknown, expired");
+			const copy = await register(spec.launchId);
+			expect(copy.group.id).toBe(snapshot.group.id);
+			expect(copy.session).toMatchObject({ label: "fix-login", host: spec.name, connected: true });
+			expect(port.channel(copy.session.channelId!).name).toBe("🟣-fix-login");
+			expect((await poll(broker, copy)).deliveries).toEqual([
+				expect.objectContaining({ source: "owner", from: config.ownerId, kind: "message", text: first }),
+			]);
+			expect((await poll(broker, copy)).deliveries).toEqual([]);
+			expect(
+				port.publications.filter(
+					item => item.channelId === overviewId && item.text.includes(copy.session.channelId!),
+				),
+			).toHaveLength(1);
+			await expect(register(spec.launchId)).rejects.toThrow("unknown, expired");
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("keeps an unclaimed launch across a restart, expires it, and reports a copy that stopped before connecting", async () => {
+		using temporary = TempDir.createSync("@discord-background-launches-");
+		const root = temporary.path();
+		const first = await serviceBroker(root);
+		const { input, snapshot } = await conversation(first.broker, root, "survivor");
+		const other = await conversation(first.broker, root, "short-lived");
+		await first.port.control(snapshot, "resume");
+		await first.broker.close();
+		const hosts = new FakeHosts();
+		hosts.live.add(`haiso-s-${input.sessionId}`);
+		const { port, broker } = await serviceBroker(root, hosts, first.port);
+		try {
+			const copy = await broker.request(claim(input, first.hosts.started[0]!.launchId));
+			expect(copy.session.host).toBe(`haiso-s-${input.sessionId}`);
+			await broker.request({ op: "detach", lease: lease(copy) });
+			hosts.live.clear(); // The copy exited.
+			const time = clock();
+			await port.control(snapshot, "resume");
+			const expired = hosts.started.at(-1)!.launchId;
+			time.advance(DISCORD_MODE_LAUNCH_TTL_MS + 1);
+			await expect(broker.request(claim(input, expired))).rejects.toThrow("unknown, expired");
+			await port.control(other.snapshot, "resume");
+			const failed = hosts.started.at(-1)!;
+			hosts.live.delete(failed.name);
+			time.advance(DISCORD_MODE_LAUNCH_GRACE_MS + 1);
+			await port.handlers!.changed();
+			expect(
+				port.publications.filter(
+					item =>
+						item.channelId === other.snapshot.session.channelId &&
+						item.text.startsWith("Couldn't start short-lived"),
+				),
+			).toHaveLength(1);
+			expect(port.cards.get(other.snapshot.session.channelId!)).toMatchObject({ resumable: true });
+			await expect(broker.request(claim(other.input, failed.launchId))).rejects.toThrow("unknown, expired");
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("closes only a background copy, at its next idle point, and stops one that stays idle without leaving", async () => {
+		using temporary = TempDir.createSync("@discord-background-close-");
+		const root = temporary.path();
+		const { port, hosts, broker } = await serviceBroker(root);
+		try {
+			const { input, snapshot } = await conversation(broker, root, "copy");
+			await port.control(snapshot, "resume");
+			const copy = await broker.request(claim(input, hosts.started[0]!.launchId));
+			const desk = await conversation(broker, root, "desk", { open: true });
+			const closed = await conversation(broker, root, "closed");
+			expect((await port.control(desk.snapshot, "close")).text).toContain("open in a terminal");
+			expect((await port.control(closed.snapshot, "close")).text).toContain("already closed");
+			expect((await poll(broker, desk.snapshot)).stepAside).toBeUndefined();
+			await poll(broker, copy, true);
+			expect((await port.control(copy, "close")).text).toContain("close after this turn");
+			await port.owner(copy, "arrived while leaving");
+			const time = clock();
+			const leaving = await poll(broker, copy);
+			expect(leaving.stepAside).toBe(true);
+			expect(leaving.deliveries).toEqual([]);
+			time.advance(40_000);
+			await poll(broker, copy);
+			time.advance(DISCORD_MODE_STEP_ASIDE_STOP_MS - 39_000);
+			await poll(broker, copy);
+			expect(hosts.stopped).toEqual([]);
+			await port.handlers!.changed();
+			expect(hosts.stopped).toEqual([`haiso-s-${input.sessionId}`]);
+			// Leaving keeps sharing and history; the undelivered message is saved for the next resume.
+			await broker.request({ op: "detach", lease: lease(copy) });
+			const after = await broker.lookup(input.projectDir, input.sessionId);
+			expect(after?.session).toMatchObject({ enabled: true, connected: false });
+			expect(port.cards.get(copy.session.channelId!)).toMatchObject({ resumable: true });
+			expect((await port.control(copy, "review")).queued?.map(item => item.text)).toEqual(["arrived while leaving"]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("lets a terminal take over only from a background copy, by the conversation's exact identity", async () => {
+		using temporary = TempDir.createSync("@discord-background-takeover-");
+		const root = temporary.path();
+		const { port, hosts, broker } = await serviceBroker(root);
+		try {
+			const { input, snapshot } = await conversation(broker, root, "copy");
+			const identity = { sessionId: input.sessionId, sessionFile: input.sessionFile, projectDir: input.projectDir };
+			// Nothing to take over from a closed conversation.
+			expect((await broker.request({ op: "step-aside", ...identity })).lease).toBeUndefined();
+			await port.control(snapshot, "resume");
+			const copy = await broker.request(claim(input, hosts.started[0]!.launchId));
+			expect((await poll(broker, copy)).stepAside).toBeUndefined();
+			await expect(
+				broker.request({ op: "step-aside", ...identity, sessionFile: path.join(root, "other.jsonl") }),
+			).rejects.toThrow("different project directory or session file");
+			await broker.request({ op: "step-aside", ...identity });
+			expect((await poll(broker, copy)).stepAside).toBe(true);
+			const desk = await conversation(broker, root, "desk", { open: true });
+			await expect(
+				broker.request({
+					op: "step-aside",
+					sessionId: desk.input.sessionId,
+					sessionFile: desk.input.sessionFile,
+					projectDir: desk.input.projectDir,
+				}),
+			).rejects.toThrow("Another terminal");
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("keeps a closing terminal's conversation running as a copy and drops the terminal's lease", async () => {
+		using temporary = TempDir.createSync("@discord-background-keep-");
+		const root = temporary.path();
+		const { port, hosts, broker } = await serviceBroker(root);
+		try {
+			const { input, snapshot } = await conversation(broker, root, "keep", { open: true });
+			expect(snapshot.background).toBe(true);
+			const refused = await conversation(broker, root, "refused", { open: true });
+			for (let index = 0; index < DISCORD_MODE_MAX_BACKGROUND; index++) hosts.live.add(`haiso-s-${randomUUID()}`);
+			await expect(broker.request({ op: "background", lease: lease(refused.snapshot) })).rejects.toThrow(
+				"already running in the background",
+			);
+			expect((await poll(broker, refused.snapshot)).session.connected).toBe(true);
+			hosts.live.clear();
+			await broker.request({ op: "background", lease: lease(snapshot) });
+			expect(hosts.started).toEqual([
+				expect.objectContaining({ name: `haiso-s-${input.sessionId}`, sessionFile: snapshot.session.sessionFile }),
+			]);
+			await expect(poll(broker, snapshot)).rejects.toThrow("invalid, expired, or revoked");
+			expect(port.cards.get(snapshot.session.channelId!)!.text).toContain("Starting in the background…");
+			const copy = await broker.request(claim(input, hosts.started[0]!.launchId));
+			expect(copy.session.host).toBe(`haiso-s-${input.sessionId}`);
 		} finally {
 			await broker.close();
 		}
