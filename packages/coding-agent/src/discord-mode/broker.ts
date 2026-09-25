@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { canonicalProjectDir } from "../launch/paths";
-import { discordCategoryName, discordChannelName } from "./names";
+import { discordCategoryName, sessionChannelName, sessionLabel, sessionSlug } from "./names";
 import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	discardDiscordDeletionEvent,
@@ -28,6 +28,7 @@ import {
 	type ModeDialogAnswer,
 	type ModeEnrollment,
 	type ModeGroup,
+	type ModeApp,
 	type ModeLease,
 	type ModeRequest,
 	type ModeNotify,
@@ -50,6 +51,9 @@ export const DISCORD_MODE_LONG_TURN_MS = 120_000;
 /** A dialog opening this soon after the session's previous one ended continues that exchange; no new ping. */
 const DIALOG_MENTION_GRACE_MS = 5_000;
 const Notify = type("'all' | 'needs-you' | 'off'");
+const App = type("'haiso' | 'omp'");
+/** Card header and overview section tag per attaching app. */
+const APP_TAGS: Record<ModeApp, string> = { haiso: "Haiso", omp: "OMP" };
 const NOTIFY_DESCRIPTIONS: Record<ModeNotify, string> = {
 	all: "You are mentioned for input requests and every final reply.",
 	"needs-you": "You are mentioned for input requests and for final replies to turns that took 2 minutes or longer.",
@@ -107,12 +111,16 @@ const RequestShape = type.or(
 		connectionId: Id,
 		label: Label,
 		groupName: Label,
+		"app?": App,
+		"rejoin?": "true",
 		"+": "reject",
 	},
 	{ op: "'retire'", eventId: Id, "+": "reject" },
 	{ op: "'poll'", lease: LeaseShape, busy: "boolean", pendingInput: "boolean", "+": "reject" },
 	{ op: "'status'", lease: LeaseShape, "+": "reject" },
 	{ op: "'off'", lease: LeaseShape, "+": "reject" },
+	{ op: "'detach'", lease: LeaseShape, "+": "reject" },
+	{ op: "'disable'", sessionId: Id, sessionFile: SafePath, projectDir: SafePath, "+": "reject" },
 	{
 		op: "'receipt'",
 		lease: LeaseShape,
@@ -183,6 +191,7 @@ const SessionShape = type({
 	uncertain: "boolean",
 	"retirement?": RetirementShape,
 	"notify?": Notify,
+	"app?": App,
 	"+": "reject",
 });
 const DeliveryShape = type({
@@ -290,6 +299,8 @@ export class DiscordModeBroker {
 	#cursor = 0;
 	/** Last dialog end per session; volatile debounce for re-rendered asks, lost on restart by design. */
 	#dialogEnded = new Map<string, number>();
+	/** Last relabel attempted per channel; volatile so each wanted name is tried at most once per process. */
+	#relabelled = new Map<string, string>();
 
 	constructor(options: { config: DiscordModeConfig; storePath: string; port: DiscordPort }) {
 		RemoteId.assert(options.config.guildId);
@@ -374,6 +385,8 @@ export class DiscordModeBroker {
 		Id.assert(sessionId);
 		const canonical = await canonicalProjectDir(projectDir);
 		return this.#mutate(async () => {
+			// A crashed or detached process must read as disconnected before a rejoin decision.
+			await this.#expire();
 			await this.#consumeRetirements();
 			const group = this.#journal.groups.find(item => item.projectDir === canonical);
 			if (!group) return undefined;
@@ -421,6 +434,7 @@ export class DiscordModeBroker {
 				return this.#snapshot(retired);
 			}
 			if (parsed.op === "register") return this.#register(parsed);
+			if (parsed.op === "disable") return this.#disable(parsed);
 			const session = this.#authorize(parsed.lease);
 			switch (parsed.op) {
 				case "poll":
@@ -438,6 +452,12 @@ export class DiscordModeBroker {
 				case "off":
 					this.#revoke(session);
 					session.enabled = false;
+					await this.#persist();
+					await this.#cards(this.#group(session.groupId));
+					break;
+				case "detach":
+					// Closing a conversation keeps it shared: resuming it rejoins the same channel.
+					this.#revoke(session);
 					await this.#persist();
 					await this.#cards(this.#group(session.groupId));
 					break;
@@ -611,7 +631,7 @@ export class DiscordModeBroker {
 
 	async #register(input: Extract<ModeRequest, { op: "register" }>): Promise<ModeSnapshot> {
 		try {
-			discordChannelName(input.label);
+			sessionChannelName(input.label);
 			discordCategoryName(input.groupName);
 		} catch {
 			throw new DiscordModeError(
@@ -628,6 +648,9 @@ export class DiscordModeBroker {
 			throw new DiscordModeError(
 				"This conversation was permanently deleted; its identity cannot be enrolled again.",
 			);
+		// Rejoin never enrolls: explicit off (here or in another window) and unknown identities stay unshared.
+		if (input.rejoin && !session?.enabled)
+			throw new DiscordModeError("Sharing is off or unknown for this conversation; automatic rejoin skipped.");
 		const registration = { ...input, projectDir, sessionFile };
 		const prior = this.#journal.operations[digest(`register:${input.sessionId}:${input.requestId}`)];
 		if (prior) {
@@ -691,7 +714,7 @@ export class DiscordModeBroker {
 				groupId: group.id,
 				sessionFile,
 				projectDir,
-				label: input.label,
+				label: sessionLabel(input.label) ?? input.label,
 				connectionId: input.connectionId,
 				enabled: true,
 				connected: true,
@@ -701,6 +724,7 @@ export class DiscordModeBroker {
 				token: randomBytes(32).toString("hex"),
 				seenAt: Date.now(),
 				uncertain: false,
+				...(input.app === "omp" ? { app: input.app } : {}),
 			};
 			this.#journal.sessions.push(session);
 		} else {
@@ -710,6 +734,9 @@ export class DiscordModeBroker {
 			session.enabled = true;
 			session.connected = true;
 			session.seenAt = Date.now();
+			// The last attaching app owns the session; a flip is visible as a channel marker rename and card tag.
+			if (input.app === "omp") session.app = input.app;
+			else delete session.app;
 		}
 		const registered = session;
 		const selectedGroup = group;
@@ -724,10 +751,11 @@ export class DiscordModeBroker {
 				if (newGroup) await this.#createGroup(selectedGroup);
 				else await this.#reconcileGroup(selectedGroup);
 				if (newSession && selectedGroup.state === "ready") await this.#createSession(registered, selectedGroup);
-				else await this.#reconcileSession(registered, false);
+				else await this.#relabel(registered, await this.#reconcileSession(registered, false));
 			} catch (error) {
 				if (!(error instanceof UnknownEffect)) throw error;
 			}
+			await this.#arrange(selectedGroup);
 		});
 		await this.#cards(selectedGroup);
 		registered.seenAt = Date.now();
@@ -776,21 +804,23 @@ export class DiscordModeBroker {
 		if (!group.categoryId || group.state !== "ready")
 			throw new DiscordModeError("Repair the project category before creating a session channel.");
 		this.#requireCategoryCapacity(group, session.id);
-		const baseName = discordChannelName(session.label);
+		const baseName = sessionSlug(session.label);
 		const occupied = new Set<string>(["overview"]);
 		for (const peer of this.#journal.sessions)
 			if (peer.groupId === group.id && peer.id !== session.id && peer.channelId) {
 				try {
-					occupied.add(discordChannelName(peer.label));
+					occupied.add(sessionSlug(peer.label));
 				} catch {
 					/* A manual name with no usable slug cannot collide with a generated slug. */
 				}
 			}
-		let channelName = baseName;
-		for (let suffix = 0; occupied.has(channelName); suffix++) {
+		// Slugs stay unique per project across apps; the marker is presentation only.
+		let slug = baseName;
+		for (let suffix = 0; occupied.has(slug); suffix++) {
 			const discriminator = `${session.id.slice(0, 8)}${suffix ? `-${suffix}` : ""}`;
-			channelName = `${baseName.slice(0, 99 - discriminator.length)}-${discriminator}`;
+			slug = `${baseName.slice(0, 96 - discriminator.length)}-${discriminator}`;
 		}
+		const channelName = sessionChannelName(slug, session.app);
 		session.state = "uncertain";
 		session.uncertain = true;
 		await this.#persist();
@@ -801,7 +831,7 @@ export class DiscordModeBroker {
 		this.#validateRemote(channel, "text", group.categoryId);
 		this.#assertUnbound(channel.id);
 		session.channelId = channel.id;
-		session.label = channel.name;
+		session.label = sessionLabel(channel.name) ?? session.label;
 		session.uncertain = false;
 		session.state = "ready";
 		await this.#persist();
@@ -824,8 +854,11 @@ export class DiscordModeBroker {
 	#requireLive(session: Session): void {
 		if (session.retirement)
 			throw new DiscordModeError("This conversation was permanently deleted; delivery is disabled.");
-		if (!session.enabled || !session.connected || Date.now() - session.seenAt >= DISCORD_MODE_LEASE_MS)
-			throw new DiscordModeError("Session is off or its connection lease expired; delivery is disabled.");
+		if (!session.enabled) throw new DiscordModeError("Session is off; delivery is disabled.");
+		if (!session.connected || Date.now() - session.seenAt >= DISCORD_MODE_LEASE_MS)
+			throw new DiscordModeError(
+				"This conversation isn't open locally; resume it to reconnect. Delivery is disabled until then.",
+			);
 	}
 
 	#requireRemote(session: Session, requireLive = true): void {
@@ -860,6 +893,34 @@ export class DiscordModeBroker {
 				changed = true;
 			}
 		if (changed) await this.#persist();
+	}
+
+	/** Sticky off by native identity, without a lease: a later rejoin is refused until an explicit enable. */
+	async #disable(input: Extract<ModeRequest, { op: "disable" }>): Promise<ModeSnapshot> {
+		const session = this.#journal.sessions.find(item => item.id === input.sessionId);
+		if (!session) throw new DiscordModeError("This conversation is not shared with Discord.");
+		const sessionFile = path.join(
+			await canonicalProjectDir(path.dirname(input.sessionFile)),
+			path.basename(input.sessionFile),
+		);
+		if (session.projectDir !== (await canonicalProjectDir(input.projectDir)) || session.sessionFile !== sessionFile)
+			throw new DiscordModeError(
+				"Persistent session UUID is bound to a different project directory or session file.",
+			);
+		if (session.retirement)
+			throw new DiscordModeError("This conversation was permanently deleted; Discord mode is already off.");
+		// #expire already ran, so a connected session has a live lease elsewhere.
+		if (session.connected)
+			throw new DiscordModeError(
+				"This conversation still holds a live Discord connection (another window, or a lease not yet expired); turn it off there or retry shortly.",
+			);
+		if (session.enabled) {
+			this.#revoke(session);
+			session.enabled = false;
+			await this.#persist();
+			await this.#cards(this.#group(session.groupId));
+		}
+		return this.#snapshot(session);
 	}
 
 	#enqueue(
@@ -1317,8 +1378,17 @@ export class DiscordModeBroker {
 		const binding = input.target === "session" ? session : this.#group(session.groupId);
 		const channelId = input.target === "session" ? session.channelId : this.#group(session.groupId).categoryId;
 		if (!channelId) throw new DiscordModeError("Cannot rename an unbound resource; repair explicitly.");
+		let name = input.name;
+		if (input.target === "session")
+			try {
+				name = sessionChannelName(input.name, session.app);
+			} catch {
+				throw new DiscordModeError(
+					"Choose a session name containing usable letters, numbers, underscores, or hyphens.",
+				);
+			}
 		await this.#perform(`request:${session.id}:${input.requestId}`, input, async () => {
-			await this.#external(() => this.#port.rename(channelId, input.name), binding);
+			await this.#external(() => this.#port.rename(channelId, name), binding);
 			if (input.target === "session") await this.#reconcileSession(session);
 			else await this.#reconcileGroup(this.#group(session.groupId));
 		});
@@ -1364,9 +1434,10 @@ export class DiscordModeBroker {
 			if (input.target === "session") {
 				if (selected) {
 					session.channelId = selected.id;
-					session.label = selected.name;
+					session.label = sessionLabel(selected.name) ?? session.label;
 					session.uncertain = false;
 					session.state = "ready";
+					await this.#relabel(session, selected);
 				} else if (session.state !== "ready") await this.#createSession(session, group);
 				this.#resumeQueue(session, input.resumeQueued);
 				this.#journal.dialogs = this.#journal.dialogs.filter(item => item.sessionId !== session.id);
@@ -1381,6 +1452,7 @@ export class DiscordModeBroker {
 			this.#journal.cards = this.#journal.cards.filter(
 				card => card.channelId !== (input.target === "session" ? session.channelId : group.overviewId),
 			);
+			await this.#arrange(group);
 		});
 		await this.#cards(group);
 	}
@@ -1499,7 +1571,8 @@ export class DiscordModeBroker {
 		if (group.state !== "ready") this.#hold(group);
 	}
 
-	async #reconcileSession(session: Session, includeGroup = true): Promise<void> {
+	/** Returns the inspected session channel when found, so callers can relabel it in place. */
+	async #reconcileSession(session: Session, includeGroup = true): Promise<RemoteChannel | undefined> {
 		if (session.retirement) return;
 		const group = this.#group(session.groupId);
 		if (includeGroup) await this.#reconcileGroup(group);
@@ -1509,13 +1582,58 @@ export class DiscordModeBroker {
 			return;
 		}
 		let state: BindingState = "unbound";
+		let found: RemoteChannel | undefined;
 		if (session.channelId) {
 			const channel = await this.#inspect(session.channelId);
 			state = inspectionState(channel, "text", group.categoryId);
-			if (channel.state === "found") session.label = channel.channel.name;
+			if (channel.state === "found") {
+				found = channel.channel;
+				session.label = sessionLabel(found.name) ?? session.label;
+			}
 		}
 		session.state = session.uncertain ? "uncertain" : state;
 		if (session.state !== "ready" || group.state !== "ready") this.#hold(session);
+		return found;
+	}
+
+	/**
+	 * Best-effort in-place rename to the app-marked name; never marks the binding uncertain.
+	 * An unconfirmed attempt is not repeated for the same wanted name; an observed match re-arms it,
+	 * so each owner edit that drops or swaps the marker is corrected exactly once.
+	 */
+	async #relabel(session: Session, channel: RemoteChannel | undefined): Promise<void> {
+		const channelId = session.channelId;
+		if (!channel || !channelId || session.retirement || session.state !== "ready") return;
+		try {
+			const wanted = sessionChannelName(session.label, session.app);
+			if (channel.name === wanted) {
+				this.#relabelled.delete(channelId);
+				return;
+			}
+			if (this.#relabelled.get(channelId) === wanted) return;
+			this.#relabelled.set(channelId, wanted);
+			await this.#external(() => this.#port.rename(channelId, wanted));
+		} catch {
+			/* Labels without a usable slug and rate-limited renames keep the owner's name until the wanted name changes. */
+		}
+	}
+
+	/** Best-effort category order: overview, Haiso sessions, then OMP sessions, each in enrollment order. */
+	async #arrange(group: Group): Promise<void> {
+		if (!this.#gateway || group.state !== "ready" || !group.categoryId || !group.overviewId) return;
+		const sessions = this.#journal.sessions.filter(
+			session =>
+				session.groupId === group.id && !session.retirement && session.channelId && session.state === "ready",
+		);
+		const ordered = [group.overviewId];
+		for (const app of ["haiso", "omp"] satisfies ModeApp[])
+			for (const session of sessions) if ((session.app ?? "haiso") === app) ordered.push(session.channelId!);
+		const categoryId = group.categoryId;
+		try {
+			await this.#external(() => this.#port.arrange(categoryId, ordered));
+		} catch {
+			/* Ordering is presentation only; the next reconcile retries. */
+		}
 	}
 
 	#scheduleReconcile(): Promise<void> {
@@ -1663,7 +1781,7 @@ export class DiscordModeBroker {
 		session.state = "ready";
 		const card = this.#journal.cards.find(item => item.channelId === channelId);
 		if (retirement.policy === "retain" && card?.messageId)
-			await this.#card(channelId, this.#sessionStatus(session), undefined, true);
+			await this.#card(channelId, this.#sessionStatus(session), undefined, true, session.app ?? "haiso");
 		try {
 			await this.#external(() => this.#port.retire(channelId, session.id, retirement.policy));
 		} catch {
@@ -1675,7 +1793,7 @@ export class DiscordModeBroker {
 		session.state = retirement.policy === "delete" ? "missing" : "ready";
 		if (retirement.policy === "retain") {
 			if (card?.messageId && card.state === "done") {
-				await this.#card(channelId, this.#sessionStatus(session, true), undefined, true);
+				await this.#card(channelId, this.#sessionStatus(session, true), undefined, true, session.app ?? "haiso");
 			}
 			if (!card?.messageId || card.state !== "done") {
 				await attention(
@@ -1706,18 +1824,23 @@ export class DiscordModeBroker {
 			} else {
 				const session = sessions[selected - groups.length]!;
 				if (session.retirement) await this.#reconcileRetirement(session);
-				else await this.#reconcileSession(session);
+				else await this.#relabel(session, await this.#reconcileSession(session));
 				touched.add(session.groupId);
 			}
 		}
 		await this.#persist();
-		for (const groupId of touched) await this.#cards(this.#group(groupId));
+		for (const groupId of touched) {
+			const group = this.#group(groupId);
+			await this.#arrange(group);
+			await this.#cards(group);
+		}
 	}
 
 	#sessionActivity(session: Session): string {
 		if (session.retirement) return "Permanently deleted";
 		if (!session.enabled) return "Off";
-		if (!session.connected || Date.now() - session.seenAt >= DISCORD_MODE_LEASE_MS) return "Disconnected";
+		if (!session.connected || Date.now() - session.seenAt >= DISCORD_MODE_LEASE_MS)
+			return "Disconnected · rejoins when resumed";
 		if (session.pendingInput) return "Waiting for input";
 		return session.busy ? "Working" : "Idle";
 	}
@@ -1725,7 +1848,7 @@ export class DiscordModeBroker {
 	#sessionStatus(session: Session, retirementComplete = false): string {
 		if (session.retirement) {
 			const retirement = session.retirement;
-			return `Haiso · ${session.label}\nSession ${session.id}\nConversation permanently deleted. Nothing is forwarded; all controls and pending input are revoked.\nDiscord ${retirement.policy === "retain" ? "history retained" : "history deletion"} · ${retirementComplete ? "done" : retirement.state}${!retirementComplete && retirement.error ? `\n${retirement.error}` : ""}`;
+			return `${APP_TAGS[session.app ?? "haiso"]} · ${session.label}\nSession ${session.id}\nConversation permanently deleted. Nothing is forwarded; all controls and pending input are revoked.\nDiscord ${retirement.policy === "retain" ? "history retained" : "history deletion"} · ${retirementComplete ? "done" : retirement.state}${!retirementComplete && retirement.error ? `\n${retirement.error}` : ""}`;
 		}
 		let queued = 0;
 		let active = 0;
@@ -1736,29 +1859,45 @@ export class DiscordModeBroker {
 			else if (delivery.state === "accepted" || delivery.state === "dispatched") active++;
 			else if (delivery.state === "unknown") uncertain++;
 		}
-		return `Haiso · ${session.label}\nSession ${session.id}\nProject ${this.#group(session.groupId).name}\n${this.#sessionActivity(session)} · ${session.state}\nQueued ${queued} · active ${active} · uncertain ${uncertain}\nNotifications: ${session.notify ?? "needs-you"}`;
+		return `${APP_TAGS[session.app ?? "haiso"]} · ${session.label}\nSession ${session.id}\nProject ${this.#group(session.groupId).name}\n${this.#sessionActivity(session)} · ${session.state}\nQueued ${queued} · active ${active} · uncertain ${uncertain}\nNotifications: ${session.notify ?? "needs-you"}`;
 	}
 
 	async #cards(group: Group): Promise<void> {
 		if (!this.#gateway || group.state !== "ready") return;
 		const members = this.#journal.sessions.filter(session => session.groupId === group.id && !session.retirement);
-		if (group.overviewId)
-			await this.#card(
-				group.overviewId,
-				`Haiso · ${group.name}\n${group.projectDir}\n${members.map(session => `${session.channelId ? `<#${session.channelId}>` : session.label} · ${session.id} · ${this.#sessionActivity(session)} · ${session.state}`).join("\n")}`,
-			);
+		if (group.overviewId) {
+			// One section per app, Haiso first to match channel order; empty sections are omitted.
+			const sections = (["haiso", "omp"] satisfies ModeApp[]).flatMap(app => {
+				const rows = members
+					.filter(session => (session.app ?? "haiso") === app)
+					.map(
+						session =>
+							`${session.channelId ? `<#${session.channelId}>` : session.label} · ${session.id} · ${this.#sessionActivity(session)} · ${session.state}`,
+					);
+				return rows.length ? [`\n${APP_TAGS[app]} sessions\n${rows.join("\n")}`] : [];
+			});
+			await this.#card(group.overviewId, `Haiso · ${group.name}\n${group.projectDir}\n${sections.join("\n")}`);
+		}
 		for (const session of members)
 			if (session.state === "ready" && session.channelId) {
 				await this.#card(
 					session.channelId,
 					`${this.#sessionStatus(session)}\nNormal messages wait for idle; queued messages can become guidance or be cancelled before dispatch. !steer sends guidance; !abort and Stop turn cancel the current turn, not the process.`,
 					this.#controlConnection(session),
+					false,
+					session.app ?? "haiso",
 				);
 			}
 	}
 
-	async #card(channelId: string, text: string, connectionId?: string, existingOnly = false): Promise<void> {
-		const fingerprint = digest([text, connectionId]);
+	async #card(
+		channelId: string,
+		text: string,
+		connectionId?: string,
+		existingOnly = false,
+		app?: ModeApp,
+	): Promise<void> {
+		const fingerprint = digest([text, connectionId, app]);
 		let card = this.#journal.cards.find(item => item.channelId === channelId);
 		// Only exact saved-message replacement is retryable. This mode cannot create
 		// a notice when inspection fails or the saved message has disappeared.
@@ -1786,7 +1925,15 @@ export class DiscordModeBroker {
 		const previousMessageId = card.messageId;
 		try {
 			const messageId = await this.#external(() =>
-				this.#port.status(channelId, text, `status:${channelId}`, connectionId, previousMessageId, existingOnly),
+				this.#port.status(
+					channelId,
+					text,
+					`status:${channelId}`,
+					connectionId,
+					previousMessageId,
+					existingOnly,
+					app,
+				),
 			);
 			if (existingOnly && messageId !== previousMessageId)
 				throw new DiscordModeError("Saved status-card identity changed; no replacement was adopted.");

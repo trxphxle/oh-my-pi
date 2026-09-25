@@ -4,7 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import * as discordClient from "../../src/discord-mode/client";
 import * as discordConfig from "../../src/discord-mode/config";
+import * as retirementEvents from "../../src/discord-mode/retirement-events";
 import * as discordSessions from "../../src/discord-mode/session";
 import { DiscordDialogs, raceDiscordDialog, requestDiscordAsk } from "../../src/discord-mode/dialog";
 import {
@@ -22,7 +24,7 @@ import {
 	type ModeSession,
 	type ModeSnapshot,
 } from "@oh-my-pi/pi-wire/discord-mode";
-import { DiscordModeRequestError } from "@oh-my-pi/pi-utils/discord-client";
+import { type DiscordModeClient, DiscordModeRequestError } from "@oh-my-pi/pi-utils/discord-client";
 import type { AgentSessionEvent } from "../../src/session/agent-session-events";
 import { normalizeCustomMessagePayload } from "../../src/session/messages";
 import { executeBuiltinSlashCommand } from "../../src/slash-commands/builtin-registry";
@@ -72,7 +74,7 @@ function assistant(text: string): AssistantMessage {
 	};
 }
 
-async function fixture() {
+async function fixture(options: { rejoinRetryMs?: number } = {}) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-discord-session-"));
 	cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
 	const state = { id: crypto.randomUUID() as string, busy: false, admitted: false, queued: 0, aborts: 0 };
@@ -89,6 +91,10 @@ async function fixture() {
 	let connects = 0;
 	let connectFailure: Error | undefined;
 	let forgotten = false;
+	/** Offline state.json view: whether this conversation is listed as shared. */
+	let sharedOffline = false;
+	/** A broker from before `detach`, `disable`, and `rejoin`. */
+	let legacy = false;
 	let snapshot: ModeSnapshot = {
 		group: { id: crypto.randomUUID(), projectDir: root, name: "Project", state: "ready", categoryId: "100" },
 		session: {
@@ -151,6 +157,7 @@ async function fixture() {
 			state.aborts++;
 			state.busy = false;
 		},
+		waitForSessionTransition: async () => {},
 	};
 	const client: DiscordSessionClient = {
 		lookup: async () => (forgotten ? undefined : { group: snapshot.group, session: snapshot.session }),
@@ -166,11 +173,39 @@ async function fixture() {
 					"unknown",
 					"Session lease is invalid, expired, or revoked; reconnect explicitly. Discord mode did not confirm the result; outcome may be unknown. Inspect status before retrying.",
 				);
-			if (input.op === "register")
+			if (input.op === "register") {
+				if (input.rejoin && legacy)
+					throw new DiscordModeRequestError(
+						"unknown",
+						"Invalid Discord request: check operation, UUIDs, absolute paths, text/byte limits, and allowed fields. Discord mode did not confirm the result; outcome may be unknown. Inspect status before retrying.",
+					);
+				if (input.rejoin && (forgotten || !snapshot.session.enabled))
+					throw new DiscordModeRequestError(
+						"unknown",
+						"Sharing is off or unknown for this conversation; automatic rejoin skipped. Discord mode did not confirm the result; outcome may be unknown. Inspect status before retrying.",
+					);
 				snapshot = {
 					...snapshot,
-					session: { ...snapshot.session, id: input.sessionId, connectionId: input.connectionId, connected: true },
+					session: {
+						...snapshot.session,
+						id: input.sessionId,
+						connectionId: input.connectionId,
+						enabled: true,
+						connected: true,
+					},
 					lease: { sessionId: input.sessionId, connectionId: input.connectionId, token: "private-lease" },
+				};
+			}
+			if (legacy && (input.op === "detach" || input.op === "disable"))
+				throw new DiscordModeRequestError(
+					"not-started",
+					"Discord mode rejected the request before execution (authentication, protocol, readiness, or capacity).",
+				);
+			// Like the broker: detach keeps sharing; off and disable turn it off.
+			if (input.op === "detach" || input.op === "off" || input.op === "disable")
+				snapshot = {
+					...snapshot,
+					session: { ...snapshot.session, connected: false, ...(input.op === "detach" ? {} : { enabled: false }) },
 				};
 			if (input.op === "receipt" && input.state === "completed") completed.resolve(input);
 			if (input.op === "poll" && pollGate) return pollGate;
@@ -189,6 +224,8 @@ async function fixture() {
 		receiptRoot: root,
 		pollIntervalMs: 0,
 		notify: text => notices.push(text),
+		shared: async () => sharedOffline,
+		rejoinRetryMs: options.rejoinRetryMs,
 	});
 	cleanups.push(() => mode.off());
 	return {
@@ -225,6 +262,16 @@ async function fixture() {
 		/** Broker state reset: the UUID is no longer enrolled. */
 		forget() {
 			forgotten = true;
+		},
+		/** Saved broker state lists this conversation as shared (the offline pre-gate). */
+		share(value = true) {
+			sharedOffline = value;
+		},
+		legacyBroker() {
+			legacy = true;
+		},
+		ops() {
+			return requests.map(request => request.op);
 		},
 		async enroll() {
 			await mode.on("Project", "Session");
@@ -753,5 +800,220 @@ describe("native Discord dialog races", () => {
 			kind: "answered",
 			value: { kind: "submit", results: [{ selectedOptions: ["Chat about this"] }] },
 		});
+	});
+});
+
+/**
+ * Automatic rejoins run detached from their trigger (after a transition settles, or a lease-expiry retry) and cross
+ * real filesystem I/O, so fake timers cannot drive them; poll for the observable end state instead of a fixed delay.
+ */
+async function until(condition: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 400 && !condition(); attempt++) await Bun.sleep(5);
+	expect(condition()).toBe(true);
+}
+
+describe("remembered Discord sharing", () => {
+	test("closing keeps the conversation shared; an older broker without detach gets its previous off", async () => {
+		const f = await fixture();
+		await f.enroll();
+		await f.mode.detach();
+		expect(f.ops().at(-1)).toBe("detach");
+		expect(f.snapshot().session).toMatchObject({ enabled: true, connected: false });
+		expect(f.mode.enabled).toBe(false);
+
+		const legacy = await fixture();
+		legacy.legacyBroker();
+		await legacy.enroll();
+		await legacy.mode.detach();
+		expect(legacy.ops().slice(-2)).toEqual(["detach", "off"]);
+		expect(legacy.snapshot().session.enabled).toBe(false);
+	});
+
+	test("explicit off is sticky, uses the lease when attached, and works by identity when not", async () => {
+		const f = await fixture();
+		// Never shared: nothing to turn off, and the broker is not even contacted.
+		await f.mode.off();
+		expect(f.connects()).toBe(0);
+		await f.enroll();
+		await f.mode.off();
+		expect(f.ops().slice(-1)).toEqual(["off"]);
+		await f.enroll();
+		await f.mode.detach();
+		f.share();
+		await f.mode.off();
+		expect(f.requests.at(-1)).toEqual({
+			op: "disable",
+			sessionId: f.state.id,
+			sessionFile: path.join(f.root, "session.jsonl"),
+			projectDir: await fs.realpath(f.root),
+		});
+		expect(f.snapshot().session.enabled).toBe(false);
+		expect(await f.mode.rejoin()).toBeUndefined();
+		expect(f.registers()).toHaveLength(2);
+	});
+
+	test("rejoin reattaches the same still-shared conversation to its channel without naming or enrolling", async () => {
+		const f = await fixture();
+		await f.enroll();
+		await f.mode.detach();
+		const rejoined = await f.mode.rejoin();
+		expect(rejoined?.session.channelId).toBe("101");
+		expect(f.registers()).toHaveLength(2);
+		expect(f.registers()[1]).toMatchObject({
+			rejoin: true,
+			sessionId: f.state.id,
+			label: "Session",
+			groupName: "Project",
+		});
+		expect(f.mode.enabled).toBe(true);
+		expect(f.mode.presentation.footer).toContain("Rejoined");
+		expect(f.notices).toEqual([]);
+		// The marker lasts until local activity.
+		f.local("local work");
+		expect(f.mode.presentation.footer).not.toContain("Rejoined");
+	});
+
+	test.each<[string, Partial<ModeSession> | undefined]>([
+		["turned off", { enabled: false }],
+		["deleted", { retirement: { eventId: crypto.randomUUID(), policy: "retain", deletedAt: 1, state: "done" } }],
+		["bound to another file", { sessionFile: path.join(os.tmpdir(), "other-session.jsonl") }],
+		["unknown to the broker", undefined],
+	])("a conversation %s never rejoins", async (_name, patch) => {
+		const f = await fixture();
+		await f.enroll();
+		await f.mode.detach();
+		if (patch) f.setSession(patch);
+		else f.forget();
+		expect(await f.mode.rejoin()).toBeUndefined();
+		expect(f.registers()).toHaveLength(1);
+		expect(f.notices).toEqual([]);
+		expect(f.mode.presentation.state).toBe("off");
+	});
+
+	test("a live lease elsewhere is retried once after it could expire, then reported instead of displaced", async () => {
+		const f = await fixture({ rejoinRetryMs: 1 });
+		await f.enroll();
+		await f.mode.detach();
+		f.setSession({ connected: true, connectionId: crypto.randomUUID() });
+		expect(await f.mode.rejoin()).toBeUndefined();
+		expect(f.mode.presentation.footer).toBe("[Discord · REJOINING]");
+		await until(() => f.notices.length > 0);
+		expect(f.notices).toEqual([expect.stringContaining("open in another window")]);
+		expect(f.registers()).toHaveLength(1);
+		expect(f.mode.presentation.state).toBe("off");
+		f.setSession({ connected: false });
+		expect((await f.mode.rejoin())?.session.connected).toBe(true);
+		expect(f.registers()).toHaveLength(2);
+	});
+
+	test("an unexpected rejoin failure notifies once; sharing turned off in the meantime stays quiet", async () => {
+		const legacy = await fixture();
+		await legacy.enroll();
+		await legacy.mode.detach();
+		// A broker from before `rejoin` refuses the flag unexecuted: fail closed, never a plain re-enable.
+		legacy.legacyBroker();
+		expect(await legacy.mode.rejoin()).toBeUndefined();
+		expect(legacy.notices).toEqual([expect.stringContaining("couldn't rejoin #Session")]);
+		expect(legacy.mode.enabled).toBe(false);
+
+		const f = await fixture();
+		await f.enroll();
+		await f.mode.detach();
+		const request = f.client.request;
+		vi.spyOn(f.client, "request").mockImplementation(async input => {
+			// Turned off in another window between the lookup and the register.
+			if (input.op === "register") f.setSession({ enabled: false });
+			return request(input);
+		});
+		expect(await f.mode.rejoin()).toBeUndefined();
+		expect(f.notices).toEqual([]);
+		expect(f.mode.enabled).toBe(false);
+	});
+});
+
+describe("automatic Discord rejoin hosts", () => {
+	test("interactive hosts rejoin shared conversations at start and after transitions; other hosts never join", async () => {
+		const f = await fixture();
+		const previousRoot = process.env.OMP_DISCORD_MODE_ROOT;
+		process.env.OMP_DISCORD_MODE_ROOT = f.root;
+		cleanups.push(async () => {
+			if (previousRoot === undefined) delete process.env.OMP_DISCORD_MODE_ROOT;
+			else process.env.OMP_DISCORD_MODE_ROOT = previousRoot;
+		});
+		const sharedId = f.state.id;
+		const canonicalRoot = await fs.realpath(f.root);
+		vi.spyOn(discordConfig, "loadDiscordModeConfig").mockResolvedValue({
+			botToken: "offline-fixture-only",
+			guildId: "100",
+			ownerId: "200",
+		});
+		const shared = vi.spyOn(retirementEvents, "readDiscordSharedSessions").mockResolvedValue([
+			{
+				sessionId: sharedId,
+				sessionFile: path.join(canonicalRoot, "session.jsonl"),
+				projectDir: canonicalRoot,
+				label: "Session",
+				guildId: "100",
+				ownerId: "200",
+			},
+		]);
+		const connect = vi
+			.spyOn(discordClient, "connectDiscordMode")
+			.mockResolvedValue(f.client as unknown as DiscordModeClient);
+		// The live AgentSession object the TUI hands to transitions and dispose; a rejoin is scheduled on its transition.
+		const engine: DiscordSessionEngine = Object.create(f.engine);
+		const transitions = vi.fn(async () => {});
+		engine.waitForSessionTransition = transitions;
+		// Shared, and closed by its previous process.
+		f.setSession({ connected: false });
+
+		// RPC, print, and ACP register no host: a transition schedules no rejoin at all.
+		await discordSessions.invalidateDiscordModeSession(engine);
+		expect(transitions).not.toHaveBeenCalled();
+		expect(connect).not.toHaveBeenCalled();
+
+		const footers: Array<string | undefined> = [];
+		const warnings: string[] = [];
+		const ctx = createInteractiveModeContext({
+			session: engine,
+			sessionManager: f.engine.sessionManager,
+			setHookStatus: (_key: string, text: string | undefined) => footers.push(text),
+			showWarning: (message: string) => warnings.push(message),
+		});
+		discordSessions.startDiscordModeAutoRejoin(ctx);
+		await until(() => discordSessions.getDiscordModeSession(engine)?.enabled === true);
+		expect(f.registers()).toEqual([expect.objectContaining({ rejoin: true, sessionId: sharedId })]);
+		expect(footers.at(-1)).toContain("Rejoined");
+
+		// Switching to a conversation that was never shared detaches the old one, which stays shared, and the
+		// offline gate keeps the broker out of it.
+		const connections = connect.mock.calls.length;
+		f.state.id = crypto.randomUUID();
+		await discordSessions.invalidateDiscordModeSession(engine);
+		expect(f.ops().at(-1)).toBe("detach");
+		expect(f.snapshot().session).toMatchObject({ enabled: true, connected: false });
+		await until(() => shared.mock.calls.length === 2);
+		expect(connect).toHaveBeenCalledTimes(connections);
+		expect(f.registers()).toHaveLength(1);
+
+		// Back to the shared one: it rejoins its channel.
+		f.state.id = sharedId;
+		await discordSessions.invalidateDiscordModeSession(engine);
+		await until(() => discordSessions.getDiscordModeSession(engine)?.enabled === true);
+		expect(f.registers()).toHaveLength(2);
+
+		// Exit keeps sharing and forgets the host, so nothing joins afterwards.
+		await discordSessions.disposeDiscordModeSession(engine);
+		expect(f.ops().at(-1)).toBe("detach");
+		expect(f.snapshot().session).toMatchObject({ enabled: true, connected: false });
+		const scheduled = transitions.mock.calls.length;
+		await discordSessions.invalidateDiscordModeSession(engine);
+		expect(transitions).toHaveBeenCalledTimes(scheduled);
+		expect(warnings).toEqual([]);
+
+		// A moved conversation stops sharing for good, even with nothing attached.
+		await discordSessions.offDiscordModeSession(engine);
+		expect(f.requests.at(-1)).toMatchObject({ op: "disable", sessionId: sharedId });
+		expect(f.snapshot().session.enabled).toBe(false);
 	});
 });

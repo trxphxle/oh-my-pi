@@ -10,10 +10,12 @@ import type { AgentSessionEvent } from "../session/agent-session-events";
 import type { InteractiveModeContext } from "../modes/types";
 import { canonicalProjectDir } from "../launch/paths";
 import { connectDiscordMode } from "./client";
-import { discordModePaths } from "./config";
+import { discordModePaths, loadDiscordModeConfig } from "./config";
 import { DiscordDialogs, type DiscordDialogResult } from "./dialog";
 import { readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import { describeDiscordMode, type DiscordModePresentation } from "./presentation";
+import { readDiscordSharedSessions } from "./retirement-events";
+import { DiscordModeRequestError } from "@oh-my-pi/pi-utils/discord-client";
 import {
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_REPLY,
@@ -41,6 +43,7 @@ export type DiscordSessionEngine = Pick<
 	| "subscribe"
 	| "promptCustomMessage"
 	| "abort"
+	| "waitForSessionTransition"
 > & {
 	sessionManager: Pick<AgentSession["sessionManager"], "getSessionId" | "getCwd" | "ensureOnDisk" | "flush">;
 };
@@ -117,6 +120,10 @@ export interface DiscordSessionOptions {
 	notify?: (text: string) => void;
 	pendingLocalInput?: () => boolean;
 	isWorking?: () => boolean;
+	/** Offline check that saved broker state still shares this conversation; default reads it without connecting. */
+	shared?: () => Promise<boolean>;
+	/** Delay before the one rejoin retry while another process still holds the conversation's lease. */
+	rejoinRetryMs?: number;
 }
 
 const sessions = new WeakMap<DiscordSessionEngine, DiscordModeSession>();
@@ -131,10 +138,52 @@ const MAX_ATTEMPTED_CONNECTIONS = 16;
  * other reconnect failure is retried with backoff.
  */
 const MANUAL_RECONNECT_FAILURE = /configuration differs|protocol does not match/;
+/** One broker lease (45 s) plus margin: a crashed or just-closed process has released it by then. */
+const REJOIN_RETRY_MS = 50_000;
+/** Expected refusals during automatic rejoin (sharing turned off meanwhile, or the conversation changed): stay quiet. */
+const QUIET_REJOIN_FAILURE = /automatic rejoin skipped|Session changed during Discord enrollment/;
 
 /** The broker's stored form: canonical directory plus basename. */
 async function canonicalSessionFile(file: string): Promise<string> {
 	return path.join(await canonicalProjectDir(path.dirname(file)), path.basename(file));
+}
+
+/** Offline gate: saved broker state shares this exact conversation under the configured account. Never connects. */
+async function sharedOffline(engine: DiscordSessionEngine): Promise<boolean> {
+	const file = engine.sessionFile;
+	if (!file) return false;
+	const sessionId = engine.sessionManager.getSessionId();
+	const shared = (await readDiscordSharedSessions()).find(session => session.sessionId === sessionId);
+	if (!shared) return false;
+	try {
+		const config = await loadDiscordModeConfig();
+		if (shared.guildId !== config.guildId || shared.ownerId !== config.ownerId) return false;
+	} catch {
+		return false;
+	}
+	return shared.sessionFile === (await canonicalSessionFile(file).catch(() => undefined));
+}
+
+/** Drop a lease but keep sharing; brokers without `detach` reject it unexecuted and get their only release, `off`. */
+async function releaseLease(client: DiscordSessionClient, lease: ModeLease): Promise<void> {
+	try {
+		await client.request({ op: "detach", lease });
+	} catch (error) {
+		if (error instanceof DiscordModeRequestError && error.outcome === "not-started")
+			await client.request({ op: "off", lease }).catch(() => {});
+	}
+}
+
+/** Bounded best-effort goodbye on a released connection; the connection always closes. */
+async function release(client: DiscordSessionClient, send: () => Promise<void>): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const timeout = setTimeout(resolve, 1500);
+	try {
+		await Promise.race([send().catch(() => {}), promise]);
+	} finally {
+		clearTimeout(timeout);
+		await client.close().catch(() => {});
+	}
 }
 
 /** Existing engine owns every turn. This adapter only routes authorized deliveries and attributable output. */
@@ -164,6 +213,11 @@ export class DiscordModeSession {
 	#localDialogs = 0;
 	#dialogs: DiscordDialogs;
 	#options: DiscordSessionOptions;
+	/** Automatic rejoin in flight or its single retry pending; the footer reads REJOINING meanwhile. */
+	#rejoining = false;
+	#rejoinTimer?: NodeJS.Timeout;
+	/** Set by a successful automatic rejoin; the footer says so until local activity. */
+	#rejoined = false;
 
 	constructor(
 		readonly engine: DiscordSessionEngine,
@@ -201,6 +255,8 @@ export class DiscordModeSession {
 			intakeHeld: this.#intakeHeld,
 			pendingInput: this.pendingInput,
 			working: this.engine.isStreaming || this.#options.isWorking?.(),
+			rejoining: this.#rejoining || this.#rejoinTimer !== undefined,
+			rejoined: this.#rejoined,
 		});
 	}
 
@@ -229,9 +285,10 @@ export class DiscordModeSession {
 		}
 	}
 
-	async on(groupName: string, label: string): Promise<ModeSnapshot> {
+	/** `rejoin` is automatic resume only: the broker refuses unless it still shares this conversation. */
+	async on(groupName: string, label: string, options: { rejoin?: boolean } = {}): Promise<ModeSnapshot> {
 		if (this.enabled) return this.status();
-		await this.off();
+		await this.detach();
 		const epoch = this.#epoch;
 		const identity = this.engine.sessionManager.getSessionId();
 		const file = this.engine.sessionFile;
@@ -258,10 +315,11 @@ export class DiscordModeSession {
 				connectionId: crypto.randomUUID(),
 				label,
 				groupName,
+				...(options.rejoin ? { rejoin: true as const } : {}),
 			});
 			if (!snapshot.lease) throw new Error("Discord broker did not grant a session lease.");
 			if (!current()) {
-				await client.request({ op: "off", lease: snapshot.lease });
+				await releaseLease(client, snapshot.lease);
 				throw new Error("Session changed during Discord enrollment.");
 			}
 		} catch (error) {
@@ -281,8 +339,82 @@ export class DiscordModeSession {
 		return snapshot;
 	}
 
-	/** Invalidate synchronously before awaiting I/O; off never aborts local work or deletes resources. */
-	async off(): Promise<void> {
+	/**
+	 * Resume sharing a reopened conversation. Never enrolls, names, or creates anything: the broker must still have
+	 * this exact identity enabled, and `rejoin` makes it refuse if sharing was turned off in the meantime.
+	 */
+	async rejoin(retried = false): Promise<ModeSnapshot | undefined> {
+		const identity = this.engine.sessionManager.getSessionId();
+		const file = this.engine.sessionFile;
+		if (this.enabled || this.#rejoining || !file) return undefined;
+		clearTimeout(this.#rejoinTimer);
+		this.#rejoinTimer = undefined;
+		this.#rejoining = true;
+		this.#renderStatus();
+		const epoch = this.#epoch;
+		const current = () =>
+			epoch === this.#epoch &&
+			identity === this.engine.sessionManager.getSessionId() &&
+			file === this.engine.sessionFile;
+		let label: string | undefined;
+		try {
+			const enrollment = await this.lookup();
+			const shared = enrollment?.session;
+			if (!current() || !enrollment || shared?.id !== identity || shared.retirement || !shared.enabled)
+				return undefined;
+			const sameFile = (await canonicalSessionFile(shared.sessionFile)) === (await canonicalSessionFile(file));
+			if (!sameFile || !current()) return undefined;
+			label = shared.label;
+			if (shared.connected) {
+				if (retried)
+					this.#options.notify?.(
+						`Discord: #${shared.label} is open in another window, so this one stays local. Close it there, then use /discord on here.`,
+					);
+				else {
+					// A crashed or just-closed process still holds the lease until it expires; never displace a live one.
+					this.#rejoinTimer = setTimeout(() => {
+						this.#rejoinTimer = undefined;
+						if (epoch === this.#epoch) void this.rejoin(true);
+					}, this.#options.rejoinRetryMs ?? REJOIN_RETRY_MS);
+					this.#rejoinTimer.unref();
+				}
+				return undefined;
+			}
+			const snapshot = await this.on(enrollment.group.name, shared.label, { rejoin: true });
+			this.#rejoined = true;
+			const attached = this.#epoch;
+			let held = 0;
+			try {
+				const status = await this.status();
+				held = status.deliveries.filter(item => item.state === "queued" || item.state === "unknown").length;
+			} catch {
+				/* Polling surfaces transport trouble; the held count is advisory. */
+			}
+			if (held && attached === this.#epoch)
+				this.#options.notify?.(
+					`Discord rejoined #${shared.label}; ${held} held or uncertain message(s) need /discord repair or /discord reconcile.`,
+				);
+			return snapshot;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (!QUIET_REJOIN_FAILURE.test(message))
+				this.#options.notify?.(
+					`Discord couldn't rejoin${label ? ` #${label}` : " this conversation"}: ${
+						// Brokers from before automatic rejoin refuse the flag without executing anything.
+						/Invalid Discord request/.test(message)
+							? "the running Discord service predates automatic rejoin; restart it."
+							: message
+					} Use /discord on to retry.`,
+				);
+			return undefined;
+		} finally {
+			this.#rejoining = false;
+			this.#renderStatus();
+		}
+	}
+
+	/** Invalidate synchronously before awaiting I/O; never aborts local work or deletes resources. */
+	#teardown(): { client?: DiscordSessionClient; lease?: ModeLease } {
 		this.#epoch++;
 		const client = this.#client;
 		const lease = this.#lease;
@@ -297,6 +429,9 @@ export class DiscordModeSession {
 		this.#reconnectDelay = RECONNECT_BASE_MS;
 		this.#reconnectBlocked = undefined;
 		this.#attemptedConnections.clear();
+		clearTimeout(this.#rejoinTimer);
+		this.#rejoinTimer = undefined;
+		this.#rejoined = false;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		clearTimeout(this.#timer);
@@ -304,23 +439,52 @@ export class DiscordModeSession {
 		if (this.#sessionFile && enrolledFiles.get(this.#sessionFile) === this) enrolledFiles.delete(this.#sessionFile);
 		this.#dialogs.unavailable();
 		this.#renderStatus();
-		if (!client) return;
-		const deadline = new AbortController();
-		const timeout = setTimeout(() => deadline.abort(), 1500);
-		const { promise, resolve } = Promise.withResolvers<void>();
-		deadline.signal.addEventListener("abort", () => resolve(), { once: true });
+		return { client, lease };
+	}
+
+	/**
+	 * Close this conversation locally but keep it shared: the broker holds its queued work, and resuming it later
+	 * rejoins the same channel. Older brokers without `detach` get `off`, their previous close behavior.
+	 */
+	async detach(): Promise<void> {
+		const { client, lease } = this.#teardown();
+		if (client)
+			await release(client, async () => {
+				if (lease) await releaseLease(client, lease);
+			});
+	}
+
+	/** Explicit and sticky: sharing stays off, also across resume, until /discord on. Works when not attached here. */
+	async off(): Promise<void> {
+		const { client, lease } = this.#teardown();
+		let done = false;
+		if (client)
+			await release(client, async () => {
+				if (!lease) return;
+				await client.request({ op: "off", lease });
+				done = true;
+			});
+		if (!done) await this.#disable();
+	}
+
+	/** Turn sharing off by identity when no working lease is held here; conversations that aren't shared are skipped. */
+	async #disable(): Promise<void> {
+		const file = this.engine.sessionFile;
+		if (!file || !(await (this.#options.shared?.() ?? sharedOffline(this.engine)))) return;
+		const sessionId = this.engine.sessionManager.getSessionId();
+		const client = await (this.#options.connect ?? connectDiscordMode)();
 		try {
-			await Promise.race([
-				lease
-					? client
-							.request({ op: "off", lease })
-							.then(() => {})
-							.catch(() => {})
-					: Promise.resolve(),
-				promise,
-			]);
+			const projectDir = await canonicalProjectDir(this.engine.sessionManager.getCwd());
+			const shared = (await client.lookup(projectDir, sessionId))?.session;
+			if (!shared?.enabled || shared.retirement) return;
+			await client.request({ op: "disable", sessionId, sessionFile: file, projectDir });
+		} catch (error) {
+			if (error instanceof DiscordModeRequestError && error.outcome === "not-started")
+				throw new Error(
+					"The running Discord service did not accept turning sharing off. If it predates this Haiso version, restart it, then run /discord off again.",
+				);
+			throw error;
 		} finally {
-			clearTimeout(timeout);
 			await client.close().catch(() => {});
 		}
 	}
@@ -381,7 +545,8 @@ export class DiscordModeSession {
 	async poll(): Promise<void> {
 		if (this.#polling || !this.#lease) return;
 		if (!this.enabled) {
-			await this.off();
+			// The engine moved to another conversation; the previous one stays shared.
+			await this.detach();
 			return;
 		}
 		// A lost lease never recovers by polling it again; wait out the reconnect backoff instead.
@@ -444,7 +609,7 @@ export class DiscordModeSession {
 				return;
 			}
 			if (retained.retirement) {
-				await this.off();
+				await this.detach();
 				this.#options.notify?.("This conversation was deleted from Discord; Discord mode is off.");
 				return;
 			}
@@ -463,7 +628,7 @@ export class DiscordModeSession {
 				this.#blockReconnect("Another process holds this session's Discord connection.");
 				return;
 			}
-			// Lookup never expires leases, so ours may still be live behind a dead or flaky transport.
+			// Our own lease may still be live behind a dead or flaky transport.
 			let snapshot =
 				retained.connected && ours
 					? await client.request({ op: "status", lease: previous }).catch(() => undefined)
@@ -487,7 +652,7 @@ export class DiscordModeSession {
 				});
 				if (!snapshot.lease) throw new Error("Discord broker did not grant a session lease.");
 				if (!live()) {
-					await client.request({ op: "off", lease: snapshot.lease }).catch(() => {});
+					await releaseLease(client, snapshot.lease);
 					return;
 				}
 				lease = snapshot.lease;
@@ -748,6 +913,7 @@ export class DiscordModeSession {
 
 	#event(event: AgentSessionEvent): void {
 		if (!this.enabled) return;
+		this.#rejoined = false;
 		this.#renderStatus();
 		const active = this.#active;
 		if (!active) return;
@@ -834,12 +1000,44 @@ export function discordModeSessionForFile(
 	return mode?.enabled && mode.engine.sessionManager.getSessionId() === sessionId ? mode : undefined;
 }
 
-export async function invalidateDiscordModeSession(session: DiscordSessionEngine): Promise<void> {
-	await sessions.get(session)?.off();
+/** Interactive TUI hosts only; RPC, print, and ACP never register, so they never join automatically. */
+const hosts = new WeakMap<DiscordSessionEngine, InteractiveModeContext>();
+
+/** Rejoin the host's current conversation if it is still shared; silent unless the broker refuses unexpectedly. */
+async function rejoinDiscordModeSession(engine: DiscordSessionEngine): Promise<void> {
+	const ctx = hosts.get(engine);
+	if (!ctx || ctx.collabGuest || getDiscordModeSession(engine)?.enabled) return;
+	// Offline first: never start the broker, or create the footer, for a conversation that was never shared.
+	if (!(await sharedOffline(engine)) || hosts.get(engine) !== ctx) return;
+	await ensureDiscordModeSession(ctx).rejoin();
 }
 
+/** Remember the interactive host and rejoin a resumed conversation that is still shared with Discord. */
+export function startDiscordModeAutoRejoin(ctx: InteractiveModeContext): void {
+	hosts.set(ctx.session, ctx);
+	void rejoinDiscordModeSession(ctx.session).catch(() => {});
+}
+
+/** Session transitions close the previous conversation but keep it shared; the next one rejoins if it is shared. */
+export async function invalidateDiscordModeSession(session: DiscordSessionEngine): Promise<void> {
+	await sessions.get(session)?.detach();
+	// Called inside the transition, so rejoin only after it (or its rollback) settles.
+	if (hosts.has(session))
+		void session
+			.waitForSessionTransition()
+			.then(() => rejoinDiscordModeSession(session))
+			.catch(() => {});
+}
+
+/** A moved conversation file can never be rebound by the broker, so sharing it stops for good. */
+export async function offDiscordModeSession(session: DiscordSessionEngine): Promise<void> {
+	await (sessions.get(session) ?? new DiscordModeSession(session)).off().catch(() => {});
+}
+
+/** Closing keeps sharing; the conversation rejoins when it is resumed in an interactive TUI. */
 export async function disposeDiscordModeSession(session: DiscordSessionEngine): Promise<void> {
 	const mode = sessions.get(session);
 	sessions.delete(session);
-	await mode?.off();
+	hosts.delete(session);
+	await mode?.detach();
 }

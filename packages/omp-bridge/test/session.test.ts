@@ -7,6 +7,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { DiscordModeRequestError } from "@oh-my-pi/pi-utils/discord-client";
+import { writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import {
 	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_TEXT,
@@ -166,6 +167,11 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 				await beforeRequest?.(input);
 				let result: ModeSnapshot;
 				if (input.op === "register") {
+					if (input.rejoin && !session.enabled)
+						throw new DiscordModeRequestError(
+							"unknown",
+							"Sharing is off or unknown for this conversation; automatic rejoin skipped. Discord mode did not confirm the result; outcome may be unknown. Inspect status before retrying.",
+						);
 					if (session.connected) throw new Error("live lease exists");
 					for (const delivery of deliveries.values())
 						if (delivery.state === "accepted" || delivery.state === "dispatched") delivery.state = "unknown";
@@ -179,6 +185,10 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 						connected: true,
 					};
 					lease = { sessionId: input.sessionId, connectionId: input.connectionId, token: "a".repeat(64) };
+					enrollment = { group, session };
+					result = snapshot();
+				} else if (input.op === "disable") {
+					session = { ...session, connected: false, enabled: false };
 					enrollment = { group, session };
 					result = snapshot();
 				} else {
@@ -225,7 +235,9 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 							break;
 						}
 						case "off":
-							session = { ...session, connected: false, enabled: false };
+						case "detach":
+							// Like the broker: detach keeps sharing; off turns it off.
+							session = { ...session, connected: false, enabled: input.op === "detach" && session.enabled };
 							enrollment = { group, session };
 							for (const item of deliveries.values())
 								if (item.state === "accepted" || item.state === "dispatched") item.state = "unknown";
@@ -338,6 +350,18 @@ async function fixture(options: { timers?: boolean; saved?: boolean; maxReply?: 
 		set enrollment(value: ModeEnrollment | undefined) {
 			enrollment = value;
 		},
+		/** Broker-side session state as the next lookup or register sees it. */
+		setSession(patch: Partial<ModeSession>) {
+			session = { ...session, ...patch };
+			enrollment = { group, session };
+		},
+		/** Saved broker state lists this conversation as shared (the offline pre-filter). */
+		async share() {
+			await writePrivateJson(path.join(root, "state.json"), {
+				version: 1,
+				sessions: [{ id: state.sessionId, sessionFile: state.sessionFile, enabled: true }],
+			});
+		},
 		async restart() {
 			await mode.off();
 			mode = create();
@@ -419,6 +443,7 @@ describe("BridgeSession local identity and lifecycle", () => {
 		expect(f.requests.find(input => input.op === "register")).toMatchObject({
 			label: "Saved native label",
 			groupName: "Existing project",
+			app: "omp",
 		});
 		expect(await f.mode.peers()).toEqual([{ id: f.peer.id, label: "Peer", busy: false, pendingInput: false }]);
 		expect(JSON.stringify(await f.mode.peers())).not.toContain("private");
@@ -430,6 +455,24 @@ describe("BridgeSession local identity and lifecycle", () => {
 		expect(registrations[1]).toMatchObject({ label: "Explicit label" });
 		expect(registrations[0]!.requestId).not.toBe(registrations[1]!.requestId);
 		expect(await fs.readFile(f.state.sessionFile!, "utf8")).toBe(before);
+	});
+
+	test("attaches untagged when a broker predating the app split rejects the app field", async () => {
+		const f = await fixture();
+		f.beforeRequest = async input => {
+			if (input.op === "register" && input.app !== undefined)
+				throw new DiscordModeRequestError(
+					"unknown",
+					"Invalid Discord request: check operation, UUIDs, absolute paths, text/byte limits, and allowed fields. Discord mode did not confirm the result; outcome may be unknown. Inspect status before retrying.",
+				);
+		};
+		expect((await f.mode.on()).session.connected).toBe(true);
+		const [tagged, untagged, ...rest] = f.requests.filter(input => input.op === "register");
+		expect(rest).toEqual([]);
+		if (tagged?.op !== "register") throw new Error("tagged registration missing");
+		const { app, ...fields } = tagged;
+		expect(app).toBe("omp");
+		expect(untagged).toEqual(fields);
 	});
 
 	test("new group defaults to canonical cwd basename and refuses another live lease", async () => {
@@ -887,5 +930,72 @@ describe("BridgeSession private storage and uncertain effects", () => {
 		expect(f.sent).toEqual([{ recipient: f.peer.id, text: "hello peer" }]);
 		await f.mode.off();
 		await expect(f.mode.report("must stay local", "off-report")).rejects.toThrow("off");
+	});
+});
+
+describe("BridgeSession remembered sharing", () => {
+	test("detach keeps sharing, and rejoin reattaches only a still-shared conversation under its retained name", async () => {
+		const f = await fixture();
+		await f.mode.on("Explicit label");
+		expect(await f.mode.detach()).toBe(true);
+		expect(f.requests.at(-1)).toMatchObject({ op: "detach" });
+		expect(f.mode.enabled).toBe(false);
+		// Not listed as shared in saved state: opening it causes no broker traffic.
+		const connects = f.connects;
+		expect(await f.mode.rejoin()).toBeUndefined();
+		expect(f.connects).toBe(connects);
+		await f.share();
+		const notices = f.notices.length;
+		const rejoined = await f.mode.rejoin();
+		expect(rejoined?.session.channelId).toBe("102");
+		expect(f.requests.filter(input => input.op === "register").at(-1)).toMatchObject({
+			rejoin: true,
+			label: "Existing channel",
+		});
+		expect(f.mode.enabled).toBe(true);
+		expect(f.notices).toHaveLength(notices);
+	});
+
+	test("explicit off is sticky, by lease when attached and by identity when not", async () => {
+		const f = await fixture();
+		await f.share();
+		await f.mode.on();
+		expect(await f.mode.off()).toBe(true);
+		// The broker, not the saved view, decides: sharing is off, so nothing reattaches.
+		expect(await f.mode.rejoin()).toBeUndefined();
+		expect(f.requests.filter(input => input.op === "register")).toHaveLength(1);
+		await f.mode.on();
+		await f.mode.detach();
+		expect(await f.mode.off()).toBe(false);
+		await f.mode.disable();
+		expect(f.requests.at(-1)).toEqual({
+			op: "disable",
+			sessionId: f.state.sessionId,
+			sessionFile: path.join(f.root, "native.jsonl"),
+			projectDir: f.root,
+		});
+		expect(await f.mode.rejoin()).toBeUndefined();
+		expect(f.requests.filter(input => input.op === "register")).toHaveLength(2);
+	});
+
+	test("a live lease elsewhere is retried once after it could expire, then reported instead of displaced", async () => {
+		const f = await fixture();
+		await f.share();
+		await f.mode.on();
+		await f.mode.detach();
+		f.setSession({ connected: true, connectionId: randomUUID() });
+		expect(await f.mode.rejoin()).toBeUndefined();
+		const retry = f.timers.at(-1)!;
+		expect(retry.cancelled).toBe(false);
+		// The scheduled retry is this second attempt.
+		expect(await f.mode.rejoin(true)).toBeUndefined();
+		expect(retry.cancelled).toBe(true);
+		expect(f.notices.at(-1)).toContain("attached in another window");
+		expect(f.requests.filter(input => input.op === "register")).toHaveLength(1);
+		// A lifecycle change cancels a pending retry.
+		await f.mode.rejoin();
+		const pending = f.timers.at(-1)!;
+		await f.mode.detach();
+		expect(pending.cancelled).toBe(true);
 	});
 });

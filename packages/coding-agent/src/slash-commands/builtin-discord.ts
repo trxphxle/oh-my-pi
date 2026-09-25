@@ -77,7 +77,8 @@ async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordMod
 		}
 		choices.push({
 			label: "Turn off Discord",
-			description: "Disconnect this session. Local work and channel history stay intact.",
+			description:
+				"Stop sharing this conversation, also when resumed later. Local work and channel history stay intact.",
 			action: "off",
 		});
 	}
@@ -158,7 +159,10 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		subcommands: [
 			{ name: "on", description: "Turn on remote access for this session" },
 			{ name: "status", description: "Show whether Discord is off, connected, or needs attention" },
-			{ name: "off", description: "Turn off remote access; keep local work and channel history" },
+			{
+				name: "off",
+				description: "Stop sharing this conversation, also when resumed; keep local work and channel history",
+			},
 			{ name: "repair", description: "Explicitly create or adopt a group/category or session channel" },
 			{ name: "reconcile", description: "Inspect and explicitly resolve uncertain work without replaying it" },
 			{ name: "rename", description: "Rename the group or session channel" },
@@ -207,18 +211,17 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 							);
 						}
 					} else {
-						ctx.showStatus(
-							"Discord OFF\nThis session is not shared. Open /discord to connect or set up your bot.",
-							{ dim: false },
-						);
+						const { title, detail } = mode.presentation;
+						ctx.showStatus(`${title}\n${detail}`, { dim: false });
 					}
 					return;
 				}
 				if (verb === "off") {
 					await mode.off();
-					ctx.showStatus("Discord OFF\nRemote access stopped. Local work and Discord history are unchanged.", {
-						dim: false,
-					});
+					ctx.showStatus(
+						"Discord OFF\nThis conversation stays private, also when resumed, until /discord on. Local work and Discord history are unchanged.",
+						{ dim: false },
+					);
 					return;
 				}
 				if (verb === "on") {

@@ -29,12 +29,23 @@ export function describeDiscordMode(options: {
 	intakeHeld?: boolean;
 	pendingInput?: boolean;
 	working?: boolean;
+	/** An automatic rejoin of this still-shared conversation is in flight or waiting to retry. */
+	rejoining?: boolean;
+	/** Sharing resumed automatically on reopen; shown until local activity. */
+	rejoined?: boolean;
 }): DiscordModePresentation {
 	if (!options.enabled) {
+		if (options.rejoining)
+			return {
+				state: "off",
+				title: "Discord · REJOINING",
+				detail: "This conversation is still shared with Discord; reconnecting to its channel automatically.",
+				footer: "[Discord · REJOINING]",
+			};
 		return {
 			state: "off",
 			title: "Discord OFF",
-			detail: "This session is not shared with Discord.",
+			detail: "This session is not shared. Open /discord to connect or set up your bot.",
 			footer: "[Discord OFF]  /discord to connect",
 		};
 	}
@@ -76,7 +87,13 @@ export function describeDiscordMode(options: {
 		title = "Discord ON · CONNECTED";
 		detail = "Remote messages can reach this session.";
 	}
-	const activity = options.pendingInput ? "Awaiting your answer" : options.working ? "Working" : undefined;
+	const activity = options.pendingInput
+		? "Awaiting your answer"
+		: options.working
+			? "Working"
+			: options.rejoined
+				? "Rejoined"
+				: undefined;
 	return {
 		state,
 		title,

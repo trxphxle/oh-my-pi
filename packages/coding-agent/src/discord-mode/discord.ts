@@ -2,6 +2,7 @@
 // omp-discord-bridge (Copyright (c) 2026 treearc, MIT License).
 import { createHash } from "node:crypto";
 import {
+	type APIEmbed,
 	ActionRowBuilder,
 	ApplicationCommandType,
 	AttachmentBuilder,
@@ -10,6 +11,7 @@ import {
 	ChannelType,
 	Client,
 	type ClientEvents,
+	Colors,
 	Events,
 	GatewayIntentBits,
 	type Guild,
@@ -40,6 +42,7 @@ import {
 	type DiscordModeConfig,
 	type DiscordPort,
 	type DiscordPortHandlers,
+	type ModeApp,
 	type ModeControlRequest,
 	type ModeControlResult,
 	type ModeDialog,
@@ -62,6 +65,11 @@ const REPLY_PREVIEW = 1_800;
 const READ_PERMISSIONS = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
 const WRITE_PERMISSIONS = READ_PERMISSIONS | PermissionFlagsBits.SendMessages;
 const BOT_PERMISSIONS = WRITE_PERMISSIONS | PermissionFlagsBits.AttachFiles | PermissionFlagsBits.EmbedLinks;
+/** Small colored session-card embed; overview cards carry none. */
+const APP_EMBEDS: Record<ModeApp, APIEmbed> = {
+	haiso: { color: Colors.Purple, description: "🟣 Haiso session" },
+	omp: { color: Colors.Blue, description: "🔵 OMP session" },
+};
 
 type ManagedChannel = Extract<GuildBasedChannel, { type: ChannelType.GuildText | ChannelType.GuildCategory }>;
 type ReplyInteraction = Extract<Interaction, { reply: unknown }>;
@@ -609,6 +617,25 @@ export class DiscordAdapter implements DiscordPort {
 		await channel.setParent(categoryId, { lockPermissions: false, reason: "Haiso explicit owner repair" });
 	}
 
+	async arrange(categoryId: string, channelIds: string[]): Promise<void> {
+		const guild = this.#requireGuild();
+		const category = guild.channels.cache.get(categoryId);
+		if (category?.type !== ChannelType.GuildCategory)
+			throw new Error("Discord arrangement requires a cached project category.");
+		// Gateway-maintained cache: an already ordered category costs no request and emits no ChannelUpdate.
+		const wanted = channelIds.flatMap(id => {
+			const channel = guild.channels.cache.get(id);
+			return channel?.type === ChannelType.GuildText && channel.parentId === categoryId ? [channel] : [];
+		});
+		const current = wanted.toSorted(
+			(a, b) => a.rawPosition - b.rawPosition || (BigInt(a.id) < BigInt(b.id) ? -1 : 1),
+		);
+		if (current.every((channel, index) => channel === wanted[index])) return;
+		this.#requireManage(category);
+		// One bulk PATCH listing only owned channels; permissions are never synced with the category.
+		await guild.channels.setPositions(wanted.map((channel, position) => ({ channel, position })));
+	}
+
 	/** Fetch afresh: null/access failures never authorize treating a channel as deleted. */
 	async #retirementChannel(id: string, marker: string, closedTopic: string): Promise<TextChannel | undefined> {
 		const guild = this.#requireGuild();
@@ -786,6 +813,7 @@ export class DiscordAdapter implements DiscordPort {
 		connectionId?: string,
 		messageId?: string,
 		existingOnly = false,
+		app?: ModeApp,
 	): Promise<string> {
 		if (!text || text.length > 64_000)
 			return Promise.reject(new Error("Discord status exceeds its 64000-character limit."));
@@ -834,6 +862,7 @@ export class DiscordAdapter implements DiscordPort {
 				const payload = {
 					...this.#textPayload(text, "haiso-status.txt"),
 					components: connectionId ? this.#sessionComponents(channelId, connectionId) : [],
+					...(app ? { embeds: [APP_EMBEDS[app]] } : {}),
 				};
 				if (message) {
 					state.id = message.id;
@@ -842,7 +871,7 @@ export class DiscordAdapter implements DiscordPort {
 					await message.edit({
 						...payload,
 						attachments: [],
-						embeds: [],
+						embeds: app ? [APP_EMBEDS[app]] : [],
 						allowedMentions: MENTIONS,
 					});
 				} else {

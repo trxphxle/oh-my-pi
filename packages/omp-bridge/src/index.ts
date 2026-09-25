@@ -120,11 +120,30 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 		},
 	};
 
+	function ensureSession(): BridgeSession {
+		if (!session) {
+			const flag = pi.getFlag("bridge-root");
+			const root = path.resolve(
+				typeof flag === "string" && flag
+					? flag
+					: process.env.HAISO_BRIDGE_ROOT || path.join(os.homedir(), ".omp", "agent", "discord-mode"),
+			);
+			session = new BridgeSession(host, { root, ...options });
+		}
+		return session;
+	}
+
+	/** Local interactive TUI only; RPC and print hosts never attach automatically. */
+	function autoAttach(ctx: ExtensionContext): void {
+		if (ctx.mode === "tui" && ctx.hasUI) void ensureSession().rejoin();
+	}
+
+	/** Lifecycle detach keeps the conversation shared; resuming it reattaches. */
 	async function detach(): Promise<void> {
 		epoch++;
 		approvals.clear();
 		asks.clear();
-		if (session) await session.off();
+		if (session) await session.detach();
 		else await host.setToolEnabled(false);
 	}
 
@@ -223,25 +242,26 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 				switch (action) {
 					case "on": {
 						epoch++;
-						if (!session) {
-							const flag = pi.getFlag("bridge-root");
-							const root = path.resolve(
-								typeof flag === "string" && flag
-									? flag
-									: process.env.HAISO_BRIDGE_ROOT || path.join(os.homedir(), ".omp", "agent", "discord-mode"),
-							);
-							session = new BridgeSession(host, { root, ...options });
-						}
+						const bridge = ensureSession();
 						const generation = epoch;
-						const snapshot = await session.on(rest.join(" ") || undefined);
+						const snapshot = await bridge.on(rest.join(" ") || undefined);
 						if (generation !== epoch) return;
 						ctx.ui.notify(describe(snapshot), "info");
 						break;
 					}
-					case "off":
-						await detach();
-						ctx.ui.notify("Bridge is off.", "info");
+					case "off": {
+						epoch++;
+						approvals.clear();
+						asks.clear();
+						const bridge = ensureSession();
+						// Not attached here, or its lease was already lost: record the off by identity instead.
+						if (!(await bridge.off())) await bridge.disable();
+						ctx.ui.notify(
+							"Bridge is off; this conversation stays private, also when resumed, until /bridge on.",
+							"info",
+						);
 						break;
+					}
 					case "status": {
 						const snapshot = await session?.status();
 						ctx.ui.notify(
@@ -331,15 +351,20 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 
 	pi.on("session_start", async (_event, ctx) => {
 		await useContext(ctx);
+		autoAttach(ctx);
 	});
 	const onLifecycleChange = async (_event: unknown, ctx: ExtensionContext) => {
 		latest = ctx;
 		observedIdentity = identity(ctx);
 		await detach();
 	};
-	pi.on("session_switch", onLifecycleChange);
-	pi.on("session_branch", onLifecycleChange);
-	pi.on("session_tree", onLifecycleChange);
+	const onSessionChange = async (event: unknown, ctx: ExtensionContext) => {
+		await onLifecycleChange(event, ctx);
+		autoAttach(ctx);
+	};
+	pi.on("session_switch", onSessionChange);
+	pi.on("session_branch", onSessionChange);
+	pi.on("session_tree", onSessionChange);
 	pi.on("session_shutdown", onLifecycleChange);
 	pi.on("message_start", async (event, ctx) => {
 		await useContext(ctx);

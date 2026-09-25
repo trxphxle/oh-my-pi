@@ -321,6 +321,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	#allSessions: T[];
 	#showCwd: boolean;
 	#pinnedIds: ReadonlySet<string>;
+	readonly #badges: ReadonlyMap<string, string>;
 	readonly #getCurrentSessionPath: () => string | undefined;
 	readonly #historyMatcher?: SessionHistoryMatcher;
 	#historyMergeTimer: NodeJS.Timeout | undefined;
@@ -358,11 +359,13 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		getTerminalRows: () => number = () => 24,
 		pinnedIds: ReadonlySet<string> = new Set(),
 		currentSessionPath?: string | (() => string | undefined),
+		badges: ReadonlyMap<string, string> = new Map(),
 	) {
 		this.#getTerminalRows = getTerminalRows;
 		this.#allSessions = sessions;
 		this.#showCwd = showCwd;
 		this.#pinnedIds = pinnedIds;
+		this.#badges = badges;
 		this.#getCurrentSessionPath =
 			typeof currentSessionPath === "function" ? currentSessionPath : () => currentSessionPath;
 		this.#historyMatcher = historyMatcher;
@@ -710,6 +713,10 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 			if (status) {
 				metadata += ` ${dot} ${status}`;
 			}
+			const badge = this.#badges.get(session.id);
+			if (badge) {
+				metadata += ` ${dot} ${theme.fg("accent", badge)}`;
+			}
 			if (session.parentSessionPath) {
 				metadata += ` ${dot} ${dim(`${theme.icon.branch} fork`)}`;
 			}
@@ -854,6 +861,8 @@ export interface SessionSelectorOptions<T extends SessionSelectorEntry = Session
 	fillHeight?: boolean;
 	/** Set of pinned session ids to display with a pin indicator. */
 	pinnedIds?: ReadonlySet<string>;
+	/** Short per-session labels (session id → text) appended to each row's metadata, e.g. sharing state. */
+	badges?: ReadonlyMap<string, string>;
 	/** Path of the live session, or a getter so detach/newSession stays accurate. */
 	currentSessionPath?: string | (() => string | undefined);
 }
@@ -932,6 +941,7 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 			options.getTerminalRows,
 			options.pinnedIds,
 			options.currentSessionPath,
+			options.badges,
 		);
 		// Every exit path cancels the list's pending history merge, so a stale
 		// debounce timer can never run its SQLite lookup after the picker closed.

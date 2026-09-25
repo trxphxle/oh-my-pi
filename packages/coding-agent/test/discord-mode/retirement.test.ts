@@ -10,6 +10,7 @@ import {
 	commitDiscordDeletionEvent,
 	discardDiscordDeletionEvent,
 	isDiscordDeletedSessionFile,
+	loadDiscordSessionBadges,
 	lookupDiscordDeletionBinding,
 	prepareDiscordDeletionEvent,
 	readDiscordDeletionEvents,
@@ -644,5 +645,36 @@ describe("startup retirement replay", () => {
 		});
 		expect(notified).toBe(false);
 		expect(await fs.readFile(file, "utf8")).toBe("PRIVATE_INVALID_REPLAY_STATE");
+	});
+});
+
+describe("resume picker Discord badges", () => {
+	it("marks only conversations the broker still shares, offline, and never fails the picker", async () => {
+		const { temporary, root, nativeDir, binding } = await fixture();
+		const state = stateFor(binding);
+		const [shared] = state.sessions;
+		const other = (name: string) => ({
+			...shared!,
+			id: randomUUID(),
+			sessionFile: path.join(nativeDir, `${name}.jsonl`),
+			channelId: undefined,
+		});
+		await writePrivateJson(path.join(root, "state.json"), {
+			...state,
+			sessions: [
+				{ ...shared, enabled: true },
+				{ ...other("closed-before-remembered-sharing"), enabled: false },
+				{
+					...other("deleted"),
+					enabled: true,
+					retirement: { eventId: randomUUID(), policy: "retain", state: "done", deletedAt: 1 },
+				},
+				other("never-enabled"),
+			],
+		});
+		expect(await loadDiscordSessionBadges(root)).toEqual(new Map([[binding.sessionId, "Discord"]]));
+		await fs.writeFile(path.join(root, "state.json"), "PRIVATE_INVALID_STATE", { mode: 0o600 });
+		expect(await loadDiscordSessionBadges(root)).toEqual(new Map());
+		expect(await loadDiscordSessionBadges(path.join(temporary, "missing"))).toEqual(new Map());
 	});
 });

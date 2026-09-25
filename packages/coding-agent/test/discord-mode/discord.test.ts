@@ -958,6 +958,11 @@ describe("Discord mode gateway adapter (offline)", () => {
 		await f.adapter.start(f.handlers);
 		await f.adapter.rename(CHANNEL, "My Session");
 		expect(await f.adapter.inspect(CHANNEL)).toMatchObject({ channel: { name: "my-session" } });
+		await f.adapter.rename(CHANNEL, "🔵 API Dev");
+		expect(await f.adapter.inspect(CHANNEL)).toMatchObject({ channel: { name: "🔵-api-dev" } });
+		expect((await f.adapter.createChannel("category", "🟣-Session One", "haiso:session:one")).name).toBe(
+			"🟣-session-one",
+		);
 		await f.adapter.move(CHANNEL, "destination");
 		expect(f.channel.setParent).toHaveBeenCalledWith(
 			"destination",
@@ -966,6 +971,56 @@ describe("Discord mode gateway adapter (offline)", () => {
 		expect(await f.adapter.inspect(CHANNEL)).toMatchObject({ channel: { parentId: "destination", private: true } });
 		f.setEffective(READ_WRITE | PermissionFlagsBits.AttachFiles | PermissionFlagsBits.EmbedLinks);
 		await expect(f.adapter.rename(CHANNEL, "denied")).rejects.toThrow("Manage Channels");
+	});
+
+	it("orders only listed category channels in one bulk request and skips an ordered category", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const guild = (await f.client.guilds.fetch(GUILD)) as unknown as {
+			channels: { fetch(id: string): Promise<unknown> };
+		};
+		const text = (id: string, rawPosition: number, parentId = "category") => ({
+			id,
+			type: ChannelType.GuildText,
+			parentId,
+			rawPosition,
+		});
+		const children = [text("201", 2), text("202", 0), text("203", 1), text("204", 0), text("205", 0, "elsewhere")];
+		const setPositions = vi.fn(
+			async (positions: Array<{ channel: { id: string; rawPosition: number }; position: number }>) => {
+				for (const { channel, position } of positions) channel.rawPosition = position;
+				return guild;
+			},
+		);
+		Object.assign(guild.channels, {
+			cache: new Collection<string, unknown>([
+				["category", await guild.channels.fetch("category")],
+				...children.map(channel => [channel.id, channel] as const),
+			]),
+			setPositions,
+		});
+		await f.adapter.arrange("category", ["201", "202", "203", "205"]);
+		expect(setPositions).toHaveBeenCalledTimes(1);
+		// Unlisted and foreign channels are untouched; permissions are never synced.
+		expect(setPositions.mock.calls[0]![0].map(({ channel, ...entry }) => [channel.id, entry])).toEqual([
+			["201", { position: 0 }],
+			["202", { position: 1 }],
+			["203", { position: 2 }],
+		]);
+		await f.adapter.arrange("category", ["201", "202", "203", "205"]);
+		expect(setPositions).toHaveBeenCalledTimes(1);
+	});
+
+	it("colors session cards by app and keeps the color when the card is edited", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const id = await f.adapter.status(CHANNEL, "OMP · api", "app-card", CONNECTION, undefined, false, "omp");
+		expect(f.sent[0]?.embeds).toMatchObject([{ color: 0x3498db }]);
+		await f.adapter.status(CHANNEL, "OMP · api idle", "app-card", CONNECTION, id, false, "omp");
+		expect(f.edited.at(-1)?.embeds).toMatchObject([{ color: 0x3498db }]);
+		await f.adapter.status(CHANNEL, "Haiso · api", "app-card", CONNECTION, id, false, "haiso");
+		expect(f.edited.at(-1)?.embeds).toMatchObject([{ color: 0x9b59b6 }]);
+		expect(f.sent).toHaveLength(1);
 	});
 
 	it("retains history and permissions, archives once, and still delivers closed-channel owner notices", async () => {

@@ -56,6 +56,7 @@ import {
 	getDiscordDeletionChoices,
 } from "../../discord-mode/deletion-ui";
 import { deleteSessionWithDiscord } from "../../discord-mode/retirement";
+import { loadDiscordSessionBadges } from "../../discord-mode/retirement-events";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -1882,9 +1883,10 @@ export class SelectorController {
 				showCwd: true,
 			};
 		} else {
-			const [loadedSessions, pinnedIds] = await Promise.all([
+			const [loadedSessions, pinnedIds, badges] = await Promise.all([
 				SessionManager.listForPicker(this.ctx.sessionManager.getCwd(), this.ctx.sessionManager.getSessionDir()),
 				loadPinnedSessionIds(),
+				loadDiscordSessionBadges(),
 			]);
 			sessions = loadedSessions;
 			const historyStorage = this.ctx.historyStorage;
@@ -1917,6 +1919,7 @@ export class SelectorController {
 				historyMatcher,
 				loadAllSessions: () => SessionManager.listAllForPicker(),
 				pinnedIds,
+				badges,
 				// Live getter so detach/newSession stays accurate; tolerant of partial
 				// contexts and in-memory sessions (undefined file means no marker).
 				currentSessionPath: () => this.ctx.sessionManager.getSessionFile?.() ?? undefined,

@@ -70,6 +70,8 @@ export interface ModeDeletionEvent {
 }
 /** Owner @mention policy for one session; absent means `needs-you`. */
 export type ModeNotify = "all" | "needs-you" | "off";
+/** Host app that attached a session; absent means `haiso` (older records and Haiso clients omit it). */
+export type ModeApp = "haiso" | "omp";
 export interface ModeSession {
 	id: string;
 	groupId: string;
@@ -85,6 +87,7 @@ export interface ModeSession {
 	state: BindingState;
 	retirement?: ModeRetirement;
 	notify?: ModeNotify;
+	app?: ModeApp;
 }
 export interface ModeEnrollment {
 	group: ModeGroup;
@@ -140,10 +143,24 @@ export type ModeRequest =
 			connectionId: string;
 			label: string;
 			groupName: string;
+			/** Attaching host app; absent means `haiso`. Older brokers reject the field. */
+			app?: ModeApp;
+			/**
+			 * Automatic resume only: refuse unless the broker still has this session enrolled, enabled, and not retired;
+			 * never creates a session. Older brokers reject the field.
+			 */
+			rejoin?: true;
 	  }
 	| { op: "poll"; lease: ModeLease; busy: boolean; pendingInput: boolean }
 	| { op: "status"; lease: ModeLease }
 	| { op: "off"; lease: ModeLease }
+	/** Drop this connection but keep sharing enabled, so resuming the conversation rejoins its channel. */
+	| { op: "detach"; lease: ModeLease }
+	/**
+	 * Sticky off by native identity; needs no lease, so it also works while the conversation is not attached.
+	 * Refused while another process holds a live lease.
+	 */
+	| { op: "disable"; sessionId: string; sessionFile: string; projectDir: string }
 	| {
 			op: "receipt";
 			lease: ModeLease;
@@ -227,6 +244,8 @@ export interface DiscordPort {
 	createChannel(categoryId: string, name: string, marker: string): Promise<RemoteChannel>;
 	rename(id: string, name: string): Promise<void>;
 	move(id: string, categoryId: string): Promise<void>;
+	/** Orders the listed children of one category top-to-bottom; unlisted channels are untouched. */
+	arrange(categoryId: string, channelIds: string[]): Promise<void>;
 	/** Owner reports and notices; chunked into ordinary messages, never mentions. */
 	publish(channelId: string, text: string, key: string): Promise<void>;
 	/** Final owner reply; one message, long text attached in full. `mention` pings the owner. */
@@ -238,6 +257,8 @@ export interface DiscordPort {
 		connectionId?: string,
 		messageId?: string,
 		existingOnly?: boolean,
+		/** Session cards carry the attaching app's color; overview cards omit it. */
+		app?: ModeApp,
 	): Promise<string>;
 	/** `mention` pings the owner; the broker decides per session notify mode. */
 	showDialog(channelId: string, dialog: ModeDialog, options?: { mention?: boolean }): Promise<void>;

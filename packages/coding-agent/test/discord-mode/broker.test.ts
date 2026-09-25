@@ -21,6 +21,7 @@ import type {
 	DiscordPortHandlers,
 	ModeControlRequest,
 	ModeControlResult,
+	ModeApp,
 	ModeDialog,
 	ModeDeletionBinding,
 	ModeDeletionEvent,
@@ -44,7 +45,7 @@ class FixtureDiscord implements DiscordPort {
 		key: string;
 		mention: boolean;
 	}> = [];
-	readonly cards = new Map<string, { id: string; text: string; connectionId?: string }>();
+	readonly cards = new Map<string, { id: string; text: string; connectionId?: string; app?: ModeApp }>();
 	readonly legacyCards = new Set<string>();
 	readonly dialogs = new Map<string, ModeDialog>();
 	readonly shownDialogs: Array<{ title: string; mention: boolean }> = [];
@@ -59,6 +60,10 @@ class FixtureDiscord implements DiscordPort {
 	failNextRetire: "before" | "after" | undefined;
 	beforeRetire: (() => Promise<void>) | undefined;
 	readonly retirements: Array<{ channelId: string; policy: ModeRetirementPolicy }> = [];
+	readonly renames: Array<{ id: string; name: string }> = [];
+	failNextRename = false;
+	/** Last requested top-to-bottom order per category. */
+	readonly arrangements = new Map<string, string[]>();
 	#next = 1000;
 
 	async start(handlers: DiscordPortHandlers): Promise<void> {
@@ -102,7 +107,15 @@ class FixtureDiscord implements DiscordPort {
 		return { ...channel };
 	}
 	async rename(id: string, name: string): Promise<void> {
+		this.renames.push({ id, name });
+		if (this.failNextRename) {
+			this.failNextRename = false;
+			throw new Error("rename rate limited");
+		}
 		this.channel(id).name = name;
+	}
+	async arrange(categoryId: string, channelIds: string[]): Promise<void> {
+		this.arrangements.set(categoryId, [...channelIds]);
 	}
 	async move(id: string, categoryId: string): Promise<void> {
 		this.channel(id).parentId = categoryId;
@@ -161,6 +174,7 @@ class FixtureDiscord implements DiscordPort {
 		connectionId?: string,
 		messageId?: string,
 		existingOnly = false,
+		app?: ModeApp,
 	): Promise<string> {
 		if (this.failNextStatusInspection) {
 			this.failNextStatusInspection = false;
@@ -171,7 +185,7 @@ class FixtureDiscord implements DiscordPort {
 			throw new Error("exact saved status message unavailable; replacement is forbidden");
 		if (messageId && existing?.id !== messageId) messageId = undefined;
 		const id = messageId ?? (this.legacyCards.has(channelId) ? existing?.id : undefined);
-		const card = { id: id ?? String(this.#next++), text, connectionId };
+		const card = { id: id ?? String(this.#next++), text, connectionId, app };
 		if (!id) this.statusCreates++;
 		this.cards.set(channelId, card);
 		this.legacyCards.delete(channelId);
@@ -615,7 +629,7 @@ describe("durable Discord mode broker", () => {
 			broker = new DiscordModeBroker({ config, storePath, port });
 			await broker.start();
 			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe("done");
-			expect(port.channel(session.session.channelId!).name).toBe("archived-recover");
+			expect(port.channel(session.session.channelId!).name).toBe("archived-🟣-recover");
 			expect(port.retirements).toEqual([{ channelId: session.session.channelId!, policy: "retain" }]);
 			expect(port.statusCreates).toBe(creates);
 			const conflicting: ModeDeletionEvent = {
@@ -707,7 +721,7 @@ describe("durable Discord mode broker", () => {
 			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe(
 				"attention",
 			);
-			expect(port.channel(channelId).name).toBe("archived-card-inspection");
+			expect(port.channel(channelId).name).toBe("archived-🟣-card-inspection");
 			expect(port.cards.get(channelId)).toEqual(savedCard);
 			const recovered = await broker.request({ op: "retire", eventId: event.id });
 			expect(recovered.session.retirement?.state).toBe("done");
@@ -744,7 +758,7 @@ describe("durable Discord mode broker", () => {
 			expect((await broker.request({ op: "retire", eventId: event.id })).session.retirement?.state).toBe(
 				"attention",
 			);
-			expect(port.channel(channelId).name).toBe("archived-missing-card");
+			expect(port.channel(channelId).name).toBe("archived-🟣-missing-card");
 			await broker.close();
 			broker = new DiscordModeBroker({ config, storePath, port });
 			await broker.start();
@@ -1792,6 +1806,155 @@ describe("durable Discord mode broker", () => {
 	}, 20_000);
 });
 
+describe("remembered sharing", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	function identity(input: Extract<ModeRequest, { op: "register" }>) {
+		return { sessionId: input.sessionId, sessionFile: input.sessionFile, projectDir: input.projectDir };
+	}
+
+	it("closing keeps sharing, holds queued work, and a rejoin reuses the channel without creating anything", async () => {
+		using temporary = TempDir.createSync("@discord-rejoin-detach-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "remembered");
+			const first = await broker.request(input);
+			await port.owner(first, "arrived before closing", "message", "8600");
+			const closed = await broker.request({ op: "detach", lease: lease(first) });
+			expect(closed.session).toMatchObject({ enabled: true, connected: false });
+			await expect(poll(broker, first)).rejects.toThrow("reconnect explicitly");
+			// Shared-but-closed survives a broker restart without migration.
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect((await broker.lookup(input.projectDir, input.sessionId))?.session).toMatchObject({
+				enabled: true,
+				connected: false,
+			});
+			const creates = port.creates;
+			const rejoined = await broker.request({ ...resumed(input), label: first.session.label, rejoin: true });
+			expect(rejoined.session.channelId).toBe(first.session.channelId);
+			expect(rejoined.session).toMatchObject({ enabled: true, connected: true });
+			expect(port.creates).toBe(creates);
+			// Work that arrived for the closed conversation stays held; rejoining never dispatches it.
+			expect((await poll(broker, rejoined)).deliveries).toEqual([]);
+			const status = await broker.request({ op: "status", lease: lease(rejoined) });
+			expect(status.deliveries.map(item => [item.text, item.state])).toEqual([["arrived before closing", "queued"]]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("explicit off is sticky across restart, and so is a lease-free off while the conversation is closed", async () => {
+		using temporary = TempDir.createSync("@discord-rejoin-off-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "private-later");
+			const first = await broker.request(input);
+			await broker.request({ op: "off", lease: lease(first) });
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			await expect(broker.request({ ...resumed(input), rejoin: true })).rejects.toThrow("automatic rejoin skipped");
+			// Only an explicit enable shares it again.
+			const again = await broker.request(resumed(input));
+			expect(again.session.channelId).toBe(first.session.channelId);
+			await broker.request({ op: "detach", lease: lease(again) });
+			const disabled = await broker.request({ op: "disable", ...identity(input) });
+			expect(disabled.session).toMatchObject({ enabled: false, connected: false });
+			expect(disabled.lease).toBeUndefined();
+			await expect(broker.request({ ...resumed(input), rejoin: true })).rejects.toThrow("automatic rejoin skipped");
+			expect((await broker.lookup(input.projectDir, input.sessionId))?.session?.enabled).toBe(false);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("a lease-free off never takes over a live connection or a rebound file", async () => {
+		using temporary = TempDir.createSync("@discord-rejoin-disable-live-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "open-elsewhere");
+			const live = await broker.request(input);
+			await expect(broker.request({ op: "disable", ...identity(input) })).rejects.toThrow("live Discord connection");
+			await expect(
+				broker.request({ op: "disable", ...identity(input), sessionFile: path.join(root, "other.jsonl") }),
+			).rejects.toThrow("different project directory or session file");
+			await expect(
+				broker.request({ op: "disable", ...identity(registration(root, "never-shared")) }),
+			).rejects.toThrow("not shared");
+			expect((await poll(broker, live)).session).toMatchObject({ enabled: true, connected: true });
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("unknown and deleted conversations never rejoin, and a rejoin never enrolls", async () => {
+		using temporary = TempDir.createSync("@discord-rejoin-unknown-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			await expect(broker.request({ ...registration(root, "never-shared"), rejoin: true })).rejects.toThrow(
+				"automatic rejoin skipped",
+			);
+			expect(port.creates).toBe(0);
+			const input = registration(root, "deleted-later");
+			await fs.writeFile(input.sessionFile, `${JSON.stringify({ type: "session", id: input.sessionId })}\n`);
+			const first = await broker.request(input);
+			await broker.request({ op: "detach", lease: lease(first) });
+			await deleted(storePath, first);
+			await expect(broker.request({ ...resumed(input), rejoin: true })).rejects.toThrow("permanently deleted");
+			expect((await broker.lookup(input.projectDir, input.sessionId))?.session).toMatchObject({
+				enabled: false,
+				retirement: expect.anything(),
+			});
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("lookup reports a crashed process's expired lease as closed, so its conversation can rejoin", async () => {
+		using temporary = TempDir.createSync("@discord-rejoin-expire-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "crashed");
+			await broker.request(input);
+			expect((await broker.lookup(input.projectDir, input.sessionId))?.session?.connected).toBe(true);
+			const now = Date.now();
+			vi.spyOn(Date, "now").mockReturnValue(now + 46_000);
+			expect((await broker.lookup(input.projectDir, input.sessionId))?.session).toMatchObject({
+				enabled: true,
+				connected: false,
+			});
+			const rejoined = await broker.request({ ...resumed(input), rejoin: true });
+			expect(rejoined.session.connected).toBe(true);
+		} finally {
+			await broker.close();
+		}
+	});
+});
+
 describe("owner mention policy", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -1932,6 +2095,165 @@ describe("owner mention policy", () => {
 			expect(reconnected.session.notify).toBe("off");
 			await showDialog(broker, reconnected, "after-reconnect");
 			expect(port.shownDialogs).toEqual([{ title: "after-reconnect", mention: false }]);
+		} finally {
+			await broker.close();
+		}
+	});
+});
+
+describe("Haiso and OMP app split", () => {
+	it("persists the OMP app, marks channels per app, and reads app-less records as Haiso", async () => {
+		using temporary = TempDir.createSync("@discord-app-register-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const haiso = await broker.request(registration(root, "Backend Work"));
+			const ompInput = { ...registration(root, "🔵 API dev"), app: "omp" as const };
+			const omp = await broker.request(ompInput);
+			const ompChannel = omp.session.channelId!;
+			expect(port.channel(haiso.session.channelId!).name).toBe("🟣-backend-work");
+			expect(port.channel(ompChannel).name).toBe("🔵-api-dev");
+			expect(haiso.session.label).toBe("backend-work");
+			expect(haiso.session.app).toBeUndefined();
+			expect(omp.session).toMatchObject({ label: "api-dev", app: "omp" });
+			expect(omp.peers.map(peer => [peer.id, peer.app])).toEqual([[haiso.session.id, undefined]]);
+			expect(port.cards.get(ompChannel)).toMatchObject({ app: "omp" });
+			expect(port.cards.get(ompChannel)?.text).toStartWith("OMP · api-dev\n");
+			expect(port.cards.get(haiso.session.channelId!)?.text).toStartWith("Haiso · backend-work\n");
+			await broker.close();
+			// A record written before the app split (or by an older bridge) has no app field.
+			const saved = JSON.parse(await fs.readFile(storePath, "utf8")) as {
+				sessions: Array<{ id: string; app?: string }>;
+			};
+			expect(saved.sessions.map(session => [session.id, session.app])).toEqual([
+				[haiso.session.id, undefined],
+				[omp.session.id, "omp"],
+			]);
+			for (const session of saved.sessions) delete session.app;
+			await fs.writeFile(storePath, JSON.stringify(saved));
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect(port.channel(ompChannel).name).toBe("🟣-api-dev");
+			expect(port.cards.get(ompChannel)).toMatchObject({ app: "haiso" });
+			expect(port.cards.get(ompChannel)?.text).toStartWith("Haiso · api-dev\n");
+			const reattached = await broker.request(resumed(ompInput));
+			expect(reattached.session).toMatchObject({ label: "api-dev", app: "omp", channelId: ompChannel });
+			expect(port.channel(ompChannel).name).toBe("🔵-api-dev");
+			expect(port.cards.get(ompChannel)?.text).toStartWith("OMP · api-dev\n");
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("adopts manual renames without markers and restores the marker once per change", async () => {
+		using temporary = TempDir.createSync("@discord-app-rename-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const session = await broker.request(registration(root, "first"));
+			const channelId = session.session.channelId!;
+			const before = port.renames.length;
+			port.channel(channelId).name = "🔵-other";
+			await port.handlers!.changed();
+			expect((await broker.request({ op: "status", lease: lease(session) })).session.label).toBe("other");
+			expect(port.channel(channelId).name).toBe("🟣-other");
+			await port.handlers!.changed();
+			expect(port.renames.slice(before)).toEqual([{ id: channelId, name: "🟣-other" }]);
+			port.channel(channelId).name = "other";
+			await port.handlers!.changed();
+			await port.handlers!.changed();
+			expect(port.renames.slice(before)).toEqual([
+				{ id: channelId, name: "🟣-other" },
+				{ id: channelId, name: "🟣-other" },
+			]);
+			await broker.request({
+				op: "rename",
+				lease: lease(session),
+				requestId: randomUUID(),
+				target: "session",
+				name: "🔵 Renamed",
+			});
+			expect(port.channel(channelId).name).toBe("🟣-renamed");
+			expect((await broker.request({ op: "status", lease: lease(session) })).session.label).toBe("renamed");
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("relabels pre-marker channels in place once on start and contains relabel failures", async () => {
+		using temporary = TempDir.createSync("@discord-app-relabel-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "legacy");
+			const session = await broker.request(input);
+			const channelId = session.session.channelId!;
+			await broker.close();
+			port.channel(channelId).name = "legacy";
+			const creates = port.creates;
+			const statusCreates = port.statusCreates;
+			const before = port.renames.length;
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect(port.channel(channelId).name).toBe("🟣-legacy");
+			await port.handlers!.changed();
+			expect(port.renames.slice(before)).toEqual([{ id: channelId, name: "🟣-legacy" }]);
+			expect(port.creates).toBe(creates);
+			expect(port.statusCreates).toBe(statusCreates);
+			await broker.close();
+			port.channel(channelId).name = "legacy";
+			port.failNextRename = true;
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			const reattached = await broker.request(resumed(input));
+			await port.handlers!.changed();
+			expect(port.renames.slice(before)).toHaveLength(2);
+			expect(port.channel(channelId).name).toBe("legacy");
+			expect(reattached.session.state).toBe("ready");
+			await port.owner(reattached, "still routed");
+			expect((await poll(broker, reattached)).deliveries.map(delivery => delivery.text)).toEqual(["still routed"]);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("orders overview, Haiso, then OMP channels and splits the overview by app", async () => {
+		using temporary = TempDir.createSync("@discord-app-arrange-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const alpha = await broker.request(registration(root, "alpha"));
+			const overviewId = alpha.group.overviewId!;
+			expect(port.cards.get(overviewId)?.text).not.toContain("OMP sessions");
+			const gamma = await broker.request({ ...registration(root, "gamma"), app: "omp" });
+			const beta = await broker.request(registration(root, "beta"));
+			const [alphaId, betaId, gammaId] = [alpha, beta, gamma].map(item => item.session.channelId!);
+			expect(port.arrangements.get(alpha.group.categoryId!)).toEqual([overviewId, alphaId, betaId, gammaId]);
+			const overview = port.cards.get(overviewId)!;
+			expect(overview.app).toBeUndefined();
+			const [header, haisoSection, ompSection, ...rest] = overview.text.split("\n\n");
+			expect(rest).toEqual([]);
+			expect(header).toBe(`Haiso · Named project\n${alpha.group.projectDir}`);
+			expect(haisoSection!.split("\n").map(line => line.split(" · ")[0])).toEqual([
+				"Haiso sessions",
+				`<#${alphaId}>`,
+				`<#${betaId}>`,
+			]);
+			expect(ompSection!.split("\n").map(line => line.split(" · ")[0])).toEqual(["OMP sessions", `<#${gammaId}>`]);
+			expect(port.cards.get(gammaId)).toMatchObject({ app: "omp" });
+			expect(port.cards.get(gammaId)?.text).toStartWith("OMP · gamma\n");
+			expect(port.cards.get(alphaId)).toMatchObject({ app: "haiso" });
+			expect(port.cards.get(alphaId)?.text).toStartWith("Haiso · alpha\n");
 		} finally {
 			await broker.close();
 		}

@@ -55,9 +55,13 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 			absolutePath(value.sessionFile) &&
 			absolutePath(value.projectDir) &&
 			text(value.label, 100) &&
-			text(value.groupName, 100)
+			text(value.groupName, 100) &&
+			(value.app === undefined || value.app === "haiso" || value.app === "omp") &&
+			(value.rejoin === undefined || value.rejoin === true)
 		);
 	}
+	if (value.op === "disable")
+		return identifier(value.sessionId) && absolutePath(value.sessionFile) && absolutePath(value.projectDir);
 	if (
 		!record(value.lease) ||
 		!identifier(value.lease.sessionId) ||
@@ -70,6 +74,7 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 			return typeof value.busy === "boolean" && typeof value.pendingInput === "boolean";
 		case "status":
 		case "off":
+		case "detach":
 			return true;
 		case "receipt":
 			return (
@@ -239,6 +244,7 @@ function session(value: unknown): value is ModeSession {
 			value.notify === "all" ||
 			value.notify === "needs-you" ||
 			value.notify === "off") &&
+		(value.app === undefined || value.app === "haiso" || value.app === "omp") &&
 		(value.retirement === undefined ||
 			(retirement(value.retirement) &&
 				record(value.retirement) &&
@@ -524,6 +530,13 @@ async function snapshotMatches(value: ModeSnapshot, input: ModeRequest): Promise
 			value.lease !== undefined
 		);
 	}
+	if (input.op === "disable")
+		return (
+			value.session.id === input.sessionId &&
+			!value.session.enabled &&
+			!value.session.connected &&
+			value.lease === undefined
+		);
 	return value.session.id === input.lease.sessionId && value.session.connectionId === input.lease.connectionId;
 }
 

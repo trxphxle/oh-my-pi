@@ -10,6 +10,8 @@ import { runStandaloneTui } from "./standalone-picker";
 /** Persistence and history capabilities supplied by the session-owning host. */
 export interface SessionPickerHost<T extends SessionSelectorEntry = SessionSelectorEntry> {
 	loadPinnedIds?(): Promise<ReadonlySet<string>>;
+	/** Short per-session labels (session id → text) shown in each row's metadata. */
+	loadBadges?(): Promise<ReadonlyMap<string, string>>;
 	loadHistoryMatcher?(): SessionHistoryMatcher;
 	deleteSession?(session: T, choice?: string): Promise<boolean>;
 	getDeleteChoices?(session: T): Promise<SessionDeleteChoice[] | undefined>;
@@ -26,6 +28,7 @@ export interface SessionPickerOptions<T extends SessionSelectorEntry = SessionSe
 	allowGlobalScope?: boolean;
 	historySearch?: boolean;
 	pinnedIds?: ReadonlySet<string>;
+	badges?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -43,6 +46,8 @@ export async function selectSession<T extends SessionSelectorEntry>(
 	// session-list prefix never sees. Best-effort: a missing/locked history.db
 	// must not break the picker.
 	const pinnedIds = options.pinnedIds ?? (await host.loadPinnedIds?.());
+	// Decoration only: an unreadable badge source never blocks resuming.
+	const badges = options.badges ?? (await host.loadBadges?.().catch(() => undefined));
 
 	let historyMatcher: ((query: string) => string[]) | undefined;
 	if (options.historySearch !== false) {
@@ -75,6 +80,7 @@ export async function selectSession<T extends SessionSelectorEntry>(
 					scopeLabel: options.scopeLabel,
 					showCwd: options.showCwd,
 					pinnedIds,
+					badges,
 				},
 			);
 			selector.setOnRequestRender(() => ui.requestRender());

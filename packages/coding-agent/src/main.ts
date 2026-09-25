@@ -48,6 +48,8 @@ import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
 import { discordDeletionPolicy, getDiscordDeletionChoices } from "./discord-mode/deletion-ui";
 import { deleteSessionWithDiscord, resumeDiscordRetirements } from "./discord-mode/retirement";
+import { loadDiscordSessionBadges } from "./discord-mode/retirement-events";
+import { startDiscordModeAutoRejoin } from "./discord-mode/session";
 import { initializeWithSettings } from "./discovery";
 import {
 	clearPluginRootsAndCaches,
@@ -149,6 +151,7 @@ async function loadSessionPicker(): Promise<SessionPicker> {
 		const storage = new FileSessionStorage();
 		return selectSession<SessionInfo>(sessions, options, {
 			loadPinnedIds: loadPinnedSessionIds,
+			loadBadges: loadDiscordSessionBadges,
 			loadHistoryMatcher: () => {
 				const history = HistoryStorage.open();
 				return query => history.matchingSessionIds(query);
@@ -673,6 +676,7 @@ async function runInteractiveMode(
 		await logger.time("InteractiveMode.renderInitialMessages", () =>
 			mode.renderInitialMessages({ preserveExistingChat: true }),
 		);
+		startDiscordModeAutoRejoin(mode);
 		// A resolved version check must not insert its banner into a partial transcript.
 		checkedVersionPromise.then(newVersion => {
 			if (!settings.get("startup.checkUpdate")) {

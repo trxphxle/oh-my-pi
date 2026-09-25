@@ -12,6 +12,7 @@ import {
 	type ModeDelivery,
 	type ModeLease,
 	type ModeRequest,
+	type ModeSession,
 	type ModeSnapshot,
 } from "@oh-my-pi/pi-wire/discord-mode";
 import {
@@ -32,6 +33,9 @@ const MAX_JOURNAL_BYTES = 1024 * 1024;
 const owners = new Map<string, BridgeSession>();
 const RECOVERY =
 	"Bridge work is held; nothing will be replayed. Inspect /bridge status. For an uncertain delivery, detach and reattach locally, then use /bridge reconcile. Resume queued work only with explicit /bridge repair.";
+/** One broker lease (45 s) plus margin: a crashed or just-closed window has released it by then. */
+const REJOIN_RETRY_MS = 50_000;
+const MAX_STATE_BYTES = 24 * 1024 * 1024;
 
 type ReceiptState = "attempted" | "accepted" | "settled" | "held" | "resolved";
 interface Receipt {
@@ -141,6 +145,26 @@ function sameHost(state: BridgeHostState, expected: BridgeHostState): boolean {
 		state.sessionId === expected.sessionId &&
 		state.sessionFile === expected.sessionFile &&
 		state.cwd === expected.cwd
+	);
+}
+
+/**
+ * Offline pre-filter from the broker's saved state, so opening a conversation that was never shared causes no broker
+ * traffic. The broker's own lookup and its `rejoin` guard stay authoritative.
+ */
+async function sharedOffline(root: string, identity: Identity): Promise<boolean> {
+	const saved = await readPrivateJson(path.join(root, "state.json"), MAX_STATE_BYTES).catch(() => undefined);
+	return (
+		record(saved) &&
+		Array.isArray(saved.sessions) &&
+		saved.sessions.some(
+			session =>
+				record(session) &&
+				session.id === identity.sessionId &&
+				session.enabled === true &&
+				session.retirement === undefined &&
+				session.sessionFile === identity.sessionFile,
+		)
 	);
 }
 
@@ -303,6 +327,8 @@ export interface BridgeSessionOptions {
 	connect?: (root: string) => Promise<BridgeConnection>;
 	receiptRoot?: string;
 	pollIntervalMs?: number;
+	/** Delay before the one automatic-rejoin retry while another window still holds the conversation's lease. */
+	rejoinRetryMs?: number;
 }
 
 /** The public host owns generation/admission. Only observed, marked host events prove delivery. */
@@ -315,6 +341,7 @@ export class BridgeSession {
 	#toolSerial: Promise<void> = Promise.resolve();
 	#closing: Promise<void> = Promise.resolve();
 	#statusText = "Bridge: off";
+	#cancelRejoin?: () => void;
 
 	constructor(
 		readonly host: BridgeHost,
@@ -337,12 +364,74 @@ export class BridgeSession {
 		return this.enabled ? this.#statusText : "Bridge: off";
 	}
 
-	async on(label?: string): Promise<ModeSnapshot> {
+	on(label?: string): Promise<ModeSnapshot> {
+		return this.#attach(label, false);
+	}
+
+	/**
+	 * Automatic reattach after this conversation is opened or resumed. Never enrolls, names, or creates anything: the
+	 * broker must still share this exact identity, and `rejoin` makes it refuse if sharing was turned off meanwhile.
+	 * Unsaved conversations and an unreachable broker stay silent; never throws.
+	 */
+	async rejoin(retried = false): Promise<ModeSnapshot | undefined> {
+		if (this.enabled || this.#attaching) return undefined;
+		this.#cancelRejoin?.();
+		this.#cancelRejoin = undefined;
+		const state = { ...this.host.getState() };
+		const epoch = this.#epoch;
+		let identity: Identity;
+		let shared: ModeSession | undefined;
+		try {
+			identity = await savedIdentity(state);
+			if (!(await sharedOffline(this.options.root, identity))) return undefined;
+			// Probe the broker before attaching, so a stale offline view leaves no receipt storage behind.
+			const client = await (this.options.connect ?? connectExistingDiscordMode)(this.options.root);
+			try {
+				shared = (await client.lookup(identity.projectDir, identity.sessionId))?.session;
+			} finally {
+				await client.close().catch(() => {});
+			}
+		} catch {
+			return undefined;
+		}
+		if (
+			epoch !== this.#epoch ||
+			!sameHost(this.host.getState(), state) ||
+			!shared?.enabled ||
+			shared.retirement ||
+			shared.sessionFile !== identity.sessionFile
+		)
+			return undefined;
+		if (shared.connected) {
+			if (retried)
+				this.host.notify(
+					`Bridge: #${shared.label} is attached in another window, so this one stays local. Detach it there, then use /bridge on here.`,
+					"warning",
+				);
+			// A crashed or just-closed window still holds the lease until it expires; never displace a live one.
+			else
+				this.#cancelRejoin = this.host.schedule(() => {
+					this.#cancelRejoin = undefined;
+					if (epoch === this.#epoch) void this.rejoin(true);
+				}, this.options.rejoinRetryMs ?? REJOIN_RETRY_MS);
+			return undefined;
+		}
+		try {
+			return await this.#attach(undefined, true);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (!/automatic rejoin skipped|cancelled by a session\/lifecycle change/.test(message))
+				this.host.notify(`Bridge couldn't rejoin #${shared.label}: ${message}`, "warning");
+			return undefined;
+		}
+	}
+
+	async #attach(label: string | undefined, rejoin: boolean): Promise<ModeSnapshot> {
 		if (!this.host.getState().local) throw new Error("Use /bridge on from the local interactive OMP UI only.");
 		if (this.enabled) return (await this.status())!;
 		if (this.#attaching) throw new Error("Bridge attachment is already in progress; wait for its local result.");
 		this.#attaching = true;
-		const closing = this.off();
+		const closing = this.detach();
 		const epoch = this.#epoch;
 		const state = { ...this.host.getState() };
 		const abort = new AbortController();
@@ -384,7 +473,9 @@ export class BridgeSession {
 				throw new Error(
 					"This session already has a live broker lease. Detach its original owner or wait for lease expiry; bridge never borrows another connection's token.",
 				);
+			// A rejoin never names anything: it keeps the retained channel label.
 			const selectedLabel =
+				(rejoin ? enrollment?.session?.label : undefined) ||
 				label?.trim() ||
 				state.label?.trim() ||
 				enrollment?.session?.label ||
@@ -397,10 +488,28 @@ export class BridgeSession {
 			)
 				throw new Error("Choose a session/project label of 1–100 characters without control characters.");
 			const connectionId = randomUUID();
-			const snapshot = await client.request(
-				{ op: "register", ...identity, connectionId, requestId: randomUUID(), label: selectedLabel, groupName },
-				abort.signal,
-			);
+			const registration: Extract<ModeRequest, { op: "register" }> = {
+				op: "register",
+				...identity,
+				connectionId,
+				requestId: randomUUID(),
+				label: selectedLabel,
+				groupName,
+				app: "omp",
+				...(rejoin ? { rejoin: true as const } : {}),
+			};
+			let snapshot: ModeSnapshot;
+			try {
+				snapshot = await client.request(registration, abort.signal);
+			} catch (error) {
+				// Brokers predating the app split reject `app` before any effect; attach untagged (shown as Haiso).
+				// Rejoin stays fail-closed: such brokers reject `rejoin` too and must never see it as a plain register.
+				if (rejoin || !(error instanceof Error) || !error.message.startsWith("Invalid Discord request"))
+					throw error;
+				check();
+				const { app: _app, ...untagged } = registration;
+				snapshot = await client.request(untagged, abort.signal);
+			}
 			// Remember only our freshly requested lease, even if the host changed while registering.
 			if (snapshot.lease?.sessionId === identity.sessionId && snapshot.lease.connectionId === connectionId)
 				registeredLease = snapshot.lease;
@@ -438,10 +547,11 @@ export class BridgeSession {
 			await this.#tool(true);
 			check();
 			this.#render(attachment);
-			this.host.notify(
-				"Bridge attached to this saved session. Approvals and settings remain local. Official OMP has no authoritative permanent-deletion event: switching, branching, shutdown, or a missing file only detaches; it never retires or deletes a Discord channel.",
-				"info",
-			);
+			if (!rejoin)
+				this.host.notify(
+					"Bridge attached to this saved session. Approvals and settings remain local. Switching, branching, or shutdown only detaches: resuming this conversation reattaches it until /bridge off. Official OMP has no authoritative permanent-deletion event, so a missing file never retires or deletes a Discord channel.",
+					"info",
+				);
 			if (attachment.holds.size) this.host.notify(RECOVERY, "warning");
 			this.#schedule(attachment);
 			return snapshot;
@@ -456,10 +566,14 @@ export class BridgeSession {
 			}
 			if (client) {
 				if (registeredLease)
-					await client.request({ op: "off", lease: registeredLease }, AbortSignal.timeout(2000)).catch(() => {});
+					await client
+						.request({ op: rejoin ? "detach" : "off", lease: registeredLease }, AbortSignal.timeout(2000))
+						.catch(() => {});
 				await client.close().catch(() => {});
 			}
 			if (ownedFile && owners.get(ownedFile) === this) owners.delete(ownedFile);
+			// The broker refusing an automatic rejoin (sharing turned off meanwhile) is expected, not uncertain.
+			if (rejoin && error instanceof Error && /automatic rejoin skipped/.test(error.message)) throw error;
 			if (error instanceof DiscordModeRequestError)
 				throw new Error(
 					error.outcome === "unknown"
@@ -472,24 +586,71 @@ export class BridgeSession {
 		}
 	}
 
-	async off(): Promise<void> {
+	/** Close locally but keep sharing: resuming this conversation reattaches it. Older brokers get `off` instead. */
+	detach(): Promise<boolean> {
+		return this.#close("detach");
+	}
+
+	/**
+	 * Explicit and sticky: this conversation stays unshared, also across resume, until /bridge on. Resolves true once
+	 * the broker confirmed it; otherwise nothing was attached here (see `disable`).
+	 */
+	off(): Promise<boolean> {
+		return this.#close("off");
+	}
+
+	/** Sticky off by identity for a conversation not attached here; a no-op unless the broker still shares it. */
+	async disable(): Promise<void> {
+		let identity: Identity;
+		try {
+			identity = await savedIdentity(this.host.getState());
+		} catch {
+			return; // An unsaved or non-local conversation was never shared.
+		}
+		let client: BridgeConnection;
+		try {
+			client = await (this.options.connect ?? connectExistingDiscordMode)(this.options.root);
+		} catch {
+			throw new Error(
+				"Bridge is off here, but the broker is unreachable, so this conversation may reattach when resumed. Run /bridge off again once the broker is running.",
+			);
+		}
+		try {
+			const shared = (await client.lookup(identity.projectDir, identity.sessionId))?.session;
+			if (!shared?.enabled || shared.retirement) return;
+			await client.request({ op: "disable", ...identity }, AbortSignal.timeout(2000));
+		} finally {
+			await client.close().catch(() => {});
+		}
+	}
+
+	#close(op: "detach" | "off"): Promise<boolean> {
 		const attachment = this.#attachment;
 		this.#epoch++;
 		this.#attachment = undefined;
 		this.#abort?.abort();
 		this.#abort = undefined;
 		attachment?.cancelTimer?.();
+		this.#cancelRejoin?.();
+		this.#cancelRejoin = undefined;
 		this.#statusText = "Bridge: off";
 		this.host.setStatus(undefined);
 		const disable = this.#tool(false);
 		const prior = this.#closing;
+		let released = false;
 		this.#closing = (async () => {
 			await prior.catch(() => {});
 			try {
 				if (attachment) {
-					await attachment.client
-						.request({ op: "off", lease: attachment.lease }, AbortSignal.timeout(2000))
-						.catch(() => {});
+					const signal = AbortSignal.timeout(2000);
+					try {
+						await attachment.client.request({ op, lease: attachment.lease }, signal);
+						released = true;
+					} catch (error) {
+						// Brokers without `detach` reject it unexecuted; `off` was their only release.
+						if (op === "detach" && error instanceof DiscordModeRequestError && error.outcome === "not-started")
+							await attachment.client.request({ op: "off", lease: attachment.lease }, signal).catch(() => {});
+					}
 					await attachment.client.close().catch(() => {});
 					await attachment.journal.flush();
 				}
@@ -499,7 +660,7 @@ export class BridgeSession {
 				await disable;
 			}
 		})();
-		return this.#closing;
+		return this.#closing.then(() => released);
 	}
 
 	async status(): Promise<ModeSnapshot | undefined> {
@@ -610,7 +771,7 @@ export class BridgeSession {
 		const attachment = this.#attachment;
 		if (!attachment || attachment.polling) return;
 		if (!this.#current(attachment)) {
-			await this.off();
+			await this.detach();
 			return;
 		}
 		attachment.polling = true;
@@ -729,8 +890,10 @@ export class BridgeSession {
 	#require(): Attachment {
 		const attachment = this.#attachment;
 		if (!attachment || !this.#current(attachment)) {
-			if (attachment) void this.off().catch(() => {});
-			throw new Error("Bridge is off for this session. Use /bridge on locally; it never automatically reenrolls.");
+			if (attachment) void this.detach().catch(() => {});
+			throw new Error(
+				"Bridge is off for this session. Use /bridge on locally; only resuming a still-shared conversation reattaches it automatically.",
+			);
 		}
 		return attachment;
 	}
@@ -807,7 +970,7 @@ export class BridgeSession {
 				snapshot.session.sessionFile !== attachment.identity.sessionFile ||
 				snapshot.group.projectDir !== attachment.identity.projectDir
 			) {
-				void this.off().catch(() => {});
+				void this.detach().catch(() => {});
 				throw new Error(
 					"Broker connection was revoked; attach explicitly from this session after checking its owner.",
 				);

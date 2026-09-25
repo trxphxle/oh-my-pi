@@ -102,6 +102,8 @@ async function canonicalSessionFile(sessionFile: string): Promise<string> {
 interface DeletionStateProjection {
 	binding: ModeDeletionBinding;
 	retired: boolean;
+	/** Sharing remembered by the broker; closed conversations stay enabled until an explicit off. */
+	enabled: boolean;
 	pendingEventId?: string;
 }
 
@@ -183,6 +185,7 @@ async function readDeletionState(root: string): Promise<DeletionStateProjection[
 		result.push({
 			binding: projected,
 			retired: retirement !== undefined,
+			enabled: session.enabled === true,
 			...(record(retirement) && retirement.state !== "done" && identifier(retirement.eventId)
 				? { pendingEventId: retirement.eventId }
 				: {}),
@@ -204,6 +207,25 @@ export async function lookupDiscordDeletionBinding(
 		throw new Error("Discord deletion project identity changed.");
 	}
 	return found;
+}
+
+/**
+ * Offline, credential-free view of conversations the broker still shares (enabled, not deleted). Never connects to or
+ * starts the broker; any unreadable or invalid state reads as nothing shared.
+ */
+export async function readDiscordSharedSessions(root = discordModePaths().root): Promise<ModeDeletionBinding[]> {
+	try {
+		return (await readDeletionState(root))
+			.filter(session => session.enabled && !session.retired)
+			.map(session => session.binding);
+	} catch {
+		return [];
+	}
+}
+
+/** Picker badges keyed by native session UUID for conversations shared with Discord. */
+export async function loadDiscordSessionBadges(root = discordModePaths().root): Promise<ReadonlyMap<string, string>> {
+	return new Map((await readDiscordSharedSessions(root)).map(session => [session.sessionId, "Discord"]));
 }
 
 async function privateDirectoryExists(directory: string): Promise<boolean> {

@@ -86,7 +86,11 @@ import { requiresNativeTools, requiresToolFreeHistoryForToolOptOut } from "@oh-m
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { type EditStore, PowerAssertion, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
-import { disposeDiscordModeSession, invalidateDiscordModeSession } from "../discord-mode/session";
+import {
+	disposeDiscordModeSession,
+	invalidateDiscordModeSession,
+	offDiscordModeSession,
+} from "../discord-mode/session";
 import { deleteSessionWithDiscord } from "../discord-mode/retirement";
 import {
 	$env,
@@ -8664,7 +8668,7 @@ export class AgentSession {
 	/** Move the active session and artifacts after enforcing mode transition invariants. */
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
-		await invalidateDiscordModeSession(this);
+		await offDiscordModeSession(this);
 		await this.sessionManager.moveTo(newCwd, targetSessionDir);
 	}
 

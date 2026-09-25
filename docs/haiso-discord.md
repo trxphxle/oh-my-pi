@@ -1,11 +1,14 @@
 # Haiso Discord mode
 
 Opt individual, existing terminal sessions into a private Discord workspace. One
-category represents a canonical project directory; `#overview` lists the group,
-and each enrolled independent session has its own named text channel. Names are
-editable labels; routing uses persistent group/session and Discord resource IDs.
-Short-lived subagents remain owned by their parent session rather than creating
-channels of their own.
+category represents a canonical project directory (the peer group: sessions in it
+can message each other); `#overview` lists the group in **Haiso sessions** and
+**OMP sessions** sections, and each enrolled session has its own text channel,
+marked 🟣 (Haiso) or 🔵 (OMP via `omp-bridge`), Haiso channels first. Names are
+editable labels; the marker is added by Haiso and never becomes part of the label.
+Routing uses persistent group/session and Discord resource IDs. Short-lived
+subagents remain owned by their parent session rather than creating channels of
+their own.
 
 ## Setup and enrollment
 
@@ -23,12 +26,16 @@ channels of their own.
 4. Run `/discord on`. On first enrollment, name the project group and this session's channel. Other
    explicitly enrolled sessions in the same canonical directory join that group.
    Symlink aliases converge; separate worktrees/subdirectories remain separate
-   groups. Enrollment is session-local, not a persistent auto-enrollment setting.
+   groups.
 
-Re-enabling the same saved conversation reconnects its retained channel without
-asking for a new name, including after `haiso --resume`. Use `/discord rename` to
-change its label. Starting a new conversation creates a separate session identity
-and channel; resume the original conversation to reuse its channel.
+Sharing is remembered per conversation. Closing a terminal, switching, or starting
+a new conversation only disconnects; the channel card shows *Disconnected · rejoins
+when resumed*. Resuming a shared conversation (`haiso --resume`, the in-terminal
+resume picker, or OMP with the connector) rejoins its channel automatically; resume
+pickers mark shared conversations with a **Discord** badge. Only `/discord off` (or
+`/bridge off`) makes a conversation private again, and that is sticky, including
+when it is not currently open. Print, RPC, and ACP runs never join. Use
+`/discord rename` to change a label. A new conversation gets its own channel.
 
 The mode uses a shared supervised local service and the original session's model,
 tools, conversation, and approval settings. It does not launch another coding
@@ -58,7 +65,8 @@ first. The connector never creates or rewrites OMP's native session file.
 | OMP terminal command | Behavior |
 | --- | --- |
 | `/bridge on [label]` | Explicitly attach this saved conversation and enable its small `bridge` tool. |
-| `/bridge off` | Stop routing, release the service lease, and remove only this extension's tool. |
+| `/bridge on [label]` | Share this saved conversation and enable its small `bridge` tool; afterwards it rejoins automatically when resumed in OMP. |
+| `/bridge off` | Make this conversation private (sticky), release the service lease, and remove only this extension's tool. |
 | `/bridge status` | Inspect local connection, destination, and uncertain deliveries. |
 | `/bridge reconcile` | Review unknown delivery outcomes without replaying them. |
 | `/bridge repair` | Explicitly repair a binding or resume held work after inspection. |
@@ -78,8 +86,8 @@ broker from Haiso before attaching again.
 
 Approvals and settings stay in OMP's terminal. Its public extension API does not
 provide this connector an authoritative permanent-deletion event: switching,
-branching, navigating history, or exiting detaches, but does not delete the Discord
-channel. Do not infer deletion from a missing file. Use Haiso's native retirement
+branching, navigating history, or exiting disconnects (sharing is kept), but does
+not delete the Discord channel. Do not infer deletion from a missing file. Use Haiso's native retirement
 workflow or explicitly clean up the Discord channel when needed.
 
 ## Conversation and control
@@ -153,14 +161,14 @@ disappears. Peer input never grants owner approval.
 | --- | --- |
 | `/discord` | Open state-aware controls without enabling or disabling sharing automatically. |
 | `/discord status` | Show remote-access state, destination, activity, peers, and uncertain work. |
-| `/discord off` | Revoke this session's remote routing; retain local work and Discord channels/history. |
+| `/discord off` | Make this conversation private (sticky, also when not open); retain local work and Discord channels/history. |
 | `/discord rename` | Rename the group category or this session's channel. |
 | Manual Discord rename | Adopt the label without changing session identity. |
 | Channel/category deletion | Suspend affected remote bindings; never recreate resources or kill sessions automatically. Discord category deletion leaves child channels uncategorized. |
 | Moved channel or lost/private-permission changes | Suspend remote routing until explicitly repaired. Missing access is not proof of deletion. |
 | `/discord repair` | Explicitly create a replacement, adopt a selected resource ID, or reconcile the retained binding. Group repair reuses surviving channels. Queued work stays held unless explicitly resumed. |
 | `/discord reconcile` | Inspect an uncertain operation and explicitly clear its fence without replaying it or claiming success. |
-| Session switch/fork/branch/disposal | Revoke the previous connection before identity changes. Re-enroll explicitly; the same saved session can reuse its channel. |
+| Exit/session switch/fork/branch/disposal | Disconnect the previous conversation without forgetting sharing; a shared conversation rejoins its channel when resumed. |
 | Lost/expired broker lease (sleep, stall, broker restart) | Reconnects automatically with backoff (2s up to 60s) to the same channel. Held or uncertain messages stay fenced and are reported once; resume them with `/discord repair` / `/discord reconcile`. Auto-reconnect stops (use `/discord off`, then `/discord on`) if the enrollment is gone, the session was turned off or rebound elsewhere, or another process holds its connection. |
 | Permanent native session deletion | Retire the binding and pending input; retain Discord history by default, or delete the exact bound channel after an explicit local choice. |
 

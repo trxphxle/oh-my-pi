@@ -374,6 +374,49 @@ describe("protocol-only Discord attachment", () => {
 		await expect(client.request(request)).rejects.toMatchObject({ outcome: "unknown" });
 	});
 
+	it("carries detach and lease-free disable, accepting a disable only when the result confirms sharing is off", async () => {
+		const root = await directory();
+		const server = await endpoint(root);
+		const client = await connectExistingDiscordMode(root);
+		cleanups.push(() => client.close());
+		const closed = { ...snapshot, session: { ...snapshot.session, connected: false } };
+		server.respond = () => Response.json({ protocol: DISCORD_MODE_PROTOCOL, ok: true, result: closed });
+		expect((await client.request({ op: "detach", lease: request.lease })).session).toMatchObject({
+			enabled: true,
+			connected: false,
+		});
+		const disable: ModeRequest = {
+			op: "disable",
+			sessionId: "session-1",
+			sessionFile: "/project/session.jsonl",
+			projectDir: "/project",
+		};
+		// A result that still shares the conversation is not a confirmed off.
+		await expect(client.request(disable)).rejects.toMatchObject({ outcome: "unknown" });
+		const off = { ...closed, session: { ...closed.session, enabled: false } };
+		server.respond = () => Response.json({ protocol: DISCORD_MODE_PROTOCOL, ok: true, result: off });
+		expect((await client.request(disable)).session.enabled).toBe(false);
+		const effects = server.effects;
+		// Rejoin is a one-way flag; a disable never carries a lease instead of its identity.
+		await expect(
+			client.request({
+				op: "register",
+				requestId: "request-1",
+				sessionId: "session-1",
+				sessionFile: "/project/session.jsonl",
+				projectDir: "/project",
+				connectionId: "connection-2",
+				label: "Session",
+				groupName: "Project",
+				rejoin: false,
+			} as unknown as ModeRequest),
+		).rejects.toMatchObject({ outcome: "not-started" });
+		await expect(
+			client.request({ op: "disable", lease: request.lease } as unknown as ModeRequest),
+		).rejects.toMatchObject({ outcome: "not-started" });
+		expect(server.effects).toBe(effects);
+	});
+
 	it("keeps a ping-only supervisor lease alive until close, then fails closed without reconnecting", async () => {
 		const root = await directory();
 		const server = await endpoint(root);

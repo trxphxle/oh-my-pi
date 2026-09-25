@@ -11,6 +11,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent";
 import { type } from "@oh-my-pi/omptype";
 import type { ModeDelivery, ModeRequest, ModeSnapshot } from "@oh-my-pi/pi-wire/discord-mode";
+import { writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
 import { BRIDGE_MESSAGE_SOURCE, BRIDGE_OWNER_MESSAGE_TYPE, BRIDGE_PEER_MESSAGE_TYPE } from "../src/host";
 import { installBridge } from "../src/index";
 
@@ -33,7 +34,16 @@ const fixtures: {
 }[] = [];
 const SECRET = "must-never-reach-model";
 
-async function fixture(saved = true) {
+/**
+ * Automatic attach runs detached from the lifecycle event and crosses real filesystem I/O, so fake timers cannot drive
+ * it; poll for the observable end state instead of a fixed delay.
+ */
+async function until(condition: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 400 && !condition(); attempt++) await Bun.sleep(5);
+	expect(condition()).toBe(true);
+}
+
+async function fixture(saved = true, options: { shared?: boolean; mode?: "tui" | "rpc" | "print" } = {}) {
 	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-extension-")));
 	const sessionId = randomUUID();
 	const peerId = randomUUID();
@@ -67,6 +77,8 @@ async function fixture(saved = true) {
 	let command: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
 	let tool: ToolDefinition | undefined;
 	let failRequest = false;
+	/** The broker still has this conversation enrolled (lookup answers with it). */
+	let enrolled = false;
 	const snapshot: ModeSnapshot = {
 		group: { id: "group", projectDir: root, name: "fixture", categoryId: "123456789012345678", state: "ready" },
 		session: {
@@ -177,7 +189,7 @@ async function fixture(saved = true) {
 			connects++;
 			return {
 				async lookup() {
-					return undefined;
+					return enrolled ? structuredClone({ group: snapshot.group, session: snapshot.session }) : undefined;
 				},
 				async close() {
 					closes++;
@@ -190,8 +202,10 @@ async function fixture(saved = true) {
 						snapshot.session.label = request.label;
 						snapshot.session.enabled = true;
 						snapshot.lease = { sessionId, connectionId: request.connectionId, token: SECRET };
+						snapshot.session.connected = true;
 					}
 					if (request.op === "off") snapshot.session.enabled = false;
+					if (request.op === "detach") snapshot.session.connected = false;
 					if (request.op === "receipt" || request.op === "resolve-delivery") {
 						const delivery = snapshot.deliveries.find(item => item.id === request.deliveryId);
 						if (delivery) delivery.state = request.op === "receipt" ? request.state : "resolved";
@@ -249,6 +263,15 @@ async function fixture(saved = true) {
 			currentSessionId = randomUUID();
 			currentSessionFile = path.join(root, "other.jsonl");
 		},
+		/** Shared earlier and closed since: saved broker state lists it and the broker still has it enrolled. */
+		async share() {
+			enrolled = true;
+			snapshot.session.connected = false;
+			await writePrivateJson(path.join(root, "state.json"), {
+				version: 1,
+				sessions: [{ id: sessionId, sessionFile, enabled: true }],
+			});
+		},
 		async emit(event: string, payload: Record<string, unknown> = {}) {
 			for (const handler of handlers.get(event) ?? []) await handler({ type: event, ...payload }, ctx);
 		},
@@ -282,6 +305,8 @@ async function fixture(saved = true) {
 		},
 	};
 	fixtures.push(result);
+	if (options.shared) await result.share();
+	if (options.mode) ctx.mode = options.mode;
 	await result.emit("session_start");
 	return result;
 }
@@ -450,6 +475,47 @@ describe("official OMP bridge adapter", () => {
 			expect(f.timers.size).toBe(0);
 		},
 	);
+
+	test("a still-shared conversation reattaches on start and after switches; /bridge off keeps it private", async () => {
+		const f = await fixture(true, { shared: true });
+		const registers = () => f.requests.filter(request => request.op === "register");
+		await until(() => f.activeTools.includes("bridge"));
+		expect(registers()).toMatchObject([{ rejoin: true, app: "omp", label: "fixture" }]);
+		await f.emit("session_switch", { reason: "resume" });
+		expect(f.requests.some(request => request.op === "detach")).toBe(true);
+		expect(f.requests.some(request => request.op === "off")).toBe(false);
+		await until(() => registers().length === 2 && f.activeTools.includes("bridge"));
+		await f.command("off");
+		expect(f.requests.at(-1)).toMatchObject({ op: "off" });
+		const closes = f.closes;
+		await f.emit("session_switch", { reason: "resume" });
+		// The broker says sharing is off, so the probe ends without attaching.
+		await until(() => f.closes === closes + 1);
+		expect(registers()).toHaveLength(2);
+		expect(f.activeTools).not.toContain("bridge");
+	});
+
+	test.each(["rpc", "print"] as const)("%s hosts never attach automatically", async mode => {
+		const f = await fixture(true, { shared: true, mode });
+		await f.emit("session_switch", { reason: "resume" });
+		expect(f.connects).toBe(0);
+		expect(f.requests).toEqual([]);
+	});
+
+	test("/bridge off while nothing is attached here still keeps a shared conversation private", async () => {
+		const f = await fixture(true, { shared: true });
+		await until(() => f.activeTools.includes("bridge"));
+		await f.emit("session_shutdown");
+		expect(f.requests.at(-1)).toMatchObject({ op: "detach" });
+		await f.command("off");
+		expect(f.requests.at(-1)).toEqual({
+			op: "disable",
+			sessionId: f.ctx.sessionManager.getSessionId(),
+			sessionFile: path.join(f.root, "session.jsonl"),
+			projectDir: f.root,
+		});
+		expect(f.notices.at(-1)?.text).toContain("stays private");
+	});
 
 	test("identity guards detach before a tool runs in another session", async () => {
 		const f = await fixture();
