@@ -692,7 +692,8 @@ function junitFailures(xml: string): Set<string> {
 
 /**
  * Run a package's bun tests and return failing test keys; throws when failures cannot be attributed.
- * Full suites run in parallel. Re-runs (`parallel: false`) run each file in its own process, so
+ * A whole suite runs in one low-priority process: bun's `--parallel` workers each grew to several GB and pushed a
+ * 32 GB Mac into swap, so a slower serial run is the better trade. Re-runs (`wholeSuite: false`) run each file in its own process, so
  * neither contention nor state leaking between files decides the verdict for candidate or baseline.
  */
 async function runSuite(
@@ -701,20 +702,22 @@ async function runSuite(
 	cwd: string,
 	targets: string[],
 	env: NodeJS.ProcessEnv,
-	parallel: boolean,
+	wholeSuite: boolean,
 ): Promise<Set<string>> {
 	session.say(`• ${label}`);
 	const failures = new Set<string>();
-	const width = Math.max(2, Math.floor(os.availableParallelism() / 2));
-	for (const batch of parallel ? [targets] : targets.map(target => [target])) {
+	// `nice` execs the command in place, so timeouts still stop the test process itself.
+	const lowPriority = process.platform === "win32" ? [] : ["nice", "-n", "10"];
+	for (const batch of wholeSuite ? [targets] : targets.map(target => [target])) {
 		const report = path.join(env.TMPDIR ?? os.tmpdir(), `junit-${crypto.randomUUID()}.xml`);
 		const found = new Set<string>();
 		let file: string | undefined;
 		const result = await session.run(
 			[
+				...lowPriority,
 				process.execPath,
 				"test",
-				...(parallel ? [`--parallel=${width}`, "--only-failures"] : []),
+				...(wholeSuite ? ["--only-failures"] : []),
 				"--reporter=junit",
 				`--reporter-outfile=${report}`,
 				...batch,
