@@ -5,7 +5,10 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
-import { connectDiscordMode } from "../../src/discord-mode/client";
+import * as discordClient from "@oh-my-pi/pi-utils/discord-client";
+import { DISCORD_MODE_DAEMON_NAME } from "@oh-my-pi/pi-wire/discord-mode";
+import { DISCORD_MODE_WORKER_ARG } from "../../src/cli/worker-selectors";
+import { connectDiscordMode, resolveDiscordModeWorkerCommand } from "../../src/discord-mode/client";
 import {
 	DISCORD_MODE_CONFIG_ENV,
 	DISCORD_MODE_ROOT_ENV,
@@ -13,7 +16,10 @@ import {
 	discordModeConfigKey,
 } from "../../src/discord-mode/config";
 import { startDiscordModeServer } from "../../src/discord-mode/server";
+import { readDiscordServiceSettings, setDiscordServiceKeepOnline } from "../../src/discord-mode/service";
 import * as daemon from "../../src/launch/client";
+import type { DaemonOperation } from "../../src/launch/protocol";
+import { resolveWorkerSpawnCmd } from "../../src/subprocess/worker-client";
 
 const config = {
 	botToken: "offline-native-client-fixture-token",
@@ -49,6 +55,46 @@ async function fixture() {
 	});
 	cleanups.push(() => factory.mockRestore());
 	return { root, factory };
+}
+
+function setEnv(key: string, value: string | undefined) {
+	const previous = process.env[key];
+	if (value === undefined) delete process.env[key];
+	else process.env[key] = value;
+	cleanups.push(() => {
+		if (previous === undefined) delete process.env[key];
+		else process.env[key] = previous;
+	});
+}
+
+/** Records supervisor operations; `start` brings up an authenticated endpoint like a real worker would. */
+function fakeSupervisor(
+	root: string,
+	factory: { mockImplementation(implementation: typeof daemon.daemonClientForGlobal): unknown },
+	daemons: unknown[] = [],
+) {
+	const operations: DaemonOperation[] = [];
+	const projectDir = path.join(root, "supervisor");
+	factory.mockImplementation(
+		async () =>
+			({
+				projectDir,
+				async request(operation: DaemonOperation) {
+					operations.push(operation);
+					if (operation.op === "list") return { op: "list", daemons };
+					if (operation.op === "start") {
+						await endpoint(root);
+						return { op: "start", daemon: {}, readyTimedOut: false };
+					}
+					return { op: operation.op, projectDir, daemon: {} };
+				},
+			}) as unknown as daemon.DaemonBrokerClient,
+	);
+	return operations;
+}
+
+async function readConnector(root: string) {
+	return JSON.parse(await fs.readFile(path.join(root, "connector.json"), "utf8"));
 }
 
 async function endpoint(root: string) {
@@ -220,4 +266,97 @@ describe("native Discord durable connector adoption", () => {
 			expect(factory).toHaveBeenCalledTimes(1);
 		});
 	}
+});
+
+describe("native Discord service lifecycle", () => {
+	it("starts a persisted service by default and publishes a supervisor-free connector", async () => {
+		const { root, factory } = await fixture();
+		setEnv("HAISO_PREFIX", path.join(root, "prefix"));
+		const operations = fakeSupervisor(root, factory);
+		const client = await connectDiscordMode();
+		cleanups.push(() => client.close());
+		const start = operations.find(operation => operation.op === "start");
+		expect(start?.op === "start" && start.spec).toMatchObject({
+			name: DISCORD_MODE_DAEMON_NAME,
+			persist: true,
+			restart: "no",
+			detached: false,
+			env: { HAISO_PREFIX: path.join(root, "prefix") },
+		});
+		expect(await readConnector(root)).toEqual({ version: 1, configKey });
+	});
+
+	it("starts a session-scoped service with a supervisor lease when keep online is off", async () => {
+		const { root, factory } = await fixture();
+		setEnv("HAISO_PREFIX", undefined);
+		await writePrivateJson(path.join(root, "service.json"), { version: 1, keepOnline: false });
+		const operations = fakeSupervisor(root, factory);
+		const client = await connectDiscordMode();
+		cleanups.push(() => client.close());
+		const start = operations.find(operation => operation.op === "start");
+		expect(start?.op === "start" && start.spec.persist).toBe(false);
+		expect(start?.op === "start" && "HAISO_PREFIX" in start.spec.env).toBe(false);
+		expect((await readConnector(root)).supervisor).toBeDefined();
+	});
+
+	it("replaces a connector whose recorded supervisor is positively dead and adopts the live endpoint", async () => {
+		const { root, factory } = await fixture();
+		await endpoint(root);
+		const dead = path.join(root, "gone");
+		await writePrivateJson(path.join(root, "connector.json"), {
+			version: 1,
+			configKey,
+			supervisor: {
+				projectDir: dead,
+				endpoint: path.join(dead, "broker.sock"),
+				tokenPath: path.join(dead, "broker.token"),
+			},
+		});
+		const operations = fakeSupervisor(root, factory);
+		const client = await connectDiscordMode();
+		cleanups.push(() => client.close());
+		expect((await client.probe(configKey)).configKey).toBe(configKey);
+		expect(operations.map(operation => operation.op)).toEqual(["ping", "list"]);
+		expect(await readConnector(root)).toEqual({ version: 1, configKey });
+		const again = await connectDiscordMode();
+		cleanups.push(() => again.close());
+		expect(factory).toHaveBeenCalledTimes(1);
+	});
+
+	it("runs the worker through the Haiso prefix link only when it is executable", async () => {
+		const { root } = await fixture();
+		const prefix = path.join(root, "prefix");
+		setEnv("PI_COMPILED", "1");
+		setEnv("HAISO_PREFIX", prefix);
+		expect(resolveDiscordModeWorkerCommand()).toEqual(resolveWorkerSpawnCmd(DISCORD_MODE_WORKER_ARG));
+		await fs.mkdir(path.join(prefix, "bin"), { recursive: true });
+		await fs.writeFile(path.join(prefix, "bin", "haiso"), "#!/bin/sh\n", { mode: 0o755 });
+		expect(resolveDiscordModeWorkerCommand().cmd).toEqual([
+			path.join(prefix, "bin", "haiso"),
+			DISCORD_MODE_WORKER_ARG,
+		]);
+	});
+
+	it("persists keep online and switches a running supervised service live", async () => {
+		const { root, factory } = await fixture();
+		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: true });
+		const operations = fakeSupervisor(root, factory, [{ name: DISCORD_MODE_DAEMON_NAME, state: "running" }]);
+		const probe = discordClient.discordModeSocketIsStale;
+		const liveness = spyOn(discordClient, "discordModeSocketIsStale").mockImplementation(async socketPath =>
+			socketPath.endsWith("broker.sock") ? false : probe(socketPath),
+		);
+		cleanups.push(() => liveness.mockRestore());
+		await writePrivateJson(path.join(root, "connector.json"), { version: 1, configKey });
+		expect(await setDiscordServiceKeepOnline(false)).toEqual({ live: true });
+		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: false });
+		expect(operations.at(-1)).toEqual({ op: "mode", name: DISCORD_MODE_DAEMON_NAME, mode: "session" });
+		// Session-scoped again: bridges must lease the supervisor, so the connector publishes it.
+		expect((await readConnector(root)).supervisor).toMatchObject({ projectDir: path.join(root, "supervisor") });
+		expect(await setDiscordServiceKeepOnline(true)).toEqual({ live: true });
+		expect(await readConnector(root)).toEqual({ version: 1, configKey });
+		liveness.mockImplementation(async () => true);
+		expect(await setDiscordServiceKeepOnline(true)).toEqual({ live: false });
+		expect(await readDiscordServiceSettings()).toEqual({ keepOnline: true });
+		expect(operations.filter(operation => operation.op === "mode")).toHaveLength(2);
+	});
 });

@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { DiscordProgressTracker } from "@oh-my-pi/pi-utils/discord-progress";
 import {
 	DISCORD_MODE_MAX_MODELS,
 	DISCORD_MODE_MAX_SHORTLIST,
@@ -71,6 +72,8 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 	let toolUpdates = Promise.resolve();
 	const approvals = new Set<string>();
 	const asks = new Set<string>();
+	/** Live run summary for the session card; allowlisted event fields only. */
+	const progress = new DiscordProgressTracker();
 
 	const host: BridgeHost = {
 		getState() {
@@ -132,6 +135,7 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 		},
 		setStatus: text => latest?.ui.setStatus(TOOL_NAME, text),
 		notify: (text, level) => latest?.ui.notify(text, level),
+		select: async (title, options) => (latest?.hasUI ? latest.ui.select(title, options) : undefined),
 		schedule(callback, delayMs) {
 			if (!latest) throw new Error("Bridge has no timer context.");
 			const ctx = latest;
@@ -229,6 +233,7 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 					return { outcome: "rejected", text: "Not applied: OMP sessions don't offer this setting." };
 			}
 		},
+		progress: () => progress.current(),
 	};
 
 	function ensureSession(): BridgeSession {
@@ -254,6 +259,7 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 		epoch++;
 		approvals.clear();
 		asks.clear();
+		progress.reset();
 		if (session) await session.detach();
 		else await host.setToolEnabled(false);
 	}
@@ -482,10 +488,23 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 		await useContext(ctx);
 		session?.onMessageStart(event.message);
 	});
+	pi.on("agent_start", async (event, ctx) => {
+		await useContext(ctx);
+		progress.observe(event, ctx.cwd);
+	});
 	pi.on("agent_end", async (event, ctx) => {
 		await useContext(ctx);
+		progress.observe(event, ctx.cwd);
 		await session?.onAgentEnd(event);
 	});
+	const observeProgress = async (event: { type: string }, ctx: ExtensionContext) => {
+		await useContext(ctx);
+		progress.observe(event, ctx.cwd);
+	};
+	pi.on("auto_compaction_start", observeProgress);
+	pi.on("auto_compaction_end", observeProgress);
+	pi.on("auto_retry_start", observeProgress);
+	pi.on("auto_retry_end", observeProgress);
 	pi.on("input", async (event, ctx) => {
 		await useContext(ctx);
 		if (event.source === "interactive" || event.source === "rpc") session?.onLocalInput();
@@ -501,11 +520,13 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 	pi.on("tool_execution_start", async (event, ctx) => {
 		await useContext(ctx);
 		if (event.toolName === "ask") asks.add(event.toolCallId);
+		progress.observe(event, ctx.cwd);
 	});
 	pi.on("tool_execution_end", async (event, ctx) => {
 		await useContext(ctx);
 		asks.delete(event.toolCallId);
 		approvals.delete(event.toolCallId);
+		progress.observe(event, ctx.cwd);
 	});
 }
 

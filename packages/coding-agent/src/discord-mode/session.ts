@@ -17,6 +17,7 @@ import { describeDiscordMode, type DiscordModePresentation } from "./presentatio
 import { readDiscordSharedSessions } from "./retirement-events";
 import { createDiscordSettingsHost } from "./settings-host";
 import { DiscordModeRequestError, sealModeSettingsView } from "@oh-my-pi/pi-utils/discord-client";
+import { DiscordProgressTracker } from "@oh-my-pi/pi-utils/discord-progress";
 import {
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_REPLY,
@@ -25,6 +26,7 @@ import {
 	type ModeDialog,
 	type ModeEnrollment,
 	type ModeLease,
+	type ModeProgress,
 	type ModeRequest,
 	type ModeSettingCommand,
 	type ModeSettingsView,
@@ -144,6 +146,35 @@ export interface DiscordSessionOptions {
 	rejoinRetryMs?: number;
 	/** Discord settings panel support; without it the session reports no settings and never applies changes. */
 	settings?: DiscordSettingsHost;
+	/**
+	 * Offer owner messages saved while this conversation was closed. Resolves to per-message decisions; messages it
+	 * leaves out stay saved. Runs inside a local dialog, so nothing dispatches meanwhile. Without it, a notice points
+	 * to the channel.
+	 */
+	offerSaved?: (messages: ModeDelivery[]) => Promise<DiscordSavedDecision[] | undefined>;
+}
+
+export interface DiscordSavedDecision {
+	id: string;
+	action: "send" | "discard";
+}
+
+interface HeldSplit {
+	saved: ModeDelivery[];
+	stuck: number;
+}
+/**
+ * Saved owner messages are offered; other queued-but-held and uncertain work still needs /discord repair or
+ * /discord reconcile. Brokers before saved messages omit `held`, so all their queued work counts as stuck.
+ */
+function splitHeld(deliveries: ModeDelivery[]): HeldSplit {
+	const saved = deliveries.filter(
+		item => item.held === true && item.source === "owner" && item.kind === "message" && item.state === "queued",
+	);
+	const stuck = deliveries.filter(
+		item => item.state === "unknown" || (item.state === "queued" && item.held !== false && !saved.includes(item)),
+	).length;
+	return { saved, stuck };
 }
 
 const sessions = new WeakMap<DiscordSessionEngine, DiscordModeSession>();
@@ -235,6 +266,8 @@ export class DiscordModeSession {
 	#active?: ActiveDelivery;
 	#intakeHeld = false;
 	#localDialogs = 0;
+	/** Live run summary for the session card; built from allowlisted event fields only. */
+	#progress = new DiscordProgressTracker();
 	#dialogs: DiscordDialogs;
 	#options: DiscordSessionOptions;
 	/** Automatic rejoin in flight or its single retry pending; the footer reads REJOINING meanwhile. */
@@ -414,17 +447,17 @@ export class DiscordModeSession {
 			const snapshot = await this.on(enrollment.group.name, shared.label, { rejoin: true });
 			this.#rejoined = true;
 			const attached = this.#epoch;
-			let held = 0;
+			let held: HeldSplit = { saved: [], stuck: 0 };
 			try {
-				const status = await this.status();
-				held = status.deliveries.filter(item => item.state === "queued" || item.state === "unknown").length;
+				held = splitHeld((await this.status()).deliveries);
 			} catch {
 				/* Polling surfaces transport trouble; the held count is advisory. */
 			}
-			if (held && attached === this.#epoch)
+			if (held.stuck && attached === this.#epoch)
 				this.#options.notify?.(
-					`Discord rejoined #${shared.label}; ${held} held or uncertain message(s) need /discord repair or /discord reconcile.`,
+					`Discord rejoined #${shared.label}; ${held.stuck} held or uncertain message(s) need /discord repair or /discord reconcile.`,
 				);
+			if (held.saved.length && attached === this.#epoch) void this.#offerSaved(held.saved);
 			return snapshot;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -466,6 +499,8 @@ export class DiscordModeSession {
 		this.#rejoined = false;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
+		// Events stop with the subscription; a later attachment counts afresh.
+		this.#progress.reset();
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
 		if (this.#sessionFile && enrolledFiles.get(this.#sessionFile) === this) enrolledFiles.delete(this.#sessionFile);
@@ -597,6 +632,7 @@ export class DiscordModeSession {
 				busy: this.#busy(),
 				pendingInput: this.pendingInput,
 				...this.#settingsReport(),
+				...this.#progressReport(),
 			});
 			// Settings apply first, so the next owner message already runs with them.
 			if (this.#current(epoch, generation)) this.#intakeCommands(snapshot.commands ?? [], epoch, generation);
@@ -619,6 +655,12 @@ export class DiscordModeSession {
 		const view = this.#currentSettings();
 		const usage = this.#usage();
 		return { ...(view && view.revision !== revision ? { settings: view } : {}), ...(usage ? { usage } : {}) };
+	}
+
+	/** Only to brokers that advertise it, and only while a run is active. */
+	#progressReport(): { progress?: ModeProgress } {
+		const progress = this.#snapshot?.progress ? this.#progress.current() : undefined;
+		return progress ? { progress } : {};
 	}
 
 	#currentSettings(): ModeSettingsView | undefined {
@@ -829,17 +871,65 @@ export class DiscordModeSession {
 		}
 		// Only a fresh registration reaches here. Surface broker-held work once; it is never resumed automatically.
 		const generationAfter = this.#generation;
-		let held: number;
+		let held: HeldSplit;
 		try {
-			const status = await this.status();
-			held = status.deliveries.filter(item => item.state === "queued" || item.state === "unknown").length;
+			held = splitHeld((await this.status()).deliveries);
 		} catch {
 			return; // #request already re-armed the reconnect backoff.
 		}
-		if (held && this.#current(epoch, generationAfter))
+		if (!this.#current(epoch, generationAfter)) return;
+		if (held.stuck)
 			this.#options.notify?.(
-				`Discord reconnected; ${held} held or uncertain message(s) need /discord repair or /discord reconcile.`,
+				`Discord reconnected; ${held.stuck} held or uncertain message(s) need /discord repair or /discord reconcile.`,
 			);
+		if (held.saved.length) void this.#offerSaved(held.saved);
+	}
+
+	/** Offer this session's saved Discord messages again; they stay saved until sent or discarded. */
+	async reviewSaved(): Promise<number> {
+		const { saved } = splitHeld((await this.status()).deliveries);
+		if (saved.length) await this.#offerSaved(saved);
+		return saved.length;
+	}
+
+	/** Saved messages are offered, never dispatched on their own: only the owner's choice releases or drops them. */
+	async #offerSaved(saved: ModeDelivery[]): Promise<void> {
+		const offer = this.#options.offerSaved;
+		if (!offer) {
+			this.#options.notify?.(
+				`Discord: ${saved.length} message(s) arrived while this session was closed; review them in its channel.`,
+			);
+			return;
+		}
+		const epoch = this.#epoch;
+		const generation = this.#generation;
+		const endDialog = this.beginLocalDialog();
+		let decisions: DiscordSavedDecision[] | undefined;
+		try {
+			decisions = await offer(saved);
+		} catch {
+			decisions = undefined;
+		} finally {
+			endDialog();
+		}
+		if (!decisions?.length || !this.#current(epoch, generation)) return;
+		try {
+			for (const action of ["discard", "send"] as const) {
+				const deliveryIds = decisions.filter(item => item.action === action).map(item => item.id);
+				if (deliveryIds.length)
+					await this.#request({
+						op: "held",
+						lease: this.#requireLease(),
+						requestId: crypto.randomUUID(),
+						action,
+						deliveryIds,
+					});
+			}
+		} catch (error) {
+			this.#options.notify?.(
+				`Discord couldn't update saved messages: ${error instanceof Error ? error.message : String(error)} They stay saved; open /discord to review them again.`,
+			);
+		}
 	}
 
 	#backoff(): void {
@@ -1062,6 +1152,7 @@ export class DiscordModeSession {
 
 	#event(event: AgentSessionEvent): void {
 		if (!this.enabled) return;
+		this.#progress.observe(event, this.engine.sessionManager.getCwd());
 		this.#rejoined = false;
 		this.#renderStatus();
 		const active = this.#active;
@@ -1118,6 +1209,35 @@ export class DiscordModeSession {
 	}
 }
 
+/** Terminal offer for saved Discord messages: Review one by one, Send all, or Discard; escape keeps them saved. */
+async function chooseSavedMessages(
+	ctx: InteractiveModeContext,
+	messages: ModeDelivery[],
+): Promise<DiscordSavedDecision[] | undefined> {
+	const count = `${messages.length} message${messages.length === 1 ? "" : "s"}`;
+	const choice = await ctx.showHookSelector(`Discord: ${count} arrived while this session was closed`, [
+		{ label: "Review", description: "Read each one, then send or discard it." },
+		{ label: "Send all", description: "Run them in order, one turn each, as the session becomes idle." },
+		{ label: "Discard", description: "Drop them without running anything." },
+	]);
+	if (choice === "Send all" || choice === "Discard")
+		return messages.map(message => ({ id: message.id, action: choice === "Send all" ? "send" : "discard" }));
+	if (choice !== "Review") return undefined;
+	const decisions: DiscordSavedDecision[] = [];
+	for (const [index, message] of messages.entries()) {
+		ctx.showStatus(`Saved Discord message ${index + 1} of ${messages.length}\n${message.text}`, { dim: false });
+		const answer = await ctx.showHookSelector(`Saved message ${index + 1} of ${messages.length}`, [
+			"Send",
+			"Discard",
+			"Keep for later",
+		]);
+		if (answer === undefined) break;
+		if (answer === "Send" || answer === "Discard")
+			decisions.push({ id: message.id, action: answer === "Send" ? "send" : "discard" });
+	}
+	return decisions;
+}
+
 export function getDiscordModeSession(session: DiscordSessionEngine): DiscordModeSession | undefined {
 	return sessions.get(session);
 }
@@ -1136,6 +1256,7 @@ export function ensureDiscordModeSession(ctx: InteractiveModeContext): DiscordMo
 				ctx.session.isGeneratingHandoff ||
 				ctx.session.isRetrying,
 			settings: createDiscordSettingsHost(ctx),
+			offerSaved: messages => chooseSavedMessages(ctx, messages),
 		});
 		sessions.set(ctx.session, mode);
 	}

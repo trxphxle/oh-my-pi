@@ -28,12 +28,13 @@ import {
 	PermissionsBitField,
 	type TextChannel,
 } from "discord.js";
-import { DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
+import { CLOSED_SAVED_TEXT, DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
 import { DiscordAdapter } from "../../src/discord-mode/discord";
 import { settingsChoiceToken } from "../../src/discord-mode/settings-view";
 import {
 	DISCORD_MODE_MAX_REPLY,
 	type DiscordPortHandlers,
+	type ModeNoticeAction,
 	type ModeSettingsPanel,
 	type ModeSettingsView,
 } from "@oh-my-pi/pi-wire/discord-mode";
@@ -131,13 +132,23 @@ function fixture() {
 		permissionOverwrites: { cache: overwrites },
 		permissionsFor: () => new PermissionsBitField(effective),
 		messages: {
-			fetch: async (options: { message?: string; before?: string; limit?: number }) => {
+			fetch: async (options: { message?: string; before?: string; after?: string; limit?: number }) => {
 				if (options.message) {
 					const message = history.get(options.message);
 					if (!message) throw { code: 10008 };
 					return message;
 				}
 				const page = new Collection<string, Message>();
+				if (options.after) {
+					// Like Discord: the oldest `limit` messages after the id, returned newest first.
+					const after = BigInt(options.after);
+					const following = [...history]
+						.filter(([id]) => BigInt(id) > after)
+						.sort(([left], [right]) => (BigInt(left) < BigInt(right) ? -1 : 1))
+						.slice(0, options.limit ?? 50);
+					for (const [id, message] of following.reverse()) page.set(id, message);
+					return page;
+				}
 				for (const [id, message] of [...history].reverse()) {
 					if (options.before && Number(id) >= Number(options.before)) continue;
 					page.set(id, message);
@@ -362,8 +373,8 @@ function fixture() {
 			replied: false,
 			isRepliable: () => true,
 			isChatInputCommand: () => false,
-			isButton: () => !/:choose$|:submit$|:queue[01]$/.test(customId),
-			isStringSelectMenu: () => /:choose$|:queue[01]$/.test(customId),
+			isButton: () => !/:choose$|:submit$|:queue[01]$|:review[01]$/.test(customId),
+			isStringSelectMenu: () => /:choose$|:queue[01]$|:review[01]$/.test(customId),
 			isModalSubmit: () => customId.endsWith(":submit"),
 			isMessageComponent: () => !customId.endsWith(":submit"),
 			fields: { getTextInputValue: () => "edited text" },
@@ -1795,5 +1806,124 @@ describe("Discord mode gateway adapter (offline)", () => {
 		expect(f.client.listenerCount(Events.MessageCreate)).toBe(0);
 		expect(f.client.listenerCount(Events.InteractionCreate)).toBe(0);
 		expect(f.connections).toEqual([true, false, true, false]);
+	});
+});
+
+describe("Discord adapter saved and missed messages (offline)", () => {
+	function buttons(payload: MessageCreateOptions | InteractionEditReplyOptions): string[] {
+		const ids: string[] = [];
+		for (const row of payload.components ?? []) {
+			const data = "toJSON" in row ? row.toJSON() : row;
+			if (!("components" in data)) continue;
+			for (const component of data.components)
+				if ("custom_id" in component && component.custom_id) ids.push(component.custom_id);
+		}
+		return ids;
+	}
+
+	it("acknowledges a saved message with one Discard button that routes back with its delivery", async () => {
+		const f = fixture();
+		f.handlers.ownerMessage = async () => ({
+			text: CLOSED_SAVED_TEXT,
+			saved: true,
+			connectionId: CONNECTION,
+			deliveryId: DELIVERY,
+		});
+		await f.adapter.start(f.handlers);
+		f.client.emit(Events.MessageCreate, f.ownerMessage("while closed"));
+		await settleEvents();
+		expect(f.sent).toHaveLength(1);
+		expect(f.sent[0]!.content).toBe(CLOSED_SAVED_TEXT);
+		expect(f.sent[0]!.allowedMentions).toEqual({ parse: [], repliedUser: false });
+		const ids = buttons(f.sent[0]!);
+		expect(ids).toHaveLength(1);
+		expect(ids[0]!.endsWith(":discard")).toBe(true);
+		expect(ids[0]!.length).toBeLessThanOrEqual(100);
+		f.client.emit(Events.InteractionCreate, f.interaction(ids[0]!).event);
+		await settleEvents();
+		expect(f.controls.map(({ action, connectionId, deliveryId }) => ({ action, connectionId, deliveryId }))).toEqual([
+			{ action: "discard", connectionId: CONNECTION, deliveryId: DELIVERY },
+		]);
+	});
+
+	it("fetches owner history after the watermark oldest first, across pages, filtered and bounded", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const add = (id: string, content: string, overrides: Record<string, unknown> = {}) =>
+			f.history.set(id, { ...f.ownerMessage(content, overrides), id } as unknown as Message);
+		const bot = (id: string) =>
+			f.history.set(id, { ...f.makeMessage({ content: `bot ${id}` }), id } as unknown as Message);
+		add("201", "first");
+		bot("202");
+		add("203", "second");
+		add("204", "outsider", { author: { id: "outsider", bot: false } });
+		add("205", "hook", { webhookId: "webhook" });
+		add("206", "!steer third");
+		add("207", "with file", { attachments: new Collection([["file", {}]]) });
+		expect((await f.adapter.history(CHANNEL, "200", 50)).map(item => [item.id, item.kind, item.text])).toEqual([
+			["201", "message", "first"],
+			["203", "message", "second"],
+			["206", "steer", "third"],
+			["207", "message", ""],
+		]);
+		expect((await f.adapter.history(CHANNEL, "200", 2)).map(item => item.id)).toEqual(["201", "203"]);
+		expect((await f.adapter.history(CHANNEL, "203", 50))[0]).toMatchObject({ id: "206", ownerId: OWNER });
+		// A full page of the bot's own posts does not hide a later owner message.
+		for (let index = 0; index < 120; index++) bot(String(300 + index));
+		add("500", "after the cards");
+		expect((await f.adapter.history(CHANNEL, "299", 50)).map(item => item.id)).toEqual(["500"]);
+	});
+
+	it("posts one notice with saved-message buttons, and Review lists, shows, sends, or discards", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const actions: ModeNoticeAction[] = [
+			{ action: "review", label: "Review" },
+			{ action: "send-held", label: "Send all" },
+			{ action: "discard-held", label: "Discard" },
+		];
+		await f.adapter.notice(CHANNEL, "2 messages arrived while this session was closed.", "k", CONNECTION, actions);
+		await f.adapter.notice(CHANNEL, "2 messages arrived while this session was closed.", "k", CONNECTION, actions);
+		expect(f.sent).toHaveLength(1);
+		expect(f.sent[0]!.allowedMentions).toEqual({ parse: [], repliedUser: false });
+		const [review, sendAll, discardAll] = buttons(f.sent[0]!);
+		const saved = [
+			{ id: DELIVERY, text: "first saved", createdAt: 1, held: true, actionable: false },
+			{ id: crypto.randomUUID(), text: "second saved", createdAt: 2, held: true, actionable: false },
+		];
+		f.handlers.control = async input => {
+			f.controls.push(input);
+			return input.action === "review"
+				? {
+						text: input.deliveryId ? "Saved message\nfirst saved" : "2 saved messages.",
+						connectionId: CONNECTION,
+						...(input.deliveryId ? { deliveryId: input.deliveryId } : {}),
+						queued: saved,
+						review: true,
+					}
+				: { text: "done" };
+		};
+		const listed = f.interaction(review!);
+		f.client.emit(Events.InteractionCreate, listed.event);
+		await settleEvents();
+		const listIds = buttons(listed.payloads[0]!);
+		expect(listIds.map(id => id.split(":").at(-1))).toEqual(["review0", "send-held", "discard-held"]);
+		const picked = f.interaction(listIds[0]!, { values: [DELIVERY] });
+		f.client.emit(Events.InteractionCreate, picked.event);
+		await settleEvents();
+		expect(picked.responses[0]).toBe("Saved message\nfirst saved");
+		const [send, discard] = buttons(picked.payloads[0]!);
+		for (const id of [send!, discard!, sendAll!, discardAll!])
+			f.client.emit(Events.InteractionCreate, f.interaction(id).event);
+		await settleEvents();
+		expect(f.controls.map(({ action, deliveryId }) => [action, deliveryId])).toEqual([
+			["review", undefined],
+			["review", DELIVERY],
+			["release", DELIVERY],
+			["discard", DELIVERY],
+			["send-held", undefined],
+			["discard-held", undefined],
+		]);
+		await expect(f.adapter.notice(CHANNEL, "text", "bad", CONNECTION, [])).rejects.toThrow("invalid");
 	});
 });

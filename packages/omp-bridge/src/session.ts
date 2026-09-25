@@ -15,6 +15,7 @@ import {
 	DISCORD_MODE_MAX_TEXT,
 	type ModeDelivery,
 	type ModeLease,
+	type ModeProgress,
 	type ModeRequest,
 	type ModeSession,
 	type ModeSettingCommand,
@@ -577,6 +578,7 @@ export class BridgeSession {
 				);
 			if (attachment.holds.size) this.host.notify(RECOVERY, "warning");
 			this.#schedule(attachment);
+			void this.#offerSaved(attachment);
 			return snapshot;
 		} catch (error) {
 			if (epoch === this.#epoch) {
@@ -806,6 +808,7 @@ export class BridgeSession {
 				busy: this.#busy(attachment),
 				pendingInput: state.pendingInput || state.draft,
 				...this.#settingsReport(attachment),
+				...this.#progressReport(attachment),
 			});
 			for (const delivery of snapshot.deliveries) {
 				if (
@@ -841,6 +844,18 @@ export class BridgeSession {
 		const view = this.#settingsView(attachment);
 		const usage = this.#usage();
 		return { ...(view && view.revision !== revision ? { settings: view } : {}), ...(usage ? { usage } : {}) };
+	}
+
+	/** Only to brokers that advertise it, and only while a run is active. */
+	#progressReport(attachment: Attachment): { progress?: ModeProgress } {
+		if (!attachment.snapshot.progress) return {};
+		let progress: ModeProgress | undefined;
+		try {
+			progress = this.host.progress?.();
+		} catch {
+			// Progress is cosmetic; polling and delivery continue without it.
+		}
+		return progress ? { progress } : {};
 	}
 
 	#settingsView(attachment: Attachment): ModeSettingsView | undefined {
@@ -1082,6 +1097,55 @@ export class BridgeSession {
 			if (this.#attachment !== attachment) return;
 			void this.poll().finally(() => this.#schedule(attachment));
 		}, this.options.pollIntervalMs ?? 1000);
+	}
+
+	/** Offer owner messages saved while this conversation was closed; only the owner's choice releases or drops them. */
+	async #offerSaved(attachment: Attachment): Promise<void> {
+		if (!this.host.select) return;
+		try {
+			const status = await this.#request(attachment, { op: "status", lease: attachment.lease });
+			// Brokers before saved messages omit `held`; their queued work is never offered here.
+			const saved = status.deliveries.filter(
+				item => item.held === true && item.source === "owner" && item.kind === "message" && item.state === "queued",
+			);
+			if (!saved.length || !this.#current(attachment)) return;
+			const count = `${saved.length} message${saved.length === 1 ? "" : "s"}`;
+			const choice = await this.host.select(`Discord: ${count} arrived while this session was closed`, [
+				"Review",
+				"Send all",
+				"Discard",
+			]);
+			const send: string[] = [];
+			const discard: string[] = [];
+			if (choice === "Send all") send.push(...saved.map(item => item.id));
+			else if (choice === "Discard") discard.push(...saved.map(item => item.id));
+			else if (choice === "Review")
+				for (const [index, message] of saved.entries()) {
+					this.host.notify(`Saved Discord message ${index + 1} of ${saved.length}:\n${message.text}`, "info");
+					const answer = await this.host.select(`Saved message ${index + 1} of ${saved.length}`, [
+						"Send",
+						"Discard",
+						"Keep for later",
+					]);
+					if (answer === undefined) break;
+					if (answer === "Send") send.push(message.id);
+					else if (answer === "Discard") discard.push(message.id);
+				}
+			for (const [action, deliveryIds] of [
+				["discard", discard],
+				["send", send],
+			] as const)
+				if (deliveryIds.length && this.#current(attachment))
+					await this.#request(attachment, {
+						op: "held",
+						lease: attachment.lease,
+						requestId: randomUUID(),
+						action,
+						deliveryIds,
+					});
+		} catch {
+			/* The channel's notice offers the same choices; unsent messages stay saved. */
+		}
 	}
 
 	async #request(attachment: Attachment, input: ModeRequest): Promise<ModeSnapshot> {

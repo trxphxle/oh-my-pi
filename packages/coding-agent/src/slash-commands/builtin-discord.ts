@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { Container, Input, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { discordModePaths, loadDiscordModeConfig, saveDiscordModeConfig } from "../discord-mode/config";
+import { readDiscordServiceSettings, setDiscordServiceKeepOnline } from "../discord-mode/service";
 import { ensureDiscordModeSession, getDiscordModeSession, type DiscordModeSession } from "../discord-mode/session";
 import type { ModeSnapshot } from "@oh-my-pi/pi-wire/discord-mode";
 import { describeDiscordMode, type DiscordModePresentation } from "../discord-mode/presentation";
@@ -12,6 +13,7 @@ import type { SlashCommandSpec } from "./types";
 function formatStatus(
 	snapshot: ModeSnapshot,
 	presentation: DiscordModePresentation = describeDiscordMode({ enabled: true, snapshot, transportAvailable: true }),
+	keepOnline?: boolean,
 ): string {
 	return [
 		presentation.title,
@@ -19,6 +21,7 @@ function formatStatus(
 		presentation.detail,
 		`Session: ${snapshot.session.pendingInput ? "waiting for your answer" : snapshot.session.busy ? "working" : "idle"}`,
 		`Peers: ${snapshot.peers.filter(peer => peer.connected && peer.enabled).length} connected in this project`,
+		keepOnline === undefined ? "" : `Service: keep online ${keepOnline ? "on" : "off"}`,
 		...snapshot.deliveries
 			.filter(delivery => delivery.state === "unknown")
 			.map(delivery => `Uncertain work: ${delivery.id} — inspect with /discord reconcile; do not resend.`),
@@ -31,6 +34,16 @@ function formatStatus(
 async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordModeSession): Promise<string | undefined> {
 	const presentation = mode.presentation;
 	const choices: Array<{ label: string; description: string; action: string }> = [];
+	const keepOnlineChoice = async () => {
+		const { keepOnline } = await readDiscordServiceSettings();
+		return {
+			label: `Keep Discord online: ${keepOnline ? "on" : "off"}`,
+			description: keepOnline
+				? "Turn off: the service stops shortly after your last Haiso/OMP window closes."
+				: "Turn on: the service stays online after your last terminal closes (until logout or reboot).",
+			action: keepOnline ? "service off" : "service on",
+		};
+	};
 	if (!mode.enabled) {
 		let configured = false;
 		try {
@@ -45,6 +58,7 @@ async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordMod
 					description: "Change the private credentials saved on this Mac.",
 					action: "setup",
 				},
+				await keepOnlineChoice(),
 			);
 		} else {
 			choices.push({
@@ -68,6 +82,11 @@ async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordMod
 			description: presentation.destination ?? presentation.detail,
 			action: "status",
 		});
+		choices.push({
+			label: "Review saved messages",
+			description: "Messages sent from Discord while this session was closed.",
+			action: "saved",
+		});
 		if (presentation.state === "connected") {
 			choices.push({
 				label: "Rename group or channel",
@@ -75,6 +94,7 @@ async function chooseDiscordAction(ctx: InteractiveModeContext, mode: DiscordMod
 				action: "rename",
 			});
 		}
+		choices.push(await keepOnlineChoice());
 		choices.push({
 			label: "Turn off Discord",
 			description:
@@ -155,7 +175,7 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		getTuiAutocompleteDescription: ({ ctx }) =>
 			getDiscordModeSession(ctx.session)?.presentation.title ?? "Discord OFF",
 		allowArgs: true,
-		inlineHint: "[status|on|off|setup|repair|reconcile|rename]",
+		inlineHint: "[status|on|off|setup|repair|reconcile|saved|rename|service [on|off]]",
 		subcommands: [
 			{ name: "on", description: "Turn on remote access for this session" },
 			{ name: "status", description: "Show whether Discord is off, connected, or needs attention" },
@@ -165,8 +185,10 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			},
 			{ name: "repair", description: "Explicitly create or adopt a group/category or session channel" },
 			{ name: "reconcile", description: "Inspect and explicitly resolve uncertain work without replaying it" },
+			{ name: "saved", description: "Review messages sent from Discord while this session was closed" },
 			{ name: "rename", description: "Rename the group or session channel" },
 			{ name: "setup", description: "Configure private bot credentials using local masked input" },
+			{ name: "service", description: "Show or set whether the Discord service stays online: service on|off" },
 		],
 		handle: async (_command, runtime) => {
 			await runtime.output(
@@ -178,10 +200,10 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			const ctx = runtime.ctx;
 			const parsed = parseSubcommand(command.args);
 			let verb = parsed.verb;
-			const rest = parsed.rest;
+			let rest = parsed.rest;
 			ctx.editor.setText("");
 			try {
-				if (rest)
+				if (rest && verb !== "service")
 					throw new Error(
 						"Discord settings and names are collected locally; do not pass tokens or other arguments in command text.",
 					);
@@ -191,8 +213,32 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 					);
 				const mode = ensureDiscordModeSession(ctx);
 				if (!verb) {
-					verb = (await chooseDiscordAction(ctx, mode)) ?? "";
+					[verb = "", rest = ""] = ((await chooseDiscordAction(ctx, mode)) ?? "").split(" ");
 					if (!verb) return;
+				}
+				if (verb === "service") {
+					if (!rest) {
+						const { keepOnline } = await readDiscordServiceSettings();
+						ctx.showStatus(
+							`Discord service: keep online ${keepOnline ? "ON" : "OFF"}\nChange it with /discord service on|off.`,
+							{ dim: false },
+						);
+						return;
+					}
+					if (rest !== "on" && rest !== "off") throw new Error("Usage: /discord service [on|off]");
+					const { live } = await setDiscordServiceKeepOnline(rest === "on");
+					ctx.showStatus(
+						[
+							rest === "on"
+								? "Discord service: keep online ON\nThe service stays online after your last terminal closes (until logout or reboot)."
+								: "Discord service: keep online OFF\nThe service stops shortly after your last Haiso/OMP window closes.",
+							live ? "" : "(applies at next service start)",
+						]
+							.filter(Boolean)
+							.join("\n"),
+						{ dim: false },
+					);
+					return;
 				}
 				if (verb === "setup") {
 					await setup(ctx);
@@ -201,7 +247,14 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				if (verb === "status") {
 					if (mode.enabled) {
 						try {
-							ctx.showStatus(formatStatus(await mode.status(), mode.presentation), { dim: false });
+							ctx.showStatus(
+								formatStatus(
+									await mode.status(),
+									mode.presentation,
+									(await readDiscordServiceSettings()).keepOnline,
+								),
+								{ dim: false },
+							);
 						} catch {
 							ctx.showStatus(
 								[mode.presentation.title, mode.presentation.destination, mode.presentation.detail]
@@ -273,6 +326,13 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 						].join("\n"),
 						{ dim: false },
 					);
+					// Re-enabling an existing conversation is a rejoin: offer what arrived while it was closed.
+					if (existing) void session.reviewSaved().catch(() => {});
+					return;
+				}
+				if (verb === "saved") {
+					if (!mode?.enabled) throw new Error("Use /discord on before reviewing saved messages.");
+					if (!(await mode.reviewSaved())) ctx.showStatus("No saved Discord messages are waiting.");
 					return;
 				}
 				if (verb === "reconcile") {
@@ -309,7 +369,7 @@ export const BUILTIN_DISCORD_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 					return;
 				}
 				if (verb !== "repair" && verb !== "rename")
-					throw new Error("Usage: /discord [on|status|off|repair|reconcile|rename|setup]");
+					throw new Error("Usage: /discord [on|status|off|repair|reconcile|saved|rename|setup|service [on|off]]");
 				if (!mode?.enabled) throw new Error("Use /discord on before managing this session's Discord binding.");
 				const targetChoice = await ctx.showHookSelector(
 					`${verb === "repair" ? "Repair" : "Rename"} which Discord resource?`,

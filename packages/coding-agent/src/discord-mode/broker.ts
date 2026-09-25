@@ -4,6 +4,7 @@ import { type } from "@oh-my-pi/omptype";
 import { canonicalProjectDir } from "../launch/paths";
 import { discordCategoryName, sessionChannelName, sessionLabel, sessionSlug } from "./names";
 import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
+import { formatDiscordProgressLine } from "@oh-my-pi/pi-utils/discord-progress";
 import {
 	discardDiscordDeletionEvent,
 	isDiscordDeletedSessionFile,
@@ -16,6 +17,8 @@ import {
 	DISCORD_MODE_MAX_MODELS,
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_SESSIONS,
+	DISCORD_MODE_MAX_PROGRESS_FILES,
+	DISCORD_MODE_MAX_PROGRESS_LABEL,
 	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_SETTING_COMMANDS,
 	DISCORD_MODE_MAX_SETTINGS_BYTES,
@@ -33,11 +36,14 @@ import {
 	type ModeDialogAnswer,
 	type ModeEnrollment,
 	type ModeGroup,
+	type ModeNoticeAction,
+	type ModeOwnerMessage,
 	type ModeApp,
 	type ModeLease,
 	type ModeRequest,
 	type ModeNotify,
 	type ModeSession,
+	type ModeProgress,
 	type ModeSettingCommand,
 	type ModeSettingsPanel,
 	type ModeSettingsView,
@@ -59,6 +65,17 @@ const EFFECT_TIMEOUT_MS = 20_000;
 export const DISCORD_MODE_LONG_TURN_MS = 120_000;
 /** A dialog opening this soon after the session's previous one ended continues that exchange; no new ping. */
 const DIALOG_MENTION_GRACE_MS = 5_000;
+/** Instant, non-pinging reply to an owner message saved for a closed session. */
+export const CLOSED_SAVED_TEXT =
+	"This session is closed. Your message is saved and will be offered when you resume it.";
+/** Missed-message catch-up bounds per bound channel. */
+export const DISCORD_MODE_CATCH_UP_LIMIT = 50;
+export const DISCORD_MODE_CATCH_UP_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_CARD_FOOTER =
+	"Normal messages wait for idle; queued messages can become guidance or be cancelled before dispatch. !steer sends guidance; !abort and Stop turn cancel the current turn, not the process.";
+/** Graceful-stop card edits race the supervisor's stop grace. */
+const STOP_CARDS_MS = 1_500;
+const DISCORD_EPOCH = 1_420_070_400_000n;
 const Notify = type("'all' | 'needs-you' | 'off'");
 const App = type("'haiso' | 'omp'");
 /** Card header and overview section tag per attaching app. */
@@ -138,6 +155,20 @@ const SettingsViewShape = type({
 }).narrow(view => Buffer.byteLength(JSON.stringify(view)) <= DISCORD_MODE_MAX_SETTINGS_BYTES);
 const Amount = type("number").narrow(value => Number.isFinite(value) && value >= 0);
 const UsageShape = type({ tokens: Amount, contextWindow: Amount, percent: Amount, "+": "reject" });
+/** Shape only: a clock step must never invalidate a whole poll, so elapsed time is clamped when rendered instead. */
+const ProgressShape = type({
+	startedAt: Timestamp,
+	phase: "'thinking' | 'reading' | 'editing' | 'running' | 'searching' | 'delegating' | 'compacting' | 'retrying'",
+	files: type("number").narrow(
+		value => Number.isSafeInteger(value) && value >= 0 && value <= DISCORD_MODE_MAX_PROGRESS_FILES,
+	),
+	"last?": {
+		label: Plain(DISCORD_MODE_MAX_PROGRESS_LABEL),
+		outcome: "'pass' | 'fail' | 'timeout' | 'started'",
+		"+": "reject",
+	},
+	"+": "reject",
+});
 const RequestShape = type.or(
 	{
 		op: "'register'",
@@ -160,6 +191,7 @@ const RequestShape = type.or(
 		pendingInput: "boolean",
 		"settings?": SettingsViewShape,
 		"usage?": UsageShape,
+		"progress?": ProgressShape,
 		"+": "reject",
 	},
 	{
@@ -209,8 +241,18 @@ const RequestShape = type.or(
 		resumeQueued: type("boolean").default(false),
 		"+": "reject",
 	},
+	{
+		op: "'held'",
+		lease: LeaseShape,
+		requestId: RequestId,
+		action: "'send' | 'discard'",
+		"deliveryIds?": Id.array().atLeastLength(1).atMostLength(DISCORD_MODE_MAX_PENDING),
+		"+": "reject",
+	},
 );
 const Binding = type("'ready' | 'missing' | 'inaccessible' | 'moved' | 'offline' | 'unbound' | 'uncertain'");
+// Journal shapes drop undeclared keys instead of rejecting them, so a rollback from a release that added optional
+// fields still loads the journal; only declared fields are ever written back.
 const GroupShape = type({
 	id: Id,
 	projectDir: SafePath,
@@ -220,7 +262,7 @@ const GroupShape = type({
 	state: Binding,
 	uncertain: "boolean",
 	overviewUncertain: "boolean",
-	"+": "reject",
+	"+": "delete",
 });
 const RetirementShape = type({
 	eventId: Id,
@@ -229,7 +271,7 @@ const RetirementShape = type({
 	state: "'pending' | 'done' | 'attention'",
 	"channelId?": RemoteId,
 	"error?": type("string").atMostLength(500),
-	"+": "reject",
+	"+": "delete",
 });
 const SessionShape = type({
 	id: Id,
@@ -250,7 +292,7 @@ const SessionShape = type({
 	"retirement?": RetirementShape,
 	"notify?": Notify,
 	"app?": App,
-	"+": "reject",
+	"+": "delete",
 });
 const DeliveryShape = type({
 	id: Id,
@@ -265,32 +307,38 @@ const DeliveryShape = type({
 	held: "boolean",
 	"channelId?": RemoteId,
 	"sourceMessageId?": RemoteId,
-	"+": "reject",
+	"+": "delete",
 });
 const OperationShape = type({
 	fingerprint: Token,
 	state: "'working' | 'done' | 'unknown' | 'failed'",
 	"error?": type("string").atMostLength(500),
-	"+": "reject",
+	"+": "delete",
 });
-const AnswerShape = type({ id: RequestId, "value?": OptionalText.or("boolean"), cancelled: "boolean", "+": "reject" });
+const AnswerShape = type({ id: RequestId, "value?": OptionalText.or("boolean"), cancelled: "boolean", "+": "delete" });
 const PendingDialogShape = type({
 	sessionId: Id,
 	connectionId: Id,
-	dialog: DialogShape,
+	dialog: DialogShape.onUndeclaredKey("delete"),
 	state: "'pending' | 'answered'",
 	"answer?": AnswerShape,
-	"+": "reject",
+	"+": "delete",
 });
 const CardShape = type({
 	channelId: RemoteId,
 	fingerprint: Token,
 	state: "'working' | 'done' | 'unknown'",
 	"messageId?": RemoteId,
-	"+": "reject",
+	"+": "delete",
 });
 const OperationsShape = type({ "[string]": OperationShape }).narrow(operations =>
 	Object.keys(operations).every(key => /^[a-f0-9]{64}$/.test(key)),
+);
+/** Last processed owner message per bound channel; missed messages are fetched after it on reconnect. */
+const WatermarksShape = type({ "[string]": RemoteId }).narrow(
+	marks =>
+		Object.keys(marks).length <= DISCORD_MODE_MAX_SESSIONS * 2 &&
+		Object.keys(marks).every(key => /^\d{1,22}$/.test(key)),
 );
 const JournalShape = type({
 	version: "1",
@@ -302,7 +350,10 @@ const JournalShape = type({
 	dialogs: PendingDialogShape.array().atMostLength(DISCORD_MODE_MAX_SESSIONS * MAX_DIALOGS),
 	operations: OperationsShape,
 	cards: CardShape.array().atMostLength(DISCORD_MODE_MAX_SESSIONS * 2),
-	"+": "reject",
+	"watermarks?": WatermarksShape,
+	/** Service liveness: last heartbeat, and when a graceful stop began (cleared once back online). */
+	"service?": { "heartbeatAt?": Timestamp, "stoppedAt?": Timestamp, "+": "delete" },
+	"+": "delete",
 });
 const OwnerMessageShape = type({
 	id: RemoteId,
@@ -317,7 +368,8 @@ const ControlShape = type({
 	id: RequestId,
 	channelId: RemoteId,
 	ownerId: RemoteId,
-	action: "'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify' | 'settings' | 'setting'",
+	action:
+		"'status' | 'stop' | 'queue' | 'cancel' | 'steer' | 'notify' | 'settings' | 'setting' | 'discard' | 'release' | 'send-held' | 'discard-held' | 'review'",
 	"connectionId?": Id,
 	"deliveryId?": Id,
 	"notify?": Notify,
@@ -364,6 +416,17 @@ const SUPERSEDABLE: Partial<Record<ModeSettingCommand["kind"], true>> = {
 };
 /** Recent settings interaction ids and settled command ids kept for idempotent replays. */
 const SETTINGS_MEMORY = 256;
+/** Progress-only card edits per session are at least this far apart. */
+export const DISCORD_MODE_PROGRESS_CARD_MS = 10_000;
+/** A session's live progress; `shown` is the line its card currently carries. */
+interface ProgressReport {
+	connectionId: string;
+	progress: ModeProgress;
+	shown?: string;
+	renderedAt: number;
+	/** Trailing edit for a change that arrived inside the spacing window. */
+	timer?: NodeJS.Timeout;
+}
 
 /** Serialized durable routing for existing sessions; never owns or stops their engines. */
 export class DiscordModeBroker {
@@ -391,6 +454,11 @@ export class DiscordModeBroker {
 	#settingControls = new Map<string, ModeControlResult>();
 	/** Outcomes owed for changes dropped by revocation; posted once the current mutation finishes. */
 	#settingNotes: Array<{ channelId: string; commandId: string; text: string }> = [];
+	/** Set while stopping gracefully; overview cards then read `Offline since`. */
+	#stoppedAt: number | undefined;
+	#catchingUp = false;
+	/** Live run progress per session, never journaled; drives one line on the session card only. */
+	#progress = new Map<string, ProgressReport>();
 
 	constructor(options: { config: DiscordModeConfig; storePath: string; port: DiscordPort }) {
 		RemoteId.assert(options.config.guildId);
@@ -431,6 +499,9 @@ export class DiscordModeBroker {
 			if (operation.state === "working") operation.state = "unknown";
 		for (const card of this.#journal.cards) if (card.state === "working") card.state = "unknown";
 		this.#journal.dialogs = [];
+		// Offline window: a graceful stop records when it began; a crash leaves only the last heartbeat.
+		const crashedAt = this.#journal.service?.stoppedAt === undefined ? this.#journal.service?.heartbeatAt : undefined;
+		this.#journal.service = { heartbeatAt: Date.now() };
 		await this.#persist();
 		this.#running = true;
 		try {
@@ -442,10 +513,14 @@ export class DiscordModeBroker {
 				changed: () => this.#scheduleReconcile(),
 				connection: connected => {
 					this.#gateway = connected;
-					if (connected) void this.#scheduleReconcile();
+					if (!connected) return;
+					void this.#scheduleReconcile();
+					// Ready and resume both land here: fetch what the owner sent while the gateway was away.
+					this.#scheduleCatchUp();
 				},
 			});
 			await this.#mutate(() => this.#reconcile(true));
+			if (crashedAt !== undefined) await this.#mutate(() => this.#announceOffline(crashedAt));
 			this.#timer = setInterval(() => {
 				void this.#scheduleReconcile();
 			}, DISCORD_MODE_RECONCILE_MS);
@@ -462,9 +537,14 @@ export class DiscordModeBroker {
 		this.#timer = undefined;
 		this.#running = false;
 		await this.#serial;
+		for (const entry of this.#progress.values()) clearTimeout(entry.timer);
+		this.#progress.clear();
 		if (!this.#failed) {
 			for (const session of this.#journal.sessions) this.#revoke(session);
-			await this.#persist();
+			const stoppedAt = Date.now();
+			this.#journal.service = { ...this.#journal.service, stoppedAt };
+			if (this.#gateway) await this.#offlineCards(stoppedAt);
+			else await this.#persist();
 		}
 		this.#gateway = false;
 		await this.#port.close();
@@ -611,6 +691,17 @@ export class DiscordModeBroker {
 				case "repair":
 					await this.#repair(session, parsed);
 					break;
+				case "held":
+					await this.#perform(`request:${session.id}:${parsed.requestId}`, parsed, async () => {
+						this.#settleSaved(session, parsed.action, parsed.deliveryIds);
+					});
+					await this.#cards(this.#group(session.groupId));
+					return {
+						...this.#snapshot(session),
+						deliveries: this.#journal.deliveries
+							.filter(item => item.sessionId === session.id)
+							.map(publicDelivery),
+					};
 			}
 			return this.#snapshot(session);
 		});
@@ -854,6 +945,19 @@ export class DiscordModeBroker {
 			await this.#arrange(selectedGroup);
 		});
 		await this.#cards(selectedGroup);
+		// Saved messages are offered on resume, never dispatched: the owner decides here or at the desk.
+		const saved = newSession ? 0 : this.#saved(registered).length;
+		if (saved)
+			await this.#notice(
+				registered,
+				`${saved} message${saved === 1 ? "" : "s"} arrived while this session was closed.`,
+				`arrivals:${registered.id}:${registered.connectionId}`,
+				[
+					{ action: "review", label: "Review" },
+					{ action: "send-held", label: "Send all" },
+					{ action: "discard-held", label: "Discard" },
+				],
+			);
 		registered.seenAt = Date.now();
 		return this.#snapshot(registered, true);
 	}
@@ -930,6 +1034,8 @@ export class DiscordModeBroker {
 		session.label = sessionLabel(channel.name) ?? session.label;
 		session.uncertain = false;
 		session.state = "ready";
+		// A fresh channel has no history to catch up on; anything later is missed-message work.
+		this.#advanceWatermark(channel.id, snowflakeAt(Date.now()));
 		await this.#persist();
 	}
 
@@ -955,6 +1061,52 @@ export class DiscordModeBroker {
 			throw new DiscordModeError(
 				"This conversation isn't open locally; resume it to reconnect. Delivery is disabled until then.",
 			);
+	}
+
+	/** Holds a working lease: enabled, connected, and heard from within the lease window. */
+	#live(session: Session): boolean {
+		return session.enabled && session.connected && Date.now() - session.seenAt < DISCORD_MODE_LEASE_MS;
+	}
+
+	/** Saved owner messages of one session, in arrival order; `ids` narrows to those. */
+	#saved(session: Session, ids?: readonly string[]): Delivery[] {
+		return this.#journal.deliveries.filter(
+			item =>
+				item.sessionId === session.id &&
+				item.source === "owner" &&
+				item.from === this.#config.ownerId &&
+				item.kind === "message" &&
+				item.state === "queued" &&
+				item.held &&
+				(ids === undefined || ids.includes(item.id)),
+		);
+	}
+
+	/** Release saved messages to the current connection (dispatched in arrival order), or drop them. */
+	#settleSaved(session: Session, action: "send" | "discard", ids?: readonly string[]): number {
+		const saved = this.#saved(session, ids);
+		if (action === "discard") {
+			const dropped = new Set(saved.map(item => item.id));
+			this.#journal.deliveries = this.#journal.deliveries.filter(item => !dropped.has(item.id));
+			return saved.length;
+		}
+		this.#requireLive(session);
+		for (const delivery of saved) {
+			delivery.connectionId = session.connectionId;
+			delivery.channelId = session.channelId;
+			delivery.held = false;
+		}
+		return saved.length;
+	}
+
+	/** Keeps the newest processed owner message per channel; unbound channels are pruned when a new one appears. */
+	#advanceWatermark(channelId: string, messageId: string): void {
+		const marks = (this.#journal.watermarks ??= {});
+		const current = marks[channelId];
+		if (current === undefined)
+			for (const key of Object.keys(marks))
+				if (!this.#journal.sessions.some(session => session.channelId === key)) delete marks[key];
+		if (current === undefined || BigInt(messageId) > BigInt(current)) marks[channelId] = messageId;
 	}
 
 	#requireRemote(session: Session, requireLive = true): void {
@@ -991,6 +1143,8 @@ export class DiscordModeBroker {
 					: `Not applied (${describeSettingCommand(item.command, view)}): the session disconnected first.`,
 			});
 		this.#commands.delete(session.id);
+		clearTimeout(this.#progress.get(session.id)?.timer);
+		this.#progress.delete(session.id);
 	}
 
 	async #expire(): Promise<void> {
@@ -1038,8 +1192,12 @@ export class DiscordModeBroker {
 		kind: ModeDelivery["kind"],
 		text: string,
 		sourceMessageId?: string,
+		/** Save for a closed session: skips the live-lease check, never the budgets. */
+		held = false,
 	): void {
-		this.#requireLive(session);
+		if (!held) this.#requireLive(session);
+		else if (session.retirement || !session.enabled)
+			throw new DiscordModeError("This conversation is not shared anymore; nothing was saved.");
 		let sessionBytes = Buffer.byteLength(text);
 		for (const delivery of this.#journal.deliveries)
 			if (delivery.sessionId === session.id) {
@@ -1073,7 +1231,7 @@ export class DiscordModeBroker {
 			text,
 			state: "queued",
 			createdAt: Date.now(),
-			held: false,
+			held,
 		});
 	}
 
@@ -1091,6 +1249,8 @@ export class DiscordModeBroker {
 		session.busy = busy;
 		session.pendingInput = pendingInput;
 		if (input.settings || input.usage) this.#report(session, input.settings, input.usage);
+		// A progress-only change edits just this session's card, throttled; state flips re-render everything below.
+		const progressDue = this.#reportProgress(session, busy ? input.progress : undefined, changed);
 		// Unacknowledged changes repeat on every poll; the session dedups by id and re-sends a lost result.
 		const commands: ModeSettingCommand[] = [];
 		for (const item of this.#commands.get(session.id) ?? [])
@@ -1151,7 +1311,52 @@ export class DiscordModeBroker {
 			}
 		if (changed || deliveries.length || answers.length) await this.#persist();
 		if (changed || deliveries.length) await this.#cards(this.#group(session.groupId));
+		else if (progressDue) await this.#sessionCard(session);
 		return { ...this.#snapshot(session), deliveries, answers, ...(commands.length ? { commands } : {}) };
+	}
+
+	/** Stores this poll's progress; true when the card must re-render now for its progress line alone. */
+	#reportProgress(session: Session, progress: ModeProgress | undefined, immediate: boolean): boolean {
+		let entry = this.#progress.get(session.id);
+		if (!progress) {
+			if (!entry) return false;
+			clearTimeout(entry.timer);
+			this.#progress.delete(session.id);
+			return entry.shown !== undefined;
+		}
+		if (entry?.connectionId !== session.connectionId) {
+			clearTimeout(entry?.timer);
+			entry = { connectionId: session.connectionId, progress, renderedAt: 0 };
+			this.#progress.set(session.id, entry);
+		}
+		entry.progress = progress;
+		return this.#progressDue(session.id, entry, immediate);
+	}
+
+	/**
+	 * Adopts the current line when it changed and the spacing window allows; otherwise arms one trailing edit. Only a
+	 * changed line ever edits, and progress alone edits a card at most once per DISCORD_MODE_PROGRESS_CARD_MS.
+	 */
+	#progressDue(sessionId: string, entry: ProgressReport, immediate: boolean): boolean {
+		const line = formatDiscordProgressLine(entry.progress, Date.now());
+		if (line === entry.shown) return false;
+		const wait = entry.renderedAt + DISCORD_MODE_PROGRESS_CARD_MS - Date.now();
+		if (!immediate && wait > 0) {
+			entry.timer ??= setTimeout(() => {
+				entry.timer = undefined;
+				void this.#mutate(async () => {
+					const session = this.#journal.sessions.find(item => item.id === sessionId);
+					if (session && this.#progress.get(sessionId) === entry && this.#progressDue(sessionId, entry, true))
+						await this.#sessionCard(session);
+				}).catch(() => {});
+			}, wait).unref();
+			return false;
+		}
+		clearTimeout(entry.timer);
+		entry.timer = undefined;
+		entry.shown = line;
+		entry.renderedAt = Date.now();
+		return true;
 	}
 
 	#report(session: Session, view: ModeSettingsView | undefined, usage: ModeUsage | undefined): void {
@@ -1401,13 +1606,20 @@ export class DiscordModeBroker {
 		} catch {
 			throw new DiscordModeError("Invalid owner message: check identifiers, text limits, and allowed fields.");
 		}
+		this.#advanceWatermark(input.channelId, input.id);
 		await this.#reconcileSession(session);
 		await this.#expire();
 		await this.#persist();
-		this.#requireRemote(session);
+		// A closed conversation (still shared, no live lease) saves plain messages for its next resume.
+		const closed = session.enabled && !this.#live(session);
+		this.#requireRemote(session, !closed);
 		if (input.rejected) return { text: input.rejected };
+		if (closed && input.kind !== "message")
+			return {
+				text: `This session is closed; ${input.kind === "abort" ? "!abort" : "!steer"} needs it open at your desk. Nothing was saved.`,
+			};
 		await this.#perform(`owner:${input.id}`, input, async () => {
-			this.#enqueue(session, input.ownerId, "owner", input.kind, input.text, input.id);
+			this.#enqueue(session, input.ownerId, "owner", input.kind, input.text, input.id, closed);
 		});
 		await this.#cards(this.#group(session.groupId));
 		const delivery = this.#journal.deliveries.find(
@@ -1423,6 +1635,8 @@ export class DiscordModeBroker {
 				deliveryId: delivery.id,
 				connectionId: session.connectionId,
 			};
+		if (delivery.held && delivery.kind === "message" && !this.#live(session))
+			return { text: CLOSED_SAVED_TEXT, deliveryId: delivery.id, connectionId: session.connectionId, saved: true };
 		return {
 			text: delivery.held
 				? "Retained in the held queue; explicit repair and resumption are required before dispatch."
@@ -1463,10 +1677,14 @@ export class DiscordModeBroker {
 			input = ControlShape.assert(raw);
 			if (
 				((input.action === "cancel" || input.action === "steer") && (!input.connectionId || !input.deliveryId)) ||
+				((input.action === "discard" || input.action === "release") && !input.deliveryId) ||
 				(input.deliveryId !== undefined &&
 					input.action !== "queue" &&
 					input.action !== "cancel" &&
-					input.action !== "steer") ||
+					input.action !== "steer" &&
+					input.action !== "discard" &&
+					input.action !== "release" &&
+					input.action !== "review") ||
 				(input.action === "notify") !== (input.notify !== undefined) ||
 				(input.action === "setting") !== (input.setting !== undefined) ||
 				(input.action === "setting" && !input.connectionId) ||
@@ -1495,6 +1713,15 @@ export class DiscordModeBroker {
 		await this.#expire();
 		await this.#persist();
 		this.#requireRemote(session, false);
+		// Saved-message buttons outlive the connection that was current when they were posted.
+		if (
+			input.action === "discard" ||
+			input.action === "release" ||
+			input.action === "send-held" ||
+			input.action === "discard-held" ||
+			input.action === "review"
+		)
+			return this.#savedControl(session, input);
 		if (
 			input.connectionId !== undefined &&
 			(input.connectionId !== session.connectionId || !session.enabled || !session.connected)
@@ -1572,6 +1799,59 @@ export class DiscordModeBroker {
 						? "Queued the existing message as guidance for the current connection; dispatch is not yet confirmed."
 						: "Queued Stop turn. This requests cancellation of the current turn, not the process.",
 		};
+	}
+
+	/** Review, send, or discard saved owner messages. Sending needs the session open; the rest works while closed. */
+	async #savedControl(session: Session, input: ModeControlRequest): Promise<ModeControlResult> {
+		const ids = input.deliveryId === undefined ? undefined : [input.deliveryId];
+		const gone = "That saved message was already sent or discarded.";
+		if (input.action === "review") {
+			const saved = this.#saved(session, ids);
+			if (ids && !saved.length) throw new DiscordModeError(gone);
+			return {
+				text: ids
+					? `Saved message\n${saved[0]!.text}`
+					: saved.length
+						? `${saved.length} saved message${saved.length === 1 ? "" : "s"}. Pick one to send or discard it.`
+						: "No saved messages are waiting.",
+				connectionId: session.connectionId,
+				...(ids ? { deliveryId: input.deliveryId } : {}),
+				queued: saved.map(item => ({
+					id: item.id,
+					text: item.text,
+					createdAt: item.createdAt,
+					held: true,
+					actionable: false,
+				})),
+				review: true,
+			};
+		}
+		const send = input.action === "release" || input.action === "send-held";
+		if (send && !this.#live(session))
+			return { text: "This session is closed. Saved messages will be offered when you resume it at your desk." };
+		let count = 0;
+		await this.#perform(`control:${input.id}`, input, async () => {
+			count = this.#settleSaved(session, send ? "send" : "discard", ids);
+		});
+		await this.#cards(this.#group(session.groupId));
+		if (!count) return { text: ids ? gone : "No saved messages are waiting." };
+		const noun = `${count} saved message${count === 1 ? "" : "s"}`;
+		return {
+			text: send ? `Sending ${noun} in order as the session becomes idle.` : `Discarded ${noun}.`,
+		};
+	}
+
+	/** One best-effort saved-message notice; never repeated for its key, never fails the caller. */
+	async #notice(session: Session, text: string, key: string, actions: ModeNoticeAction[]): Promise<void> {
+		const channelId = session.channelId;
+		if (!channelId || !this.#gateway || session.state !== "ready") return;
+		try {
+			await this.#perform(`notice:${key}`, { channelId, text }, () =>
+				this.#external(() => this.#port.notice(channelId, text, key, session.connectionId, actions)),
+			);
+		} catch {
+			/* The session card's queue count and the next resume still surface saved messages. */
+		}
 	}
 
 	async #dialog(session: Session, input: Extract<ModeRequest, { op: "dialog" }>): Promise<void> {
@@ -1956,6 +2236,154 @@ export class DiscordModeBroker {
 				this.#reconcilePending = false;
 			});
 	}
+
+	#scheduleCatchUp(): void {
+		if (this.#catchingUp || !this.#running) return;
+		this.#catchingUp = true;
+		void this.#mutate(() => this.#catchUp())
+			.catch(() => undefined)
+			.finally(() => {
+				this.#catchingUp = false;
+			});
+	}
+
+	/**
+	 * Owner messages sent while the service or its gateway was away: fetched after each bound channel's watermark
+	 * (bounded in count and age), saved like messages to a closed session, and offered once per channel; never run.
+	 */
+	async #catchUp(): Promise<void> {
+		if (!this.#gateway) return;
+		const floor = snowflakeAt(Date.now() - DISCORD_MODE_CATCH_UP_MS);
+		const touched = new Set<Group>();
+		for (const group of this.#journal.groups) await this.#reconcileGroup(group);
+		for (const session of this.#journal.sessions) {
+			const channelId = session.channelId;
+			if (!channelId || session.retirement || !session.enabled) continue;
+			await this.#reconcileSession(session, false);
+			if (session.state !== "ready" || this.#group(session.groupId).state !== "ready") continue;
+			const mark = this.#journal.watermarks?.[channelId];
+			// First run with this channel: nothing is known to be missed, so start watching from now.
+			if (mark === undefined) {
+				this.#advanceWatermark(channelId, snowflakeAt(Date.now()));
+				continue;
+			}
+			let messages: ModeOwnerMessage[];
+			try {
+				messages = await this.#external(() =>
+					this.#port.history(channelId, BigInt(mark) > BigInt(floor) ? mark : floor, DISCORD_MODE_CATCH_UP_LIMIT),
+				);
+			} catch {
+				continue;
+			}
+			let saved = 0;
+			for (const raw of messages.slice(0, DISCORD_MODE_CATCH_UP_LIMIT)) {
+				if (!OwnerMessageShape.allows(raw) || raw.channelId !== channelId || raw.ownerId !== this.#config.ownerId)
+					continue;
+				if (BigInt(raw.id) <= BigInt(mark)) continue;
+				// Already received live (or by an earlier catch-up): the owner:<id> fence dedups it.
+				const fresh =
+					!raw.rejected &&
+					raw.kind === "message" &&
+					Text.allows(raw.text) &&
+					!this.#journal.operations[digest(`owner:${raw.id}`)];
+				if (fresh) {
+					try {
+						await this.#perform(`owner:${raw.id}`, raw, async () => {
+							this.#enqueue(session, raw.ownerId, "owner", "message", raw.text, raw.id, true);
+						});
+					} catch {
+						break; // A full budget stops here; the rest stays past the watermark for the next catch-up.
+					}
+					saved++;
+				}
+				this.#advanceWatermark(channelId, raw.id);
+			}
+			if (!saved) continue;
+			touched.add(this.#group(session.groupId));
+			await this.#notice(
+				session,
+				`${saved} message${saved === 1 ? "" : "s"} arrived while Haiso was offline.`,
+				`catchup:${channelId}:${this.#journal.watermarks![channelId]}`,
+				[
+					{ action: "send-held", label: "Send now" },
+					{ action: "discard-held", label: "Discard" },
+				],
+			);
+		}
+		await this.#persist();
+		for (const group of touched) await this.#cards(group);
+	}
+
+	/** After a crash, each overview says once how long the service was away. */
+	async #announceOffline(from: number): Promise<void> {
+		const text = `Haiso's Discord service was offline from <t:${Math.floor(from / 1000)}:f> to <t:${Math.floor(Date.now() / 1000)}:f>; it stopped unexpectedly.`;
+		for (const group of this.#journal.groups) {
+			const overviewId = group.overviewId;
+			if (!this.#gateway || group.state !== "ready" || !overviewId) continue;
+			try {
+				await this.#external(() => this.#port.publish(overviewId, text, `offline:${from}`));
+			} catch {
+				/* Informational only; the overview card already reads Online. */
+			}
+		}
+	}
+
+	/**
+	 * Graceful stop: overview cards read `Offline since`, session cards `Closed`, as exact edits of the saved messages
+	 * within the supervisor's stop grace. Their fingerprints are invalidated first, so the next start re-renders every
+	 * one of them whether or not the edit landed.
+	 */
+	async #offlineCards(stoppedAt: number): Promise<void> {
+		this.#stoppedAt = stoppedAt;
+		const edits: Array<{ channelId: string; text: string; app?: ModeApp }> = [];
+		for (const group of this.#journal.groups)
+			if (group.state === "ready" && group.overviewId)
+				edits.push({ channelId: group.overviewId, text: this.#overviewText(group) });
+		for (const session of this.#journal.sessions)
+			if (
+				!session.retirement &&
+				session.state === "ready" &&
+				session.channelId &&
+				this.#group(session.groupId).state === "ready"
+			)
+				edits.push({
+					channelId: session.channelId,
+					text: `${this.#sessionStatus(session)}\n${SESSION_CARD_FOOTER}`,
+					app: session.app ?? "haiso",
+				});
+		const targets = edits.flatMap(edit => {
+			const card = this.#journal.cards.find(item => item.channelId === edit.channelId);
+			if (card?.state !== "done" || !card.messageId) return [];
+			card.fingerprint = digest(["offline", stoppedAt, edit.channelId]);
+			return [{ ...edit, messageId: card.messageId }];
+		});
+		await this.#persist();
+		const deadline = Date.now() + STOP_CARDS_MS;
+		for (const target of targets) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			const expired = Promise.withResolvers<void>();
+			const timer = setTimeout(expired.resolve, remaining);
+			try {
+				await Promise.race([
+					this.#port
+						.status(
+							target.channelId,
+							target.text,
+							`status:${target.channelId}`,
+							undefined,
+							target.messageId,
+							true,
+							target.app,
+						)
+						.catch(() => {}),
+					expired.promise,
+				]);
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+	}
 	/** Adopt every matching local intent before any Discord effect or native routing. */
 	async #consumeRetirements(requestedId?: string): Promise<void> {
 		const root = path.dirname(this.#storePath);
@@ -2139,6 +2567,7 @@ export class DiscordModeBroker {
 				touched.add(session.groupId);
 			}
 		}
+		this.#journal.service = { heartbeatAt: Date.now() };
 		await this.#persist();
 		for (const groupId of touched) {
 			const group = this.#group(groupId);
@@ -2150,13 +2579,13 @@ export class DiscordModeBroker {
 	#sessionActivity(session: Session): string {
 		if (session.retirement) return "Permanently deleted";
 		if (!session.enabled) return "Off";
-		if (!session.connected || Date.now() - session.seenAt >= DISCORD_MODE_LEASE_MS)
-			return "Disconnected · rejoins when resumed";
-		if (session.pendingInput) return "Waiting for input";
-		return session.busy ? "Working" : "Idle";
+		if (!this.#live(session)) return "Closed · resume at your desk";
+		if (session.pendingInput) return "Online · Waiting for input";
+		return session.busy ? "Online · Working" : "Online · Idle";
 	}
 
-	#sessionStatus(session: Session, retirementComplete = false): string {
+	/** `progress` replaces the `<activity> · <state>` line on the session card; cards render only ready bindings. */
+	#sessionStatus(session: Session, retirementComplete = false, progress?: string): string {
 		if (session.retirement) {
 			const retirement = session.retirement;
 			return `${APP_TAGS[session.app ?? "haiso"]} · ${session.label}\nSession ${session.id}\nConversation permanently deleted. Nothing is forwarded; all controls and pending input are revoked.\nDiscord ${retirement.policy === "retain" ? "history retained" : "history deletion"} · ${retirementComplete ? "done" : retirement.state}${!retirementComplete && retirement.error ? `\n${retirement.error}` : ""}`;
@@ -2170,35 +2599,57 @@ export class DiscordModeBroker {
 			else if (delivery.state === "accepted" || delivery.state === "dispatched") active++;
 			else if (delivery.state === "unknown") uncertain++;
 		}
-		return `${APP_TAGS[session.app ?? "haiso"]} · ${session.label}\nSession ${session.id}\nProject ${this.#group(session.groupId).name}\n${this.#sessionActivity(session)} · ${session.state}\nQueued ${queued} · active ${active} · uncertain ${uncertain}\nNotifications: ${session.notify ?? "needs-you"}`;
+		return `${APP_TAGS[session.app ?? "haiso"]} · ${session.label}\nSession ${session.id}\nProject ${this.#group(session.groupId).name}\n${progress ?? `${this.#sessionActivity(session)} · ${session.state}`}\nQueued ${queued} · active ${active} · uncertain ${uncertain}\nNotifications: ${session.notify ?? "needs-you"}`;
 	}
 
 	async #cards(group: Group): Promise<void> {
 		if (!this.#gateway || group.state !== "ready") return;
 		const members = this.#journal.sessions.filter(session => session.groupId === group.id && !session.retirement);
-		if (group.overviewId) {
-			// One section per app, Haiso first to match channel order; empty sections are omitted.
-			const sections = (["haiso", "omp"] satisfies ModeApp[]).flatMap(app => {
-				const rows = members
-					.filter(session => (session.app ?? "haiso") === app)
-					.map(
-						session =>
-							`${session.channelId ? `<#${session.channelId}>` : session.label} · ${session.id} · ${this.#sessionActivity(session)} · ${session.state}`,
-					);
-				return rows.length ? [`\n${APP_TAGS[app]} sessions\n${rows.join("\n")}`] : [];
-			});
-			await this.#card(group.overviewId, `Haiso · ${group.name}\n${group.projectDir}\n${sections.join("\n")}`);
-		}
-		for (const session of members)
-			if (session.state === "ready" && session.channelId) {
-				await this.#card(
-					session.channelId,
-					`${this.#sessionStatus(session)}\nNormal messages wait for idle; queued messages can become guidance or be cancelled before dispatch. !steer sends guidance; !abort and Stop turn cancel the current turn, not the process.`,
-					this.#controlConnection(session),
-					false,
-					session.app ?? "haiso",
+		if (group.overviewId) await this.#card(group.overviewId, this.#overviewText(group));
+		for (const session of members) await this.#sessionCard(session);
+	}
+
+	/** Overview card: service liveness, then one section per app, Haiso first to match channel order. */
+	#overviewText(group: Group): string {
+		const members = this.#journal.sessions.filter(session => session.groupId === group.id && !session.retirement);
+		const sections = (["haiso", "omp"] satisfies ModeApp[]).flatMap(app => {
+			const rows = members
+				.filter(session => (session.app ?? "haiso") === app)
+				.map(
+					session =>
+						`${session.channelId ? `<#${session.channelId}>` : session.label} · ${session.id} · ${this.#sessionActivity(session)} · ${session.state}`,
 				);
-			}
+			return rows.length ? [`\n${APP_TAGS[app]} sessions\n${rows.join("\n")}`] : [];
+		});
+		const service =
+			this.#stoppedAt === undefined ? "Online" : `Offline since <t:${Math.floor(this.#stoppedAt / 1000)}:f>`;
+		return `Haiso · ${group.name}\n${group.projectDir}\nDiscord service: ${service}\n${sections.join("\n")}`;
+	}
+
+	/** One session's card, with its live progress line while it is working. */
+	async #sessionCard(session: Session): Promise<void> {
+		if (
+			!this.#gateway ||
+			session.retirement ||
+			session.state !== "ready" ||
+			!session.channelId ||
+			this.#group(session.groupId).state !== "ready"
+		)
+			return;
+		const progress = this.#progress.get(session.id);
+		const activity = this.#sessionActivity(session);
+		// The progress line (`Working · 4m · …`) takes the place of the activity's `Working`, keeping its prefix.
+		const line =
+			progress?.connectionId === session.connectionId && progress.shown && activity.endsWith("Working")
+				? `${activity.slice(0, -"Working".length)}${progress.shown}`
+				: undefined;
+		await this.#card(
+			session.channelId,
+			`${this.#sessionStatus(session, false, line)}\n${SESSION_CARD_FOOTER}`,
+			this.#controlConnection(session),
+			false,
+			session.app ?? "haiso",
+		);
 	}
 
 	async #card(
@@ -2271,6 +2722,7 @@ export class DiscordModeBroker {
 			gatewayConnected: this.#gateway,
 			maxReply: DISCORD_MODE_MAX_REPLY,
 			settingsRevision: this.#settingsFor(session)?.view?.revision ?? "",
+			progress: true,
 		};
 	}
 
@@ -2368,6 +2820,11 @@ function digest(value: unknown): string {
 function equalTokens(left: string, right: string): boolean {
 	return left.length === right.length && timingSafeEqual(Buffer.from(left), Buffer.from(right));
 }
+/** The smallest Discord snowflake at `time`: every message sent at or after it has a larger id. */
+function snowflakeAt(time: number): string {
+	const since = BigInt(Math.floor(time)) - DISCORD_EPOCH;
+	return since > 0n ? (since << 22n).toString() : "0";
+}
 function publicGroup(group: Group): ModeGroup {
 	const { uncertain: _uncertain, overviewUncertain: _overviewUncertain, ...result } = group;
 	return result;
@@ -2379,7 +2836,6 @@ function publicSession(session: Session): ModeSession {
 function publicDelivery(delivery: Delivery): ModeDelivery {
 	const {
 		connectionId: _connectionId,
-		held: _held,
 		channelId: _channelId,
 		sourceMessageId: _sourceMessageId,
 		...result

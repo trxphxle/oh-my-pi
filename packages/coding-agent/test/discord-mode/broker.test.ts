@@ -3,7 +3,15 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { DISCORD_MODE_LONG_TURN_MS, DiscordModeBroker, DiscordModeError } from "../../src/discord-mode/broker";
+import {
+	CLOSED_SAVED_TEXT,
+	DISCORD_MODE_CATCH_UP_LIMIT,
+	DISCORD_MODE_CATCH_UP_MS,
+	DISCORD_MODE_LONG_TURN_MS,
+	DISCORD_MODE_PROGRESS_CARD_MS,
+	DiscordModeBroker,
+	DiscordModeError,
+} from "../../src/discord-mode/broker";
 import { DiscordModeSession, type DiscordSessionEngine } from "../../src/discord-mode/session";
 import { settingsChoiceToken } from "../../src/discord-mode/settings-view";
 import { connectDiscordModeAt, sealModeSettingsView } from "@oh-my-pi/pi-utils/discord-client";
@@ -29,11 +37,14 @@ import type {
 	ModeDeletionEvent,
 	ModeRetirementPolicy,
 	ModeLease,
+	ModeNoticeAction,
+	ModeOwnerMessage,
 	ModeRequest,
 	ModeSettingCommand,
 	ModeSettingsPanel,
 	ModeSettingsView,
 	ModeSnapshot,
+	ModeProgress,
 	RemoteChannel,
 } from "@oh-my-pi/pi-wire/discord-mode";
 
@@ -222,6 +233,32 @@ class FixtureDiscord implements DiscordPort {
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#settingsWaiters.push({ count, resolve });
 		return promise;
+	}
+	/** Remote channel history, oldest first; `history` returns what follows the watermark like the adapter. */
+	readonly remoteHistory = new Map<string, ModeOwnerMessage[]>();
+	readonly historyRequests: Array<{ channelId: string; afterId: string; limit: number }> = [];
+	async history(channelId: string, afterId: string, limit: number): Promise<ModeOwnerMessage[]> {
+		this.historyRequests.push({ channelId, afterId, limit });
+		return (this.remoteHistory.get(channelId) ?? [])
+			.filter(message => BigInt(message.id) > BigInt(afterId))
+			.slice(0, limit)
+			.map(message => ({ ...message }));
+	}
+	readonly notices: Array<{
+		channelId: string;
+		text: string;
+		key: string;
+		connectionId: string;
+		actions: ModeNoticeAction[];
+	}> = [];
+	async notice(
+		channelId: string,
+		text: string,
+		key: string,
+		connectionId: string,
+		actions: ModeNoticeAction[],
+	): Promise<void> {
+		this.notices.push({ channelId, text, key, connectionId, actions });
 	}
 	channel(id: string): RemoteChannel {
 		const channel = this.channels.get(id);
@@ -1690,7 +1727,12 @@ describe("durable Discord mode broker", () => {
 			broker = new DiscordModeBroker({ config, storePath, port });
 			await broker.start();
 			expect(port.legacyCards.size).toBe(0);
-			expect([...port.cards.entries()]).toEqual(cards);
+			// Only the overview's service line differs: stopped before, online again now.
+			const serviceless = (entries: typeof cards) =>
+				entries.map(([id, card]) => [id, { ...card, text: card.text.replace(/Discord service: .*/, "") }]);
+			expect(serviceless([...port.cards.entries()])).toEqual(serviceless(cards));
+			expect(cards.some(([, card]) => card.text.includes("Discord service: Offline since <t:"))).toBe(true);
+			expect([...port.cards.values()].every(card => !card.text.includes("Offline since"))).toBe(true);
 			expect(port.statusCreates).toBe(statusCreates);
 			await broker.close();
 			broker = new DiscordModeBroker({ config, storePath, port });
@@ -1762,7 +1804,7 @@ describe("durable Discord mode broker", () => {
 			expect(port.cards.get(before.session.channelId!)?.connectionId).toBeUndefined();
 			const disconnected = await port.control(before, "status");
 			expect(disconnected.connectionId).toBeUndefined();
-			expect(disconnected.text).toMatch(/\bDisconnected\b/);
+			expect(disconnected.text).toContain("Closed · resume at your desk");
 			await expect(port.control(before, "stop")).rejects.toBeInstanceOf(DiscordModeError);
 			const after = await broker.request(resumed(input));
 			expect(after.session.channelId).toBe(before.session.channelId);
@@ -2265,7 +2307,7 @@ describe("Haiso and OMP app split", () => {
 			expect(overview.app).toBeUndefined();
 			const [header, haisoSection, ompSection, ...rest] = overview.text.split("\n\n");
 			expect(rest).toEqual([]);
-			expect(header).toBe(`Haiso · Named project\n${alpha.group.projectDir}`);
+			expect(header).toBe(`Haiso · Named project\n${alpha.group.projectDir}\nDiscord service: Online`);
 			expect(haisoSection!.split("\n").map(line => line.split(" · ")[0])).toEqual([
 				"Haiso sessions",
 				`<#${alphaId}>`,
@@ -2538,6 +2580,504 @@ describe("Discord session settings", () => {
 			await expect(setting(port, first, "compact")).rejects.toThrow("stale connection");
 			// The new connection must report its own settings before anything can change.
 			expect((await port.control(reconnected, "settings")).settings).toBeUndefined();
+		} finally {
+			await broker.close();
+		}
+	});
+});
+
+describe("session card progress", () => {
+	const LINE = "Working · 4m · editing 3 files · last: bun test (pass)";
+
+	async function progressFixture(prefix: string) {
+		const root = TempDir.createSync(prefix);
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({
+			config,
+			storePath: path.join(root.path(), "private", "state.json"),
+			port,
+		});
+		await broker.start();
+		const session = await broker.request(registration(root.path(), "progress"));
+		const channelId = session.session.channelId!;
+		const status = vi.spyOn(port, "status");
+		const startedAt = Date.now() - 4 * 60_000 - 1_000;
+		// The spacing window runs on fake time; broker I/O stays real.
+		vi.useFakeTimers();
+		const progress = (patch: Partial<ModeProgress> = {}): ModeProgress => ({
+			startedAt,
+			phase: "editing",
+			files: 3,
+			last: { label: "bun test", outcome: "pass" },
+			...patch,
+		});
+		return {
+			broker,
+			session,
+			progress,
+			card: () => port.cards.get(channelId)!.text,
+			overview: () => port.cards.get(session.group.overviewId!)!.text,
+			edits: () => status.mock.calls.filter(call => call[0] === channelId).length,
+			report: (value: ModeProgress | undefined, busy = true) =>
+				broker.request({
+					op: "poll",
+					lease: lease(session),
+					busy,
+					pendingInput: false,
+					...(value ? { progress: value } : {}),
+				}),
+			/** Fires due trailing edits, then waits for them: broker work is serialized behind them. */
+			async elapse(ms: number) {
+				vi.advanceTimersByTime(ms);
+				await broker.lookup(session.session.projectDir, session.session.id);
+			},
+			async close() {
+				vi.useRealTimers();
+				await broker.close();
+				root.remove();
+			},
+		};
+	}
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	it("shows the line on the session card only, throttles progress edits, and clears it when idle", async () => {
+		const f = await progressFixture("@discord-progress-card-");
+		try {
+			expect(f.session.progress).toBe(true);
+			await f.report(f.progress());
+			expect(f.card()).toContain(`${LINE}\n`);
+			expect(f.card()).not.toContain("Working · ready");
+			expect(f.overview()).toMatch(/\bWorking · ready\b/);
+			expect(f.overview()).not.toContain("editing");
+			const shown = f.edits();
+			// Unchanged line: no edit.
+			await f.report(f.progress());
+			expect(f.edits()).toBe(shown);
+			// Changes inside the window coalesce into one trailing edit carrying the latest line.
+			await f.report(f.progress({ files: 4 }));
+			await f.elapse(DISCORD_MODE_PROGRESS_CARD_MS / 2);
+			await f.report(f.progress({ files: 5 }));
+			expect(f.edits()).toBe(shown);
+			await f.elapse(DISCORD_MODE_PROGRESS_CARD_MS / 2);
+			expect(f.edits()).toBe(shown + 1);
+			expect(f.card()).toContain("editing 5 files");
+			await f.elapse(DISCORD_MODE_PROGRESS_CARD_MS);
+			expect(f.edits()).toBe(shown + 1);
+			// Past the window a change edits at once.
+			await f.report(f.progress({ phase: "running", last: { label: "bun test", outcome: "fail" } }));
+			expect(f.edits()).toBe(shown + 2);
+			expect(f.card()).toContain("Working · 4m · running · 3 files edited · last: bun test (fail)\n");
+			// Idle drops the line immediately.
+			await f.report(undefined, false);
+			expect(f.card()).toContain("Idle · ready\n");
+			expect(f.card()).not.toContain("last:");
+		} finally {
+			await f.close();
+		}
+	});
+
+	it("drops the line when a busy session stops reporting a run", async () => {
+		const f = await progressFixture("@discord-progress-norun-");
+		try {
+			await f.report(f.progress());
+			expect(f.card()).toContain(LINE);
+			// Busy only because of local editor text: no run, no line.
+			await f.report(undefined, true);
+			expect(f.card()).toContain("Working · ready\n");
+			expect(f.card()).not.toContain("last:");
+		} finally {
+			await f.close();
+		}
+	});
+
+	it("clears on detach, and a pending trailing edit never brings it back", async () => {
+		const f = await progressFixture("@discord-progress-detach-");
+		try {
+			await f.report(f.progress());
+			await f.report(f.progress({ files: 9 }));
+			await f.broker.request({ op: "detach", lease: lease(f.session) });
+			await f.elapse(DISCORD_MODE_PROGRESS_CARD_MS);
+			expect(f.card()).not.toContain("Working");
+			expect(f.card()).not.toContain("last:");
+		} finally {
+			await f.close();
+		}
+	});
+
+	it("rejects malformed progress without applying the poll", async () => {
+		const f = await progressFixture("@discord-progress-invalid-");
+		try {
+			for (const invalid of [
+				f.progress({ last: { label: "bun\u0007test", outcome: "pass" } }),
+				f.progress({ files: 1000 }),
+				{ ...f.progress(), output: "tool output" },
+			])
+				await expect(f.report(invalid as ModeProgress)).rejects.toThrow();
+			expect(f.card()).toContain("Idle · ready\n");
+		} finally {
+			await f.close();
+		}
+	});
+});
+
+describe("service liveness, saved and missed messages", () => {
+	const DISCORD_EPOCH = 1_420_070_400_000n;
+	/** A snowflake `offset` ms from now; `sequence` orders ids within it. */
+	function snowflake(offset: number, sequence = 0): string {
+		return (((BigInt(Date.now() + offset) - DISCORD_EPOCH) << 22n) + BigInt(sequence)).toString();
+	}
+	async function journal(storePath: string): Promise<Record<string, any>> {
+		return JSON.parse(await fs.readFile(storePath, "utf8"));
+	}
+	const SAVED_ACTIONS: ModeNoticeAction[] = [
+		{ action: "review", label: "Review" },
+		{ action: "send-held", label: "Send all" },
+		{ action: "discard-held", label: "Discard" },
+	];
+
+	it("session cards read Online while connected and Closed once the conversation closes", async () => {
+		using temporary = TempDir.createSync("@discord-honest-cards-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const live = await broker.request(registration(root, "honest"));
+			const channelId = live.session.channelId!;
+			expect(port.cards.get(channelId)!.text).toContain("\nOnline · Idle · ready\n");
+			await broker.request({ op: "detach", lease: lease(live) });
+			expect(port.cards.get(channelId)!.text).toContain("\nClosed · resume at your desk · ready\n");
+			expect(port.cards.get(channelId)!.text).not.toContain("Disconnected");
+			expect(port.cards.get(live.group.overviewId!)!.text).toContain("Closed · resume at your desk");
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("overview reads Offline since on a graceful stop and clears when back; a crash reports its window once", async () => {
+		using temporary = TempDir.createSync("@discord-offline-since-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const live = await broker.request(registration(root, "liveness"));
+			const overviewId = live.group.overviewId!;
+			const channelId = live.session.channelId!;
+			expect(port.cards.get(overviewId)!.text).toContain("Discord service: Online");
+			const before = Date.now();
+			await broker.close();
+			const stopped = port.cards.get(overviewId)!.text;
+			const since = /Discord service: Offline since <t:(\d+):f>/.exec(stopped);
+			expect(since).not.toBeNull();
+			expect(Number(since![1])).toBeGreaterThanOrEqual(Math.floor(before / 1000));
+			// Session cards drop their live controls and say the conversation is closed.
+			expect(port.cards.get(channelId)).toMatchObject({ connectionId: undefined });
+			expect(port.cards.get(channelId)!.text).toContain("Closed · resume at your desk");
+			expect((await journal(storePath)).service.stoppedAt).toBeGreaterThanOrEqual(before);
+
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect(port.cards.get(overviewId)!.text).toContain("Discord service: Online");
+			expect(port.cards.get(overviewId)!.text).not.toContain("Offline since");
+			expect((await journal(storePath)).service.stoppedAt).toBeUndefined();
+			// A graceful stop is not a crash: no offline-window note.
+			expect(port.publications.filter(item => item.key.startsWith("offline:"))).toEqual([]);
+			await broker.close();
+
+			// A crash leaves only the last heartbeat.
+			const heartbeatAt = before - 5 * 60_000;
+			const crashed = await journal(storePath);
+			crashed.service = { heartbeatAt };
+			await writePrivateJson(storePath, crashed);
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			const notes = port.publications.filter(item => item.key.startsWith("offline:"));
+			expect(notes).toHaveLength(1);
+			expect(notes[0]).toMatchObject({ kind: "publish", channelId: overviewId, key: `offline:${heartbeatAt}` });
+			expect(notes[0]!.text).toContain(`was offline from <t:${Math.floor(heartbeatAt / 1000)}:f> to <t:`);
+			await broker.close();
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect(port.publications.filter(item => item.key.startsWith("offline:"))).toHaveLength(1);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("saves plain messages for a closed conversation, replies at once, and discards them within budget", async () => {
+		using temporary = TempDir.createSync("@discord-closed-saved-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const input = registration(root, "closed");
+			const live = await broker.request(input);
+			await broker.request({ op: "detach", lease: lease(live) });
+			const saved = await port.owner(live, "while closed", "message", "8700");
+			expect(saved).toMatchObject({
+				text: CLOSED_SAVED_TEXT,
+				saved: true,
+				connectionId: live.session.connectionId,
+			});
+			expect(saved.deliveryId).toBeString();
+			// The same Discord event again is fenced, and still reads as saved.
+			expect(await port.owner(live, "while closed", "message", "8700")).toMatchObject({
+				saved: true,
+				deliveryId: saved.deliveryId,
+			});
+			for (const kind of ["steer", "abort"] as const)
+				expect((await port.owner(live, kind === "abort" ? "" : "nudge", kind)).text).toContain("Nothing was saved");
+			// Sending needs the conversation open; the saved message stays.
+			const early = await port.control(live, "send-held", { connectionId: live.session.connectionId });
+			expect(early.text).toContain("closed");
+			// A button from the revoked connection still discards: saved messages outlive it by design.
+			const discarded = await port.control(live, "discard", {
+				connectionId: live.session.connectionId,
+				deliveryId: saved.deliveryId,
+			});
+			expect(discarded.text).toBe("Discarded 1 saved message.");
+			expect(
+				(
+					await port.control(live, "discard", {
+						connectionId: live.session.connectionId,
+						deliveryId: saved.deliveryId,
+					})
+				).text,
+			).toContain("already sent or discarded");
+			// Existing budgets apply: 32 pending per session.
+			for (let index = 0; index < 32; index++)
+				await port.owner(live, `saved ${index}`, "message", String(9000 + index));
+			await expect(port.owner(live, "one too many", "message", "9100")).rejects.toThrow("32 per session");
+			const back = await broker.request({ ...resumed(input), rejoin: true });
+			const status = await broker.request({ op: "status", lease: lease(back) });
+			expect(status.deliveries).toHaveLength(32);
+			expect(status.deliveries.every(item => item.held === true && item.state === "queued")).toBe(true);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("a rejoin offers saved messages without dispatching them; Review, Discard, and Send all behave", async () => {
+		using temporary = TempDir.createSync("@discord-rejoin-offer-");
+		const root = temporary.path();
+		const port = new FixtureDiscord();
+		const broker = new DiscordModeBroker({ config, storePath: path.join(root, "private", "state.json"), port });
+		await broker.start();
+		try {
+			const input = registration(root, "offered");
+			const live = await broker.request(input);
+			await broker.request({ op: "detach", lease: lease(live) });
+			const first = await port.owner(live, "first saved", "message", "8800");
+			const second = await port.owner(live, "second saved", "message", "8801");
+			await port.owner(live, "third saved", "message", "8802");
+			const back = await broker.request({ ...resumed(input), rejoin: true });
+			const connectionId = back.session.connectionId;
+			expect(port.notices).toEqual([
+				{
+					channelId: live.session.channelId!,
+					text: "3 messages arrived while this session was closed.",
+					key: `arrivals:${input.sessionId}:${connectionId}`,
+					connectionId,
+					actions: SAVED_ACTIONS,
+				},
+			]);
+			// Offered, never dispatched on their own.
+			expect((await poll(broker, back)).deliveries).toEqual([]);
+			const status = await broker.request({ op: "status", lease: lease(back) });
+			expect(status.deliveries.map(item => [item.text, item.held, item.state])).toEqual([
+				["first saved", true, "queued"],
+				["second saved", true, "queued"],
+				["third saved", true, "queued"],
+			]);
+			const review = await port.control(back, "review", { connectionId });
+			expect(review).toMatchObject({ review: true, connectionId });
+			expect(review.queued!.map(item => item.text)).toEqual(["first saved", "second saved", "third saved"]);
+			const picked = await port.control(back, "review", { connectionId, deliveryId: second.deliveryId });
+			expect(picked).toMatchObject({ text: "Saved message\nsecond saved", deliveryId: second.deliveryId });
+			// Discard one from the terminal; Send all from Discord releases the rest in arrival order.
+			await broker.request({
+				op: "held",
+				lease: lease(back),
+				requestId: randomUUID(),
+				action: "discard",
+				deliveryIds: [second.deliveryId!],
+			});
+			const sent = await port.control(back, "send-held", { connectionId });
+			expect(sent.text).toBe("Sending 2 saved messages in order as the session becomes idle.");
+			const dispatched = await poll(broker, back);
+			expect(dispatched.deliveries.map(item => [item.id, item.text])).toEqual([[first.deliveryId!, "first saved"]]);
+			await broker.request({
+				op: "receipt",
+				lease: lease(back),
+				deliveryId: first.deliveryId!,
+				state: "completed",
+			});
+			expect((await poll(broker, back)).deliveries.map(item => item.text)).toEqual(["third saved"]);
+			// A later rejoin with nothing saved posts no offer.
+			await broker.request({ op: "detach", lease: lease(back) });
+			await broker.request({ ...resumed(input), rejoin: true });
+			expect(port.notices).toHaveLength(1);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("catches up owner messages missed while offline: after the watermark, owner-only, deduplicated, offered", async () => {
+		using temporary = TempDir.createSync("@discord-catch-up-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "missed");
+			const live = await broker.request(input);
+			const channelId = live.session.channelId!;
+			const base = BigInt(snowflake(60_000));
+			const id = (sequence: number) => (base + BigInt(sequence)).toString();
+			// Received live before the outage, but past the watermark a lost write left behind.
+			await port.owner(live, "seen live", "message", id(3));
+			await broker.close();
+			const saved = await journal(storePath);
+			saved.watermarks[channelId] = id(0);
+			await writePrivateJson(storePath, saved);
+			const message = (sequence: number, text: string, extra: Partial<ModeOwnerMessage> = {}) => ({
+				id: id(sequence),
+				channelId,
+				ownerId: config.ownerId,
+				text,
+				kind: "message" as const,
+				...extra,
+			});
+			port.remoteHistory.set(channelId, [
+				message(1, "missed one"),
+				message(2, "someone else", { ownerId: "999" }),
+				message(3, "seen live"),
+				message(4, "", { rejected: "Attachments are unsupported." }),
+				message(5, "late nudge", { kind: "steer" }),
+				message(6, "missed two"),
+			]);
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			await broker.lookup(input.projectDir, input.sessionId); // Serialized after the catch-up.
+			expect(port.historyRequests.at(-1)).toEqual({ channelId, afterId: id(0), limit: 50 });
+			expect(port.notices).toEqual([
+				{
+					channelId,
+					text: "2 messages arrived while Haiso was offline.",
+					key: `catchup:${channelId}:${id(6)}`,
+					connectionId: live.session.connectionId,
+					actions: [
+						{ action: "send-held", label: "Send now" },
+						{ action: "discard-held", label: "Discard" },
+					],
+				},
+			]);
+			const after = await journal(storePath);
+			expect(after.watermarks[channelId]).toBe(id(6));
+			expect(
+				after.deliveries.map((item: { text: string; held: boolean; sourceMessageId: string }) => [
+					item.text,
+					item.held,
+					item.sourceMessageId,
+				]),
+			).toEqual([
+				["seen live", true, id(3)],
+				["missed one", true, id(1)],
+				["missed two", true, id(6)],
+			]);
+			// Never run: the conversation is closed, so Send now waits for its resume; Discard drops them.
+			expect((await port.control(live, "send-held", { connectionId: live.session.connectionId })).text).toContain(
+				"closed",
+			);
+			// A second reconnect finds nothing new past the watermark.
+			port.handlers!.connection(false);
+			port.handlers!.connection(true);
+			await broker.lookup(input.projectDir, input.sessionId);
+			expect(port.historyRequests.at(-1)).toEqual({ channelId, afterId: id(6), limit: 50 });
+			expect(port.notices).toHaveLength(1);
+			expect((await port.control(live, "discard-held", { connectionId: live.session.connectionId })).text).toBe(
+				"Discarded 3 saved messages.",
+			);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("bounds catch-up to seven days and starts watching a channel that has no watermark yet", async () => {
+		using temporary = TempDir.createSync("@discord-catch-up-bounds-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "bounded");
+			const live = await broker.request(input);
+			const channelId = live.session.channelId!;
+			await broker.close();
+			const ancient = await journal(storePath);
+			ancient.watermarks[channelId] = "1";
+			await writePrivateJson(storePath, ancient);
+			const low = BigInt(snowflake(-DISCORD_MODE_CATCH_UP_MS));
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			await broker.lookup(input.projectDir, input.sessionId);
+			const high = BigInt(snowflake(-DISCORD_MODE_CATCH_UP_MS));
+			const request = port.historyRequests.at(-1)!;
+			expect(request.limit).toBe(DISCORD_MODE_CATCH_UP_LIMIT);
+			expect(BigInt(request.afterId) >= low && BigInt(request.afterId) <= high).toBe(true);
+			await broker.close();
+
+			// First run after an upgrade: nothing is known to be missed, so no history is replayed.
+			const unmarked = await journal(storePath);
+			delete unmarked.watermarks;
+			await writePrivateJson(storePath, unmarked);
+			const requests = port.historyRequests.length;
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			await broker.lookup(input.projectDir, input.sessionId);
+			expect(port.historyRequests).toHaveLength(requests);
+			expect(BigInt((await journal(storePath)).watermarks[channelId])).toBeGreaterThan(high);
+		} finally {
+			await broker.close();
+		}
+	});
+
+	it("loads a journal written with fields it does not know and writes back only its own", async () => {
+		using temporary = TempDir.createSync("@discord-journal-rollback-");
+		const root = temporary.path();
+		const storePath = path.join(root, "private", "state.json");
+		const port = new FixtureDiscord();
+		let broker = new DiscordModeBroker({ config, storePath, port });
+		await broker.start();
+		try {
+			const input = registration(root, "rollback");
+			const live = await broker.request(input);
+			await port.owner(live, "pending across versions", "message", "8900");
+			await broker.close();
+			const future = await journal(storePath);
+			future.futureTopLevel = { anything: true };
+			future.groups[0].futureField = 1;
+			future.sessions[0].futureField = "x";
+			future.deliveries[0].futureField = [1];
+			future.cards[0].futureField = true;
+			(Object.values(future.operations)[0] as Record<string, unknown>).futureField = "y";
+			future.service.futureField = 2;
+			await writePrivateJson(storePath, future);
+			broker = new DiscordModeBroker({ config, storePath, port });
+			await broker.start();
+			expect((await broker.lookup(input.projectDir, input.sessionId))?.session?.enabled).toBe(true);
+			const written = await journal(storePath);
+			expect(JSON.stringify(written)).not.toContain("future");
+			expect(written.deliveries.map((item: { text: string }) => item.text)).toEqual(["pending across versions"]);
 		} finally {
 			await broker.close();
 		}

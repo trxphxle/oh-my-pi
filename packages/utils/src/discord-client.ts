@@ -5,6 +5,8 @@ import * as net from "node:net";
 import * as path from "node:path";
 import {
 	DISCORD_MODE_MAX_FRAME,
+	DISCORD_MODE_MAX_PROGRESS_FILES,
+	DISCORD_MODE_MAX_PROGRESS_LABEL,
 	DISCORD_MODE_MAX_MODELS,
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_SESSIONS,
@@ -158,6 +160,37 @@ function settingCommand(value: unknown): boolean {
 		(value.value === undefined || typeof value.value === "boolean" || plain(value.value, 200))
 	);
 }
+const PROGRESS_PHASES = [
+	"thinking",
+	"reading",
+	"editing",
+	"running",
+	"searching",
+	"delegating",
+	"compacting",
+	"retrying",
+];
+/**
+ * Same bounds as the broker: plain bounded label and capped count. The start time is only shape-checked, so a clock
+ * step never makes a whole poll invalid; renderers clamp elapsed time at zero.
+ */
+function progress(value: unknown): boolean {
+	return (
+		record(value) &&
+		typeof value.startedAt === "number" &&
+		Number.isSafeInteger(value.startedAt) &&
+		value.startedAt >= 0 &&
+		PROGRESS_PHASES.includes(String(value.phase)) &&
+		typeof value.files === "number" &&
+		Number.isSafeInteger(value.files) &&
+		value.files >= 0 &&
+		value.files <= DISCORD_MODE_MAX_PROGRESS_FILES &&
+		(value.last === undefined ||
+			(record(value.last) &&
+				plain(value.last.label, DISCORD_MODE_MAX_PROGRESS_LABEL) &&
+				["pass", "fail", "timeout", "started"].includes(String(value.last.outcome))))
+	);
+}
 
 /** Reject invalid envelopes before they can enter the effect-owning broker queue. */
 export function isModeRequest(value: unknown): value is ModeRequest {
@@ -195,7 +228,8 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 				typeof value.busy === "boolean" &&
 				typeof value.pendingInput === "boolean" &&
 				(value.settings === undefined || isModeSettingsView(value.settings)) &&
-				(value.usage === undefined || usage(value.usage))
+				(value.usage === undefined || usage(value.usage)) &&
+				(value.progress === undefined || progress(value.progress))
 			);
 		case "command-result":
 			return (
@@ -253,6 +287,16 @@ export function isModeRequest(value: unknown): value is ModeRequest {
 				(value.target === "session" || value.target === "group") &&
 				(value.destinationId === undefined || identifier(value.destinationId)) &&
 				typeof value.resumeQueued === "boolean"
+			);
+		case "held":
+			return (
+				identifier(value.requestId) &&
+				(value.action === "send" || value.action === "discard") &&
+				(value.deliveryIds === undefined ||
+					(Array.isArray(value.deliveryIds) &&
+						value.deliveryIds.length >= 1 &&
+						value.deliveryIds.length <= DISCORD_MODE_MAX_PENDING &&
+						value.deliveryIds.every(identifier)))
 			);
 		default:
 			return false;
@@ -434,7 +478,8 @@ function snapshot(value: unknown): value is ModeSnapshot {
 		(value.commands === undefined ||
 			(Array.isArray(value.commands) &&
 				value.commands.length <= DISCORD_MODE_MAX_SETTING_COMMANDS &&
-				value.commands.every(settingCommand)))
+				value.commands.every(settingCommand))) &&
+		(value.progress === undefined || value.progress === true)
 	);
 }
 

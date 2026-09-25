@@ -76,6 +76,8 @@ async function fixture(
 		saved?: boolean;
 		maxReply?: number;
 		/** Broker advertises settings. */ settings?: boolean;
+		/** Interactive host choice; absent like hosts without a UI. */
+		select?: BridgeHost["select"];
 	} = {},
 ) {
 	const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-session-"));
@@ -233,7 +235,11 @@ async function fixture(
 								);
 							for (const item of deliveries.values()) {
 								if (intake.length === 4) break;
-								if (item.state !== "queued" || (item.kind === "message" && (busy || input.pendingInput)))
+								if (
+									item.state !== "queued" ||
+									item.held ||
+									(item.kind === "message" && (busy || input.pendingInput))
+								)
 									continue;
 								item.state = "dispatched";
 								intake.push(item);
@@ -295,6 +301,14 @@ async function fixture(
 							publications.push(input.text);
 							result = snapshot();
 							break;
+						case "held":
+							for (const item of [...deliveries.values()])
+								if (item.held && (!input.deliveryIds || input.deliveryIds.includes(item.id))) {
+									if (input.action === "discard") deliveries.delete(item.id);
+									else item.held = false;
+								}
+							result = snapshot();
+							break;
 						default:
 							result = snapshot();
 					}
@@ -344,6 +358,7 @@ async function fixture(
 			applied.push(command);
 			return applyResult(command);
 		},
+		...(options.select ? { select: options.select } : {}),
 	};
 	const create = () => new BridgeSession(host, { root, connect, pollIntervalMs: options.timers ? 1000 : 0 });
 	mode = create();
@@ -1053,6 +1068,43 @@ describe("BridgeSession remembered sharing", () => {
 		const pending = f.timers.at(-1)!;
 		await f.mode.detach();
 		expect(pending.cancelled).toBe(true);
+	});
+
+	test("a rejoin offers saved owner messages locally, never runs them unasked, and applies the owner's review", async () => {
+		const answers = ["Review", "Discard", "Send"];
+		const prompts: string[] = [];
+		const f = await fixture({
+			select: async title => {
+				prompts.push(title);
+				return answers.shift();
+			},
+		});
+		await f.share();
+		await f.mode.on();
+		await f.mode.detach();
+		const first = f.queue({ text: "first saved", held: true });
+		const second = f.queue({ text: "second saved", held: true });
+		const sent = Promise.withResolvers<void>();
+		f.afterRequest = async input => {
+			if (input.op === "held" && input.action === "send") sent.resolve();
+		};
+		await f.mode.rejoin();
+		await sent.promise;
+		expect(prompts).toEqual([
+			"Discord: 2 messages arrived while this session was closed",
+			"Saved message 1 of 2",
+			"Saved message 2 of 2",
+		]);
+		expect(f.notices.some(text => text.includes("first saved"))).toBe(true);
+		const held = f.requests.filter((input): input is Extract<ModeRequest, { op: "held" }> => input.op === "held");
+		expect(held.map(({ action, deliveryIds }) => ({ action, deliveryIds }))).toEqual([
+			{ action: "discard", deliveryIds: [first.id] },
+			{ action: "send", deliveryIds: [second.id] },
+		]);
+		expect([...f.deliveries.values()].map(item => [item.text, item.held])).toEqual([["second saved", false]]);
+		expect(f.delivered).toEqual([]);
+		await f.mode.poll();
+		expect(f.delivered.map(item => item.delivery.text)).toEqual(["second saved"]);
 	});
 });
 

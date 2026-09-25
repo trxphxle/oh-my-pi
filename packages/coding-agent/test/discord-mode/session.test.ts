@@ -12,8 +12,10 @@ import { DiscordDialogs, raceDiscordDialog, requestDiscordAsk } from "../../src/
 import {
 	DiscordModeSession,
 	DiscordReceiptJournal,
+	type DiscordSavedDecision,
 	type DiscordSessionClient,
 	type DiscordSessionEngine,
+	type DiscordSessionOptions,
 } from "../../src/discord-mode/session";
 import {
 	DISCORD_MODE_MAX_REPLY,
@@ -74,7 +76,7 @@ function assistant(text: string): AssistantMessage {
 	};
 }
 
-async function fixture(options: { rejoinRetryMs?: number } = {}) {
+async function fixture(options: { rejoinRetryMs?: number; offerSaved?: DiscordSessionOptions["offerSaved"] } = {}) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-discord-session-"));
 	cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
 	const state = { id: crypto.randomUUID() as string, busy: false, admitted: false, queued: 0, aborts: 0 };
@@ -226,6 +228,7 @@ async function fixture(options: { rejoinRetryMs?: number } = {}) {
 		notify: text => notices.push(text),
 		shared: async () => sharedOffline,
 		rejoinRetryMs: options.rejoinRetryMs,
+		offerSaved: options.offerSaved,
 	});
 	cleanups.push(() => mode.off());
 	return {
@@ -263,6 +266,11 @@ async function fixture(options: { rejoinRetryMs?: number } = {}) {
 		setSettingsRevision(settingsRevision: string | undefined) {
 			snapshot = { ...snapshot, settingsRevision };
 		},
+		/** Broker progress capability; older brokers omit it. */
+		setProgressCapability(progress: true | undefined) {
+			snapshot = { ...snapshot, progress };
+		},
+		emit,
 		/** Broker state reset: the UUID is no longer enrolled. */
 		forget() {
 			forgotten = true;
@@ -494,6 +502,44 @@ describe("native Discord session routing", () => {
 		await mode.poll();
 		expect(polls().at(-1)!.settings).toMatchObject({ effort: "low" });
 		expect(polls().at(-1)!.settings!.revision).not.toBe(reported.settings!.revision);
+	});
+
+	test("run progress rides polls only to brokers advertising it, and only while a run is active", async () => {
+		const f = await fixture();
+		await f.enroll();
+		const polls = () =>
+			f.requests.filter((request): request is Extract<ModeRequest, { op: "poll" }> => request.op === "poll");
+		f.emit({ type: "agent_start" });
+		f.emit({
+			type: "tool_execution_start",
+			toolCallId: "call-1",
+			toolName: "bash",
+			args: { command: "API_KEY=secret bun test --token secret" },
+			intent: "Running the secret tests",
+		});
+		f.emit({
+			type: "tool_execution_end",
+			toolCallId: "call-1",
+			toolName: "bash",
+			result: { content: [{ type: "text", text: "secret output" }], details: {} },
+			isError: false,
+		});
+		// An older broker rejects unknown poll fields, so it never receives progress.
+		await f.mode.poll();
+		expect(polls().at(-1)).not.toHaveProperty("progress");
+		f.setProgressCapability(true);
+		await f.mode.poll();
+		await f.mode.poll();
+		const reported = polls().at(-1)!;
+		expect(reported.progress).toMatchObject({
+			phase: "thinking",
+			files: 0,
+			last: { label: "bun test", outcome: "pass" },
+		});
+		expect(JSON.stringify(reported.progress)).not.toContain("secret");
+		f.emit({ type: "agent_end", messages: [], isTerminal: true });
+		await f.mode.poll();
+		expect(polls().at(-1)).not.toHaveProperty("progress");
 	});
 
 	test("status and registration never execute broker-held queued work", async () => {
@@ -954,6 +1000,51 @@ describe("remembered Discord sharing", () => {
 		f.setSession({ connected: false });
 		expect((await f.mode.rejoin())?.session.connected).toBe(true);
 		expect(f.registers()).toHaveLength(2);
+	});
+
+	test("a rejoin offers saved owner messages, never dispatches them, and sends the owner's decisions", async () => {
+		const offered: ModeDelivery[][] = [];
+		let pendingDuringOffer: boolean | undefined;
+		let decide: (messages: ModeDelivery[]) => DiscordSavedDecision[] | undefined = () => undefined;
+		const f = await fixture({
+			offerSaved: async messages => {
+				offered.push(messages);
+				pendingDuringOffer = f.mode.pendingInput;
+				return decide(messages);
+			},
+		});
+		await f.enroll();
+		await f.mode.detach();
+		const first = f.delivery({ state: "queued", held: true, text: "first saved" });
+		const second = f.delivery({ state: "queued", held: true, text: "second saved" });
+		const uncertain = f.delivery({ state: "unknown", text: "maybe ran" });
+		f.statusDeliveries([first, second, uncertain, f.delivery({ state: "queued", held: false, text: "live" })]);
+		decide = messages => [
+			{ id: messages[1]!.id, action: "discard" },
+			{ id: messages[0]!.id, action: "send" },
+		];
+		expect((await f.mode.rejoin())?.session.connected).toBe(true);
+		await until(() => f.ops().filter(op => op === "held").length === 2);
+		expect(offered).toEqual([[first, second]]);
+		// The offer is a local dialog: nothing dispatches while the owner decides.
+		expect(pendingDuringOffer).toBe(true);
+		expect(f.mode.pendingInput).toBe(false);
+		const held = f.requests.filter(
+			(request): request is Extract<ModeRequest, { op: "held" }> => request.op === "held",
+		);
+		expect(held.map(({ action, deliveryIds }) => ({ action, deliveryIds }))).toEqual([
+			{ action: "discard", deliveryIds: [second.id] },
+			{ action: "send", deliveryIds: [first.id] },
+		]);
+		// Only uncertain work still points at repair/reconcile.
+		expect(f.notices).toEqual([expect.stringContaining("1 held or uncertain message(s)")]);
+
+		// Declining leaves them saved; /discord offers them again later.
+		decide = () => undefined;
+		f.statusDeliveries([first]);
+		expect(await f.mode.reviewSaved()).toBe(1);
+		expect(offered).toHaveLength(2);
+		expect(f.ops().filter(op => op === "held")).toHaveLength(2);
 	});
 
 	test("an unexpected rejoin failure notifies once; sharing turned off in the meantime stays quiet", async () => {

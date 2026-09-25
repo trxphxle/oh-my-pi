@@ -16,6 +16,9 @@ export const DISCORD_MODE_MAX_SHORTLIST = 25;
 export const DISCORD_MODE_MAX_MODELS = 200;
 /** Outstanding owner settings changes per session. */
 export const DISCORD_MODE_MAX_SETTING_COMMANDS = 8;
+/** Session card progress: `last` label bound and edited-file cap; the tracker never exceeds them. */
+export const DISCORD_MODE_MAX_PROGRESS_LABEL = 48;
+export const DISCORD_MODE_MAX_PROGRESS_FILES = 999;
 
 /** Private attachment identity; stable across service restarts, never model-visible. */
 export interface DiscordModeInfo {
@@ -115,6 +118,11 @@ export interface ModeDelivery {
 	text: string;
 	state: "queued" | "dispatched" | "accepted" | "completed" | "rejected" | "unknown" | "resolved";
 	createdAt: number;
+	/**
+	 * Queued but withheld from dispatch until explicitly released (saved while the session was closed, or held by a
+	 * binding problem). Absent from older brokers, which strip it.
+	 */
+	held?: boolean;
 }
 export interface ModeDialog {
 	id: string;
@@ -146,6 +154,8 @@ export interface ModeSnapshot {
 	settingsRevision?: string;
 	/** Poll only: owner settings changes this connection has not acknowledged yet, oldest first; ids repeat until acked. */
 	commands?: ModeSettingCommand[];
+	/** Present only from brokers that accept `progress` on poll; older brokers reject the field. */
+	progress?: true;
 }
 /** Owner-queued session settings changes. Approval policy, credentials, and logins never cross this boundary. */
 export type ModeSettingKind = "model" | "effort" | "default" | "compact" | "advisor" | "advisor-model" | "plan";
@@ -200,6 +210,29 @@ export interface ModeSettingsPanel {
 	/** Ranked search results when the request carried a query. */
 	matches?: ModeModelChoice[];
 }
+/** What the running tool is doing; compaction and retry override while active. */
+export type ModeProgressPhase =
+	| "thinking"
+	| "reading"
+	| "editing"
+	| "running"
+	| "searching"
+	| "delegating"
+	| "compacting"
+	| "retrying";
+/**
+ * Live run summary for the session card, built only from tool names, sanitized arguments, and outcomes: never
+ * reasoning, tool output, or model-authored intent.
+ */
+export interface ModeProgress {
+	/** Epoch ms the run started. */
+	startedAt: number;
+	phase: ModeProgressPhase;
+	/** Distinct files edited this run, capped at DISCORD_MODE_MAX_PROGRESS_FILES. */
+	files: number;
+	/** Last notable tool: a shortened command, `edit <path>`, or `task`; plain, at most DISCORD_MODE_MAX_PROGRESS_LABEL. */
+	last?: { label: string; outcome: "pass" | "fail" | "timeout" | "started" };
+}
 export type ModeRequest =
 	| { op: "retire"; eventId: string }
 	| {
@@ -227,6 +260,8 @@ export type ModeRequest =
 			/** Only to brokers advertising `settingsRevision`, and only when the revision changed. */
 			settings?: ModeSettingsView;
 			usage?: ModeUsage;
+			/** Only to brokers advertising `progress`, and only while a run is active. */
+			progress?: ModeProgress;
 	  }
 	/** Outcome of one owner settings change, with the fresh view; only to brokers advertising `settingsRevision`. */
 	| {
@@ -267,7 +302,12 @@ export type ModeRequest =
 			target: "session" | "group";
 			destinationId?: string;
 			resumeQueued: boolean;
-	  };
+	  }
+	/**
+	 * Release (`send`, in arrival order) or drop (`discard`) this session's saved owner messages; all of them when
+	 * `deliveryIds` is absent. Older brokers reject the op unexecuted.
+	 */
+	| { op: "held"; lease: ModeLease; requestId: string; action: "send" | "discard"; deliveryIds?: string[] };
 
 export interface RemoteChannel {
 	id: string;
@@ -294,12 +334,33 @@ export interface ModeControlResult {
 	settings?: ModeSettingsPanel;
 	/** A queued settings change; its outcome arrives later through `DiscordPort.settingsResult`. */
 	commandId?: string;
+	/** The owner message was saved for a closed session; the acknowledgement offers to discard it. */
+	saved?: true;
+	/** `queued` lists saved messages to review one by one. */
+	review?: true;
 }
 export interface ModeControlRequest {
 	id: string;
 	channelId: string;
 	ownerId: string;
-	action: "status" | "stop" | "queue" | "cancel" | "steer" | "notify" | "settings" | "setting";
+	/**
+	 * `discard`/`release`: one saved message (`deliveryId`); `send-held`/`discard-held`: every saved message;
+	 * `review`: list saved messages, or show one (`deliveryId`). These accept a revoked `connectionId`.
+	 */
+	action:
+		| "status"
+		| "stop"
+		| "queue"
+		| "cancel"
+		| "steer"
+		| "notify"
+		| "settings"
+		| "setting"
+		| "discard"
+		| "release"
+		| "send-held"
+		| "discard-held"
+		| "review";
 	connectionId?: string;
 	deliveryId?: string;
 	notify?: ModeNotify;
@@ -308,15 +369,22 @@ export interface ModeControlRequest {
 	/** `settings` only: rank the reported models against this text. */
 	query?: string;
 }
+/** One owner message as parsed from Discord; `rejected` carries the refusal text for unsupported content. */
+export interface ModeOwnerMessage {
+	id: string;
+	channelId: string;
+	ownerId: string;
+	text: string;
+	kind: "message" | "steer" | "abort";
+	rejected?: string;
+}
+/** A button on a saved-message notice; the label varies, the action is a session control. */
+export interface ModeNoticeAction {
+	action: "review" | "send-held" | "discard-held";
+	label: string;
+}
 export interface DiscordPortHandlers {
-	ownerMessage(input: {
-		id: string;
-		channelId: string;
-		ownerId: string;
-		text: string;
-		kind: "message" | "steer" | "abort";
-		rejected?: string;
-	}): Promise<ModeControlResult>;
+	ownerMessage(input: ModeOwnerMessage): Promise<ModeControlResult>;
 	control(input: ModeControlRequest): Promise<ModeControlResult>;
 	answer(input: {
 		channelId: string;
@@ -359,4 +427,14 @@ export interface DiscordPort {
 	/** Outcome of a queued settings change; never mentions. `panel` refreshes the owner's open panel. */
 	settingsResult(channelId: string, commandId: string, text: string, panel?: ModeSettingsPanel): Promise<void>;
 	retire(channelId: string, sessionId: string, policy: ModeRetirementPolicy): Promise<void>;
+	/** Owner messages after `afterId` (exclusive), oldest first, at most `limit`; parsed exactly like live messages. */
+	history(channelId: string, afterId: string, limit: number): Promise<ModeOwnerMessage[]>;
+	/** One non-pinging notice with saved-message buttons bound to `connectionId`; `key` makes it idempotent. */
+	notice(
+		channelId: string,
+		text: string,
+		key: string,
+		connectionId: string,
+		actions: ModeNoticeAction[],
+	): Promise<void>;
 }

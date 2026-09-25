@@ -79,7 +79,11 @@ export async function startDiscordModeServer(options: {
 	const server = Bun.serve({
 		unix: options.socketPath,
 		maxRequestBodySize: DISCORD_MODE_MAX_FRAME,
-		async fetch(request) {
+		async fetch(request, http) {
+			// Bun's per-connection idle timeout defaults to 10 s (and `idleTimeout` is not an option for Unix sockets);
+			// outlive the request deadline, and the client's timeout just past it, so a slow broker answers 504 and
+			// never drops the socket mid-request.
+			http.timeout(request, Math.ceil(DISCORD_MODE_REQUEST_TIMEOUT_MS / 1000) + 10);
 			const supplied = Buffer.from(request.headers.get(DISCORD_MODE_AUTH_HEADER) ?? "");
 			if (supplied.length !== secret.length || !timingSafeEqual(supplied, secret))
 				return failure(401, "not-started");

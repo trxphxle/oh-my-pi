@@ -636,4 +636,50 @@ describe("official OMP bridge adapter", () => {
 		expect(error).toBeInstanceOf(Error);
 		expect(String(error)).not.toContain(SECRET);
 	});
+
+	test("reports run progress from host events, only to brokers that advertise it and only during a run", async () => {
+		const f = await fixture();
+		await f.command("on");
+		const lastPoll = () => f.requests.filter(request => request.op === "poll").at(-1)!;
+		await f.emit("agent_start");
+		await f.emit("tool_execution_start", {
+			toolCallId: "edit-1",
+			toolName: "edit",
+			args: { path: "src/a.ts", input: SECRET },
+			intent: SECRET,
+		});
+		await f.emit("tool_execution_end", {
+			toolCallId: "edit-1",
+			toolName: "edit",
+			result: { content: [{ type: "text", text: SECRET }], details: { path: path.join(f.root, "src/a.ts") } },
+			isError: false,
+		});
+		await f.emit("tool_execution_start", {
+			toolCallId: "bash-1",
+			toolName: "bash",
+			args: { command: `bun test --token ${SECRET}` },
+		});
+		await f.emit("tool_execution_end", {
+			toolCallId: "bash-1",
+			toolName: "bash",
+			result: { content: [{ type: "text", text: SECRET }], details: {} },
+			isError: true,
+		});
+		// An older broker rejects unknown poll fields, so it never receives progress.
+		await f.pulse();
+		expect(lastPoll()).not.toHaveProperty("progress");
+		f.snapshot.progress = true;
+		await f.pulse();
+		await f.pulse();
+		const reported = lastPoll();
+		expect(reported.op === "poll" && reported.progress).toMatchObject({
+			phase: "thinking",
+			files: 1,
+			last: { label: "bun test", outcome: "fail" },
+		});
+		expect(JSON.stringify(reported.op === "poll" && reported.progress)).not.toContain(SECRET);
+		await f.emit("agent_end", { messages: [], willContinue: false });
+		await f.pulse();
+		expect(lastPoll()).not.toHaveProperty("progress");
+	});
 });

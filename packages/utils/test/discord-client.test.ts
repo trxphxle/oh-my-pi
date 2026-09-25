@@ -6,6 +6,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	DISCORD_MODE_MAX_FRAME,
+	DISCORD_MODE_MAX_PROGRESS_FILES,
+	DISCORD_MODE_MAX_PROGRESS_LABEL,
 	DISCORD_MODE_MAX_MODELS,
 	DISCORD_MODE_MAX_REPLY,
 	DISCORD_MODE_MAX_SETTINGS_BYTES,
@@ -430,6 +432,33 @@ describe("protocol-only Discord attachment", () => {
 		await expect(client.request(request)).rejects.toMatchObject({ outcome: "unknown" });
 	});
 
+	it("carries bounded poll progress and refuses malformed progress before it is sent", async () => {
+		const root = await directory();
+		const server = await endpoint(root);
+		const client = await connectExistingDiscordMode(root);
+		cleanups.push(() => client.close());
+		const poll = (progress: unknown) =>
+			({ op: "poll", lease: request.lease, busy: true, pendingInput: false, progress }) as ModeRequest;
+		const progress = {
+			startedAt: Date.now(),
+			phase: "editing",
+			files: 3,
+			last: { label: "bun test", outcome: "pass" },
+		};
+		await client.request(poll(progress));
+		expect(server.effects).toBe(1);
+		for (const invalid of [
+			{ ...progress, last: { label: "bun test\u001b[2J", outcome: "pass" } },
+			{ ...progress, last: { label: "x".repeat(DISCORD_MODE_MAX_PROGRESS_LABEL + 1), outcome: "pass" } },
+			{ ...progress, last: { label: "bun test", outcome: "maybe" } },
+			{ ...progress, files: DISCORD_MODE_MAX_PROGRESS_FILES + 1 },
+			{ ...progress, phase: "plotting" },
+			{ ...progress, startedAt: -1 },
+		])
+			await expect(client.request(poll(invalid))).rejects.toMatchObject({ outcome: "not-started" });
+		expect(server.effects).toBe(1);
+	});
+
 	it("carries detach and lease-free disable, accepting a disable only when the result confirms sharing is off", async () => {
 		const root = await directory();
 		const server = await endpoint(root);
@@ -471,6 +500,27 @@ describe("protocol-only Discord attachment", () => {
 			client.request({ op: "disable", lease: request.lease } as unknown as ModeRequest),
 		).rejects.toMatchObject({ outcome: "not-started" });
 		expect(server.effects).toBe(effects);
+	});
+
+	it("carries a bounded saved-message decision and refuses malformed ones before they are sent", async () => {
+		const root = await directory();
+		const server = await endpoint(root);
+		const client = await connectExistingDiscordMode(root);
+		cleanups.push(() => client.close());
+		const held = (fields: Record<string, unknown>) =>
+			({ op: "held", lease: request.lease, requestId: "request-held", action: "send", ...fields }) as ModeRequest;
+		await client.request(held({}));
+		await client.request(held({ action: "discard", deliveryIds: ["delivery-1", "delivery-2"] }));
+		expect(server.effects).toBe(2);
+		for (const invalid of [
+			{ action: "run" },
+			{ deliveryIds: [] },
+			{ deliveryIds: ["bad id"] },
+			{ deliveryIds: Array.from({ length: 33 }, (_, index) => `delivery-${index}`) },
+			{ requestId: undefined },
+		])
+			await expect(client.request(held(invalid))).rejects.toMatchObject({ outcome: "not-started" });
+		expect(server.effects).toBe(2);
 	});
 
 	it("keeps a ping-only supervisor lease alive until close, then fails closed without reconnecting", async () => {

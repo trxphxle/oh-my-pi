@@ -48,7 +48,9 @@ import {
 	type ModeControlRequest,
 	type ModeControlResult,
 	type ModeDialog,
+	type ModeNoticeAction,
 	type ModeNotify,
+	type ModeOwnerMessage,
 	type ModeRetirementPolicy,
 	type ModeSettingsPanel,
 	type RemoteChannel,
@@ -59,6 +61,8 @@ const PREFIX = "haiso:";
 const SESSION_PREFIX = `${PREFIX}s:`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HISTORY_LIMIT = 1_000;
+/** Missed-message catch-up scans at most this many 100-message pages per channel. */
+const CATCH_UP_PAGES = 5;
 const EFFECT_LIMIT = 4_096;
 const CARD_LIMIT = 256;
 const DIALOG_LIMIT = 256;
@@ -83,7 +87,7 @@ const SETTINGS_ACTIONS: Record<string, true> = {
 	default: true,
 };
 const SESSION_CONTROL = new RegExp(
-	`^haiso:s:(\\d{1,22}):([a-f0-9-]{36}):([A-Za-z0-9_-]{22})?:(status|stop|queue|steer|cancel|queue0|queue1|settings|${Object.keys(SETTINGS_ACTIONS).join("|")})$`,
+	`^haiso:s:(\\d{1,22}):([a-f0-9-]{36}):([A-Za-z0-9_-]{22})?:(status|stop|queue|steer|cancel|queue0|queue1|settings|discard|release|send-held|discard-held|review|review0|review1|${Object.keys(SETTINGS_ACTIONS).join("|")})$`,
 	"i",
 );
 const READ_PERMISSIONS = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
@@ -934,9 +938,9 @@ export class DiscordAdapter implements DiscordPort {
 		return next;
 	}
 
-	async #ownerMessage(message: Message): Promise<void> {
+	/** The configured owner's text message in a private text channel, parsed for the broker; undefined otherwise. */
+	#parseOwnerMessage(message: Message): ModeOwnerMessage | undefined {
 		if (
-			!this.#handlers ||
 			message.guildId !== this.#config.guildId ||
 			message.author.id !== this.#config.ownerId ||
 			message.author.bot ||
@@ -944,9 +948,9 @@ export class DiscordAdapter implements DiscordPort {
 			message.system ||
 			message.channel.type !== ChannelType.GuildText
 		)
-			return;
+			return undefined;
 		// Check current permissions even before the broker's next reconciliation turn.
-		if (!this.#private(message.channel)) return;
+		if (!this.#private(message.channel)) return undefined;
 		let text = message.content;
 		let kind: "message" | "steer" | "abort" = "message";
 		let rejected: string | undefined;
@@ -967,16 +971,23 @@ export class DiscordAdapter implements DiscordPort {
 		}
 		if (!rejected && kind !== "abort" && (!text.trim() || text.length > DISCORD_MODE_MAX_TEXT))
 			rejected = `Send 1–${DISCORD_MODE_MAX_TEXT} text characters; nothing was forwarded.`;
+		return {
+			id: message.id,
+			channelId: message.channelId,
+			ownerId: message.author.id,
+			text: rejected ? "" : text,
+			kind,
+			...(rejected === undefined ? {} : { rejected }),
+		};
+	}
+
+	async #ownerMessage(message: Message): Promise<void> {
+		if (!this.#handlers || message.channel.type !== ChannelType.GuildText) return;
+		const input = this.#parseOwnerMessage(message);
+		if (!input) return;
 		let acknowledgement: ModeControlResult;
 		try {
-			acknowledgement = await this.#handlers.ownerMessage({
-				id: message.id,
-				channelId: message.channelId,
-				ownerId: message.author.id,
-				text: rejected ? "" : text,
-				kind,
-				...(rejected === undefined ? {} : { rejected }),
-			});
+			acknowledgement = await this.#handlers.ownerMessage(input);
 		} catch (error) {
 			if (!(error instanceof DiscordModeError)) throw error;
 			acknowledgement = { text: error.message };
@@ -985,13 +996,77 @@ export class DiscordAdapter implements DiscordPort {
 		if (!acknowledgement.text) return;
 		const key = `${PREFIX}ack:${message.id}`;
 		const channel = message.channel;
+		const { deliveryId, connectionId } = acknowledgement;
 		await this.#once(key, async () => {
 			await this.#send(channel, key, {
 				...this.#textPayload(acknowledgement.text),
 				components:
-					acknowledgement.deliveryId && acknowledgement.connectionId
-						? this.#queuedComponents(message.channelId, acknowledgement.connectionId, acknowledgement.deliveryId)
+					deliveryId && connectionId
+						? acknowledgement.saved
+							? this.#savedComponents(message.channelId, connectionId, deliveryId)
+							: this.#queuedComponents(message.channelId, connectionId, deliveryId)
 						: [],
+			});
+		});
+	}
+
+	/** Owner messages after `afterId`, oldest first, at most `limit`; bounded pages, parsed like live messages. */
+	async history(channelId: string, afterId: string, limit: number): Promise<ModeOwnerMessage[]> {
+		if (!/^\d{1,22}$/.test(channelId) || !/^\d{1,22}$/.test(afterId) || !Number.isSafeInteger(limit))
+			throw new Error("Discord history request is invalid.");
+		const channel = await this.#textChannel(channelId);
+		const found: ModeOwnerMessage[] = [];
+		let after = afterId;
+		for (let page = 0; page < CATCH_UP_PAGES && found.length < limit; page++) {
+			const batch = await channel.messages.fetch({ after, limit: 100, cache: false });
+			// Discord returns the page newest first.
+			const ordered = [...batch.values()].sort((left, right) => (BigInt(left.id) < BigInt(right.id) ? -1 : 1));
+			for (const message of ordered) {
+				const parsed = this.#parseOwnerMessage(message);
+				if (parsed) found.push(parsed);
+				if (found.length >= limit) break;
+			}
+			if (batch.size < 100 || !ordered.length) break;
+			after = ordered.at(-1)!.id;
+		}
+		return found;
+	}
+
+	notice(
+		channelId: string,
+		text: string,
+		key: string,
+		connectionId: string,
+		actions: ModeNoticeAction[],
+	): Promise<void> {
+		if (
+			!text.trim() ||
+			text.length > 2_000 ||
+			!actions.length ||
+			actions.length > 5 ||
+			actions.some(
+				item =>
+					(item.action !== "review" && item.action !== "send-held" && item.action !== "discard-held") ||
+					!item.label.trim() ||
+					item.label.length > 80,
+			)
+		)
+			return Promise.reject(new Error("Discord notice is invalid."));
+		const operation = `${PREFIX}notice:${digest(`${channelId}:${key}`)}`;
+		return this.#once(operation, async () => {
+			const channel = await this.#textChannel(channelId);
+			await this.#send(channel, operation, {
+				content: text,
+				components: [
+					new ActionRowBuilder<ButtonBuilder>().addComponents(
+						actions.map(item =>
+							new ButtonBuilder()
+								.setCustomId(this.#controlId(channelId, connectionId, item.action))
+								.setLabel(item.label)
+								.setStyle(item.action === "send-held" ? ButtonStyle.Primary : ButtonStyle.Secondary),
+						),
+					),
+				],
 			});
 		});
 	}
@@ -1185,9 +1260,75 @@ export class DiscordAdapter implements DiscordPort {
 		];
 	}
 
+	/** One saved message: send it (session open) or discard it. `send` is offered only while reviewing. */
+	#savedComponents(channelId: string, connectionId: string, deliveryId: string, send = false): ControlRows {
+		const discard = new ButtonBuilder()
+			.setCustomId(this.#controlId(channelId, connectionId, "discard", deliveryId))
+			.setLabel("Discard")
+			.setStyle(ButtonStyle.Secondary);
+		return [
+			new ActionRowBuilder<ButtonBuilder>().addComponents(
+				send
+					? [
+							new ButtonBuilder()
+								.setCustomId(this.#controlId(channelId, connectionId, "release", deliveryId))
+								.setLabel("Send")
+								.setStyle(ButtonStyle.Primary),
+							discard,
+						]
+					: [discard],
+			),
+		];
+	}
+
+	/** Saved messages: one picked message with Send/Discard, or a picker plus Send all/Discard all. */
+	#reviewRows(channelId: string, connectionId: string, result: ModeControlResult): ControlRows {
+		if (result.deliveryId) return this.#savedComponents(channelId, connectionId, result.deliveryId, true);
+		const saved = result.queued ?? [];
+		if (!saved.length) return [];
+		const rows: ControlRows = [];
+		for (let offset = 0; offset < Math.min(saved.length, 50); offset += 25) {
+			const entries = saved.slice(offset, offset + 25);
+			rows.push(
+				new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+					new StringSelectMenuBuilder()
+						.setCustomId(this.#controlId(channelId, connectionId, `review${offset / 25}`))
+						.setPlaceholder(`Saved messages ${offset + 1}–${offset + entries.length}`)
+						.addOptions(
+							entries.map((entry, index) => ({
+								label: `Saved message ${offset + index + 1}`,
+								description: entry.text.replace(/\s+/g, " ").slice(0, 100) || "Empty message",
+								value: entry.id,
+							})),
+						),
+				),
+			);
+		}
+		rows.push(
+			new ActionRowBuilder<ButtonBuilder>().addComponents(
+				new ButtonBuilder()
+					.setCustomId(this.#controlId(channelId, connectionId, "send-held"))
+					.setLabel("Send all")
+					.setStyle(ButtonStyle.Primary),
+				new ButtonBuilder()
+					.setCustomId(this.#controlId(channelId, connectionId, "discard-held"))
+					.setLabel("Discard all")
+					.setStyle(ButtonStyle.Secondary),
+			),
+		);
+		return rows;
+	}
+
 	#controlPayload(channelId: string, result: ModeControlResult): ControlPayload {
 		if (result.settings && result.connectionId)
 			return this.#settingsPayload(channelId, result.connectionId, result.settings, result.text);
+		if (result.review && result.connectionId)
+			return {
+				...this.#textPayload(result.text),
+				components: this.#reviewRows(channelId, result.connectionId, result),
+				attachments: [],
+				allowedMentions: MENTIONS,
+			};
 		const rows: ControlRows = [];
 		if (result.connectionId) {
 			if (result.deliveryId) {
@@ -1399,21 +1540,24 @@ export class DiscordAdapter implements DiscordPort {
 				return;
 			}
 			const selected = match[4] === "queue0" || match[4] === "queue1";
+			const reviewed = match[4] === "review0" || match[4] === "review1";
 			if (
-				selected &&
+				(selected || reviewed) &&
 				interaction.isStringSelectMenu() &&
 				interaction.values.length === 1 &&
 				UUID.test(interaction.values[0]!)
 			) {
-				action = "queue";
+				action = selected ? "queue" : "review";
 				deliveryId = interaction.values[0]!;
-			} else if (!selected && interaction.isButton()) {
+			} else if (!selected && !reviewed && interaction.isButton()) {
 				action = match[4] as ModeControlRequest["action"];
 				if (match[3]) {
 					const hex = Buffer.from(match[3], "base64url").toString("hex");
 					deliveryId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 				}
-				if ((action === "steer" || action === "cancel") !== Boolean(deliveryId)) {
+				const needsDelivery =
+					action === "steer" || action === "cancel" || action === "discard" || action === "release";
+				if (needsDelivery !== Boolean(deliveryId) && !(action === "review" && deliveryId)) {
 					await this.#reply(interaction, "Invalid queued-message control; no action was submitted.");
 					return;
 				}

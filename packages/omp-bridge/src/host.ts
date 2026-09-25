@@ -3,6 +3,7 @@ import type {
 	ModeDelivery,
 	ModeEnrollment,
 	ModeRequest,
+	ModeProgress,
 	ModeSettingCommand,
 	ModeSettingsView,
 	ModeSnapshot,
@@ -45,6 +46,10 @@ export interface BridgeHost {
 	usage(): ModeUsage | undefined;
 	/** Apply one owner change; the session calls it only while idle. */
 	applySetting(command: ModeSettingCommand): Promise<BridgeSettingResult>;
+	/** Live run summary for the session card; undefined while no run is active. */
+	progress?(): ModeProgress | undefined;
+	/** Local choice among plain options; undefined when dismissed. Hosts without an interactive UI omit it. */
+	select?(title: string, options: string[]): Promise<string | undefined>;
 }
 
 export interface BridgeConnection {

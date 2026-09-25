@@ -39,9 +39,28 @@ when it is not currently open. Print, RPC, and ACP runs never join. Use
 
 The mode uses a shared supervised local service and the original session's model,
 tools, conversation, and approval settings. It does not launch another coding
-engine. Keep the office machine awake, logged in, and online; ordinary terminal
-sessions still end when their host exits. This mode does not install a login
-service or automatically create persistent Builder processes.
+engine. Sessions still end when their terminal exits; this mode does not install a
+login service.
+
+### Service and offline behavior
+
+- **Stays online:** the Discord service keeps running after the last terminal
+  closes, until logout or reboot. `/discord service off` (or the `/discord` menu)
+  restores the old behavior of stopping with the last session.
+- **Honest cards:** a shared session shows `Online` while its terminal is attached and
+  `Closed · resume at your desk` otherwise. While working, the card shows a live line
+  such as `Working · 4m · editing 3 files · last: bun test (pass)` (tool names and
+  outcomes only; at most one edit per 10 seconds). `#overview` shows
+  `Discord service: Online`, `Offline since …` after a clean stop, and a one-time
+  note after an unexpected stop.
+- **Messages to a closed session** are saved (up to 32 per session) with an instant
+  reply and a [Discard] button; `!steer`/`!abort` are refused. When you resume the
+  conversation, you are offered them (**Review / Send all / Discard**) in the terminal
+  and in Discord; nothing runs on its own. `/discord saved` reopens the offer.
+- **Messages sent while the service was offline** are picked up when it reconnects
+  (owner messages only, up to 50 per channel from the last 7 days) and saved behind a
+  card with **Send now / Discard**.
+- Keep the machine awake and online; sleep pauses everything until it wakes.
 
 ## Optional official OMP connector
 
