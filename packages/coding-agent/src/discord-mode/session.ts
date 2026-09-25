@@ -1485,16 +1485,21 @@ export function offersDiscordBackground(
 let exitPrompt = false;
 /**
  * Interactive exit: when the conversation is shared and the Discord service can run it, ask whether it keeps running
- * in the background. False keeps the TUI open (question dismissed, or already showing).
+ * in the background. Synchronous `true` when there is nothing to ask, so shutdown's first steps stay synchronous;
+ * otherwise the owner's answer (false keeps the TUI open: question dismissed, or already showing).
  */
-export async function confirmDiscordExit(
+export function confirmDiscordExit(
 	ctx: InteractiveModeContext,
 	mode = getDiscordModeSession(ctx.session),
-): Promise<boolean> {
-	if (exitPrompt) return false;
+): true | Promise<boolean> {
+	if (exitPrompt) return Promise.resolve(false);
 	if (!offersDiscordBackground(mode)) return true;
+	return askDiscordExit(ctx, mode!);
+}
+
+async function askDiscordExit(ctx: InteractiveModeContext, mode: DiscordModeSession): Promise<boolean> {
 	exitPrompt = true;
-	const endDialog = mode!.beginLocalDialog();
+	const endDialog = mode.beginLocalDialog();
 	let choice: string | undefined;
 	try {
 		choice = await ctx.showHookSelector("Keep running in the background?", [
@@ -1508,7 +1513,7 @@ export async function confirmDiscordExit(
 	if (choice === undefined) return false;
 	if (choice === "Yes")
 		try {
-			await mode!.keepInBackground();
+			await mode.keepInBackground();
 		} catch (error) {
 			ctx.showWarning(
 				`Couldn't keep it running in the background: ${error instanceof Error ? error.message : error} Closing it here; it stays shared.`,

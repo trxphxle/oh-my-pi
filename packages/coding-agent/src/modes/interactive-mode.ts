@@ -5786,7 +5786,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		// Haiso: a shared Discord conversation may keep running as a background copy instead of closing.
-		if (!(await confirmDiscordExit(this))) return;
+		const discordExit = confirmDiscordExit(this);
+		if (discordExit !== true && !(await discordExit)) return;
 		this.#isShuttingDown = true;
 		try {
 			await this.#teardown();
