@@ -46,7 +46,7 @@ engine. This mode does not install a login service.
 - **Stays online:** the Discord service keeps running after the last terminal
   closes, until logout or reboot. `/discord service off` (or the `/discord` menu)
   restores the old behavior of stopping with the last session.
-- **Honest cards:** a shared session shows `Online` while its terminal is attached and
+- **Honest cards:** each session card is pinned in its channel (📌), so its buttons stay one tap away. A shared session shows `Online` while its terminal is attached and
   `Closed` otherwise. While working, the card shows a live line
   such as `Working · 4m · editing 3 files · last: bun test (pass)` (tool names and
   outcomes only; at most one edit per 10 seconds). `#overview` shows

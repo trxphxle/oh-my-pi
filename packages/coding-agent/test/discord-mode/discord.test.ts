@@ -69,6 +69,7 @@ function fixture() {
 	const history = new Collection<string, Message>();
 	const sent: MessageCreateOptions[] = [];
 	const edited: MessageEditOptions[] = [];
+	const pins: string[] = [];
 	const created: GuildChannelCreateOptions[] = [];
 	let nextId = 100;
 	let fetchError: unknown;
@@ -112,6 +113,12 @@ function fixture() {
 			webhookId: null,
 			embeds: payload.embeds ?? [],
 			content: payload.content ?? "",
+			pinned: false,
+			pin: async () => {
+				pins.push(id);
+				Object.assign(message, { pinned: true });
+				return message as unknown as Message;
+			},
 			edit: async (update: MessageEditOptions) => {
 				edited.push(update);
 				if (!history.has(id)) throw { code: 10008 };
@@ -425,6 +432,7 @@ function fixture() {
 		history,
 		sent,
 		edited,
+		pins,
 		created,
 		overwrites,
 		inputs,
@@ -1173,6 +1181,22 @@ describe("Discord mode gateway adapter (offline)", () => {
 		await f.adapter.status(CHANNEL, "Haiso · api", "app-card", CONNECTION, id, false, "haiso");
 		expect(f.edited.at(-1)?.embeds).toMatchObject([{ color: 0x9b59b6 }]);
 		expect(f.sent).toHaveLength(1);
+	});
+
+	it("pins a status card once so it stays reachable, and leaves stop-time edits unpinned", async () => {
+		const f = fixture();
+		await f.adapter.start(f.handlers);
+		const id = await f.adapter.status(CHANNEL, "Haiso · api", "pin-card", CONNECTION, undefined, false, "haiso");
+		expect(f.pins).toEqual([id]);
+		await f.adapter.status(CHANNEL, "Haiso · api idle", "pin-card", CONNECTION, id, false, "haiso");
+		expect(f.pins).toEqual([id]);
+
+		const other = await f.adapter.status(CHANNEL, "Haiso · closing", "stop-card", undefined, undefined, false, "haiso");
+		expect(f.pins).toEqual([id, other]);
+		// A card someone unpinned is not re-pinned by the time-boxed stop edit (existing-only).
+		Object.assign(f.history.get(other)!, { pinned: false });
+		await f.adapter.status(CHANNEL, "Offline since …", "stop-card", undefined, other, true);
+		expect(f.pins).toEqual([id, other]);
 	});
 
 	it("retains history and permissions, archives once, and still delivers closed-channel owner notices", async () => {

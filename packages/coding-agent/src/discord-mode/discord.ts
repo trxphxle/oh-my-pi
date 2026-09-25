@@ -974,6 +974,9 @@ export class DiscordAdapter implements DiscordPort {
 					state.id = message.id;
 					state.uncertain = false;
 				}
+				// Cards are edited in place and drift up as the channel grows; pin them so they stay one tap away.
+				// Skipped for the stop-time edits (tight budget) and tolerated without the Pin Messages permission.
+				if (!existingOnly && !message.pinned) await message.pin().catch(() => {});
 				return message.id;
 			})
 			.catch(error => {

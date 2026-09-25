@@ -7,7 +7,7 @@ One category per project folder; sessions in it can message each other. 🟣 = H
 Send text to chat; it waits until the agent is idle. Controls are owner-only.
 {{commands}}
 • `!steer <text>` — guide active work · `!abort` — cancel the current turn (no rollback)
-**Settings** on the card opens the same panel; changes apply after the current turn. Mentions default to approvals/questions and replies that took ≥2 min. Long replies arrive as a preview + `haiso-reply.md`.
+The session card is pinned 📌. **Settings** on it opens the same panel; changes apply after the current turn. Long replies arrive as a preview + `haiso-reply.md`.
 
 **Sharing — terminal**
 Haiso: `/discord on` once per conversation. OMP: `/bridge on`. Sharing is remembered: resuming the conversation rejoins its channel. `/discord off` / `/bridge off` makes it private (sticky).
