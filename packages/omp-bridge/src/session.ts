@@ -47,6 +47,10 @@ const RECOVERY =
 	"Bridge work is held; nothing will be replayed. Inspect /bridge status. For an uncertain delivery, detach and reattach locally, then use /bridge reconcile. Resume queued work only with explicit /bridge repair.";
 /** One broker lease (45 s) plus margin: a crashed or just-closed window has released it by then. */
 const REJOIN_RETRY_MS = 50_000;
+/** The broker's answer when it no longer knows this lease: its service restarted (update switchover) or revoked it. */
+const LEASE_LOST = /lease is invalid, expired, or revoked/;
+/** Automatic re-attach attempts after a lost lease; spans a service restart plus one lease expiry. */
+const RELINK_DELAYS_MS = [0, 2_000, 5_000, 15_000, 30_000, 60_000];
 const MAX_STATE_BYTES = 24 * 1024 * 1024;
 /** A reported settings view is rebuilt at most this often, and after every applied change. */
 const SETTINGS_REFRESH_MS = 5_000;
@@ -338,6 +342,8 @@ interface Attachment {
 	available: boolean;
 	polling: boolean;
 	cancelTimer?: () => void;
+	/** The "request failed" warning was shown and not yet cleared by a successful request. */
+	warned?: boolean;
 	/** A parked broker wait between polls; detach or a local state change aborts it. */
 	parked?: AbortController;
 	/**
@@ -385,6 +391,8 @@ export class BridgeSession {
 	#closing: Promise<void> = Promise.resolve();
 	#statusText = "Bridge: off";
 	#cancelRejoin?: () => void;
+	/** Set while re-attaching after a lost lease; any explicit on/off/detach replaces or clears it. */
+	#relinking?: object;
 
 	constructor(
 		readonly host: BridgeHost,
@@ -408,6 +416,7 @@ export class BridgeSession {
 	}
 
 	on(label?: string): Promise<ModeSnapshot> {
+		this.#relinking = undefined;
 		return this.#attach(label, false);
 	}
 
@@ -474,7 +483,7 @@ export class BridgeSession {
 		if (this.enabled) return (await this.status())!;
 		if (this.#attaching) throw new Error("Bridge attachment is already in progress; wait for its local result.");
 		this.#attaching = true;
-		const closing = this.detach();
+		const closing = this.#close("detach");
 		const epoch = this.#epoch;
 		const state = { ...this.host.getState() };
 		const abort = new AbortController();
@@ -655,6 +664,7 @@ export class BridgeSession {
 
 	/** Close locally but keep sharing: resuming this conversation reattaches it. Older brokers get `off` instead. */
 	detach(): Promise<boolean> {
+		this.#relinking = undefined;
 		return this.#close("detach");
 	}
 
@@ -663,7 +673,44 @@ export class BridgeSession {
 	 * the broker confirmed it; otherwise nothing was attached here (see `disable`).
 	 */
 	off(): Promise<boolean> {
+		this.#relinking = undefined;
 		return this.#close("off");
+	}
+
+	/**
+	 * The broker no longer knows this lease, typically because Haiso's service restarted for an update. Drop the dead
+	 * attachment locally (its lease cannot be released) and rejoin like a resume: never enrolls or creates anything,
+	 * never replays work; deliveries that were in flight stay held on the broker for /bridge reconcile.
+	 */
+	async #relink(): Promise<void> {
+		if (this.#relinking) return;
+		const token = {};
+		this.#relinking = token;
+		await this.#close("local");
+		for (const delay of RELINK_DELAYS_MS) {
+			if (this.#relinking !== token) return;
+			this.#statusText = "Bridge: reconnecting";
+			this.host.setStatus(this.#statusText);
+			if (delay) {
+				const waited = Promise.withResolvers<void>();
+				this.host.schedule(waited.resolve, delay);
+				await waited.promise;
+				if (this.#relinking !== token) return;
+			}
+			await this.rejoin();
+			if (this.enabled) {
+				this.#relinking = undefined;
+				this.host.notify("Bridge reconnected after Haiso's Discord service restarted.", "info");
+				return;
+			}
+		}
+		if (this.#relinking !== token) return;
+		this.#relinking = undefined;
+		this.host.setStatus(undefined);
+		this.host.notify(
+			"Bridge lost its Discord connection and couldn't reconnect. Use /bridge on to try again.",
+			"warning",
+		);
 	}
 
 	/** Sticky off by identity for a conversation not attached here; a no-op unless the broker still shares it. */
@@ -691,7 +738,8 @@ export class BridgeSession {
 		}
 	}
 
-	#close(op: "detach" | "off"): Promise<boolean> {
+	/** `local` drops the attachment without broker traffic, for a lease the broker no longer knows. */
+	#close(op: "detach" | "off" | "local"): Promise<boolean> {
 		const attachment = this.#attachment;
 		this.#epoch++;
 		this.#attachment = undefined;
@@ -710,14 +758,16 @@ export class BridgeSession {
 			await prior.catch(() => {});
 			try {
 				if (attachment) {
-					const signal = AbortSignal.timeout(2000);
-					try {
-						await attachment.client.request({ op, lease: attachment.lease }, signal);
-						released = true;
-					} catch (error) {
-						// Brokers without `detach` reject it unexecuted; `off` was their only release.
-						if (op === "detach" && error instanceof DiscordModeRequestError && error.outcome === "not-started")
-							await attachment.client.request({ op: "off", lease: attachment.lease }, signal).catch(() => {});
+					if (op !== "local") {
+						const signal = AbortSignal.timeout(2000);
+						try {
+							await attachment.client.request({ op, lease: attachment.lease }, signal);
+							released = true;
+						} catch (error) {
+							// Brokers without `detach` reject it unexecuted; `off` was their only release.
+							if (op === "detach" && error instanceof DiscordModeRequestError && error.outcome === "not-started")
+								await attachment.client.request({ op: "off", lease: attachment.lease }, signal).catch(() => {});
+						}
 					}
 					await attachment.client.close().catch(() => {});
 					await attachment.journal.flush();
@@ -881,7 +931,8 @@ export class BridgeSession {
 			this.#intakeCommands(attachment, snapshot.commands ?? []);
 			await this.#drain(attachment);
 		} catch (error) {
-			if (!(error instanceof DiscordModeRequestError && error.outcome === "not-started"))
+			if (error instanceof DiscordModeRequestError && LEASE_LOST.test(error.message)) void this.#relink();
+			else if (!(error instanceof DiscordModeRequestError && error.outcome === "not-started"))
 				this.#hold(attachment, "intake");
 		} finally {
 			attachment.polling = false;
@@ -1298,22 +1349,29 @@ export class BridgeSession {
 			attachment.snapshot = snapshot;
 			attachment.available = true;
 			this.#render(attachment);
-			if (restored)
+			if (restored && attachment.warned)
 				this.host.notify(
 					"Bridge broker is reachable on the same connection again; held work has not been replayed or resumed.",
 					"info",
 				);
+			attachment.warned = false;
 			return snapshot;
 		} catch (error) {
 			if (this.#current(attachment)) {
-				const wasAvailable = attachment.available;
 				attachment.available = false;
 				this.#render(attachment);
-				if (wasAvailable)
+				// A request that never reached the broker (service restarting) or a lease it no longer knows (relinked
+				// by the poll loop) has no uncertain effect to warn about; the status line shows the outage.
+				const quiet =
+					error instanceof DiscordModeRequestError &&
+					(error.outcome === "not-started" || LEASE_LOST.test(error.message));
+				if (!attachment.warned && !quiet) {
+					attachment.warned = true;
 					this.host.notify(
 						"Bridge request failed. Inspect /bridge status locally; uncertain actions must not be retried blindly.",
 						"warning",
 					);
+				}
 			}
 			if (error instanceof DiscordModeRequestError) throw error;
 			throw new Error(

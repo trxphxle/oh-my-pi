@@ -1302,4 +1302,36 @@ describe("BridgeSession push waits", () => {
 		await f.mode.detach();
 		expect(f.waits[1]!.signal?.aborted).toBe(true);
 	});
+
+	test("re-attaches quietly after Haiso's service restarts and forgets the lease", async () => {
+		const f = await fixture();
+		await f.share();
+		await f.mode.on();
+		let polls = 0;
+		f.beforeRequest = async input => {
+			if (input.op !== "poll") return;
+			polls++;
+			// While the service restarts, requests never reach it.
+			if (polls === 1) throw new DiscordModeRequestError("not-started", "connection refused");
+			if (polls !== 2) return;
+			// The new service process has the journal but no live leases.
+			f.setSession({ connected: false });
+			throw new DiscordModeRequestError(
+				"unknown",
+				"Session lease is invalid, expired, or revoked; reconnect explicitly. Discord mode did not confirm the result; outcome may be unknown. Inspect status before retrying.",
+			);
+		};
+		const notices = f.notices.length;
+		await f.mode.poll();
+		await f.mode.poll();
+		await until(() => f.notices.slice(notices).some(text => text.includes("reconnected")));
+		expect(f.mode.enabled).toBe(true);
+		const registers = f.requests.filter(
+			(request): request is Extract<ModeRequest, { op: "register" }> => request.op === "register",
+		);
+		expect(registers.at(-1)?.rejoin).toBe(true);
+		expect(f.notices.slice(notices).some(text => /held|failed/i.test(text))).toBe(false);
+		await f.mode.poll();
+		expect(f.requests.at(-1)?.op).toBe("poll");
+	});
 });
