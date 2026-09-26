@@ -747,7 +747,11 @@ async function runSuite(
 			throw new Error(
 				`${label} failed without attributable test failures (exit ${result.code}):\n${tailLines(result.output, 25)}`,
 			);
-		for (const key of found) failures.add(key);
+		// JUnit reports some files by absolute path; keys stay cwd-relative so re-runs and the baseline worktree match.
+		for (const key of found) {
+			const [file = "", ...rest] = key.split("\0");
+			failures.add([path.isAbsolute(file) ? path.relative(cwd, file) : file, ...rest].join("\0"));
+		}
 	}
 	if (failures.size) session.say(`  ${failures.size} failing`);
 	return failures;
