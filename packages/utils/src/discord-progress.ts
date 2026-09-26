@@ -286,3 +286,16 @@ export function formatDiscordProgressLine(progress: ModeProgress, now: number): 
 	const last = progress.last ? ` · last: ${progress.last.label} (${progress.last.outcome})` : "";
 	return `Working · ${elapsed(now - progress.startedAt)} · ${activity}${last}`;
 }
+
+const MAX_FAILURE_DETAIL = 300;
+
+/**
+ * Reply for a Discord turn that ended in a provider error, so the channel is not left silent.
+ * Only the first line of the error, bounded; tool output and transcript content never appear here.
+ */
+export function formatDiscordTurnFailure(message: { stopReason: string; errorMessage?: string }): string | undefined {
+	if (message.stopReason !== "error") return undefined;
+	const line = message.errorMessage?.split("\n", 1)[0]?.trim() ?? "";
+	const detail = line.length > MAX_FAILURE_DETAIL ? `${line.slice(0, MAX_FAILURE_DETAIL - 1)}…` : line;
+	return `⚠️ This turn failed${detail ? `: ${detail}` : "."}\nIt stopped at the error. Switch the model in the settings panel, or try again later.`;
+}

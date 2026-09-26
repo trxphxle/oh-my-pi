@@ -513,7 +513,7 @@ describe("BridgeSession local identity and lifecycle", () => {
 		expect(f.connects).toBe(0);
 		expect(f.timers).toEqual([]);
 		expect(f.notices).toEqual([]);
-		await expect(f.mode.on()).rejects.toThrow("actually saved");
+		await expect(f.mode.on()).rejects.toThrow("isn't saved yet");
 		expect(f.connects).toBe(0);
 		expect(await fs.stat(f.state.sessionFile!).catch(() => undefined)).toBeUndefined();
 	});
@@ -527,7 +527,7 @@ describe("BridgeSession local identity and lifecycle", () => {
 			f.state.sessionFile!,
 			`${JSON.stringify({ type: "session", id: randomUUID(), cwd: f.root })}\n`,
 		);
-		await expect(f.mode.on()).rejects.toThrow("actually saved");
+		await expect(f.mode.on()).rejects.toThrow("isn't saved yet");
 		expect(f.connects).toBe(0);
 	});
 
@@ -735,21 +735,39 @@ describe("BridgeSession admission and attribution", () => {
 		expect(f.publications[1]).not.toContain("\ufffd");
 	});
 
-	test("non-stop terminal results never publish and brokers without a reply bound keep the text bound", async () => {
+	test("provider errors publish only a bounded failure notice; aborted turns stay silent; text bound holds", async () => {
 		const f = await fixture();
 		await f.mode.on();
 		const failed = f.queue();
 		await f.mode.poll();
-		await f.mode.onAgentEnd({ messages: [marker(failed), assistant("partial failure", "error")] });
+		await f.mode.onAgentEnd({
+			messages: [
+				marker(failed),
+				{
+					...assistant("partial failure", "error"),
+					errorMessage: "Codex error event: The usage limit has been reached\nstack line",
+				},
+			],
+		});
+		expect(f.publications).toHaveLength(1);
+		expect(f.publications[0]).toContain("The usage limit has been reached");
+		expect(f.publications[0]).not.toContain("stack line");
+		expect(f.publications[0]).not.toContain("partial failure");
+		expect(f.publications[0]).not.toContain("private chain");
+		f.state.idle = true;
+		const aborted = f.queue();
+		await f.mode.poll();
+		await f.mode.onAgentEnd({ messages: [marker(aborted), assistant("half an answer", "aborted")] });
+		expect(f.publications).toHaveLength(1);
 		f.state.idle = true;
 		const completed = f.queue();
 		await f.mode.poll();
 		await f.end(completed, "界".repeat(8000));
-		expect(f.publications).toHaveLength(1);
-		expect(Buffer.byteLength(f.publications[0]!)).toBeLessThanOrEqual(DISCORD_MODE_MAX_TEXT);
-		expect(f.publications[0]).toEndWith("\n[response truncated]");
-		expect(f.publications[0]).not.toContain("\ufffd");
-		expect(f.publications[0]).not.toContain("private chain");
+		expect(f.publications).toHaveLength(2);
+		expect(Buffer.byteLength(f.publications[1]!)).toBeLessThanOrEqual(DISCORD_MODE_MAX_TEXT);
+		expect(f.publications[1]).toEndWith("\n[response truncated]");
+		expect(f.publications[1]).not.toContain("\ufffd");
+		expect(f.publications[1]).not.toContain("private chain");
 	});
 
 	test("busy, draft, and pending input defer ordinary delivery while stop controls still operate", async () => {

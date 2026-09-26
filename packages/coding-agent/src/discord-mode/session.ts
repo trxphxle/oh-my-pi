@@ -19,7 +19,7 @@ import { describeDiscordMode, type DiscordModePresentation } from "./presentatio
 import { readDiscordSharedSessions } from "./retirement-events";
 import { createDiscordSettingsHost } from "./settings-host";
 import { DiscordModeRequestError, sealModeSettingsView } from "@oh-my-pi/pi-utils/discord-client";
-import { DiscordProgressTracker } from "@oh-my-pi/pi-utils/discord-progress";
+import { DiscordProgressTracker, formatDiscordTurnFailure } from "@oh-my-pi/pi-utils/discord-progress";
 import {
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_REPLY,
@@ -1326,20 +1326,21 @@ export class DiscordModeSession {
 			active.delivery.source === "owner" &&
 			!active.contaminated &&
 			!active.reported &&
-			last?.role === "assistant" &&
-			last.stopReason === "stop"
+			last?.role === "assistant"
 		) {
-			const final = last.content
-				.filter(part => part.type === "text")
-				.map(part => part.text)
-				.join("\n");
-			// Old brokers omit maxReply and keep the report bound; never exceed this build's own limit.
-			const limit = Math.min(this.#snapshot?.maxReply ?? DISCORD_MODE_MAX_TEXT, DISCORD_MODE_MAX_REPLY);
-			const suffix = "\n[response truncated]";
-			text =
-				Buffer.byteLength(final) > limit
-					? truncateHeadBytes(final, limit - Buffer.byteLength(suffix)).text + suffix
-					: final;
+			if (last.stopReason === "stop") {
+				const final = last.content
+					.filter(part => part.type === "text")
+					.map(part => part.text)
+					.join("\n");
+				// Old brokers omit maxReply and keep the report bound; never exceed this build's own limit.
+				const limit = Math.min(this.#snapshot?.maxReply ?? DISCORD_MODE_MAX_TEXT, DISCORD_MODE_MAX_REPLY);
+				const suffix = "\n[response truncated]";
+				text =
+					Buffer.byteLength(final) > limit
+						? truncateHeadBytes(final, limit - Buffer.byteLength(suffix)).text + suffix
+						: final;
+			} else text = formatDiscordTurnFailure(last);
 		}
 		this.#active = undefined;
 		void this.#receipt(active.delivery, "completed", text || undefined).catch(() => {

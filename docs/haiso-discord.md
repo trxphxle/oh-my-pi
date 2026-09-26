@@ -118,6 +118,7 @@ Haiso operation. The connector never creates or rewrites OMP's native session fi
 | `/bridge status` | Inspect local connection, destination, and uncertain deliveries. |
 | `/bridge reconcile` | Review unknown delivery outcomes without replaying them. |
 | `/bridge repair` | Explicitly repair a binding or resume held work after inspection. |
+| `/bridge` | Open a menu of the actions above for the current state (turn on when off). |
 
 The tool exposes `peers`, `send`, and `report`. Peer input stays untrusted agent
 data; only attributable owner-turn final text and explicit reports reach Discord.
@@ -202,7 +203,9 @@ Remote select menus support up to 25 complete options; text/editor responses up
 to 4,000 characters. Full dialog details are attached rather than silently
 truncated; a remote structured ask with too many projected options remains local.
 
-Only attributable remote-turn final text and explicit reports are published.
+Only attributable remote-turn final text and explicit reports are published. A remote
+turn that ends in a provider error (usage limit, outage) posts a short notice with
+the first line of the error instead of staying silent; a stopped turn posts nothing.
 Replies and reports contain the message itself, without delivery-ID headers or
 tracking-hash footers. Delivery and status-card identity remain internal.
 Thinking, tool output, and unrelated local conversation are not mirrored. A final

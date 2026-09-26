@@ -9,6 +9,7 @@ import {
 	sealModeSettingsView,
 } from "@oh-my-pi/pi-utils/discord-client";
 import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "@oh-my-pi/pi-utils/discord-private-files";
+import { formatDiscordTurnFailure } from "@oh-my-pi/pi-utils/discord-progress";
 import {
 	DISCORD_MODE_MAX_PENDING,
 	DISCORD_MODE_MAX_REPLY,
@@ -194,7 +195,7 @@ async function savedIdentity(state: BridgeHostState): Promise<Identity> {
 		!path.isAbsolute(state.cwd)
 	) {
 		throw new Error(
-			"Bridge requires a saved native session with a persistent UUID. Save a local turn or resume an existing session, then use /bridge on.",
+			"This conversation isn't saved yet. Send one message first (or resume a saved session), then /bridge on.",
 		);
 	}
 	let file: fs.FileHandle | undefined;
@@ -247,7 +248,7 @@ async function savedIdentity(state: BridgeHostState): Promise<Identity> {
 		return { sessionId: state.sessionId, sessionFile, projectDir };
 	} catch {
 		throw new Error(
-			"Bridge requires an actually saved native session matching this UUID and project. Save a local turn or resume the session before /bridge on; no session file was created or modified.",
+			"This conversation isn't saved yet, or its session file doesn't match this project. Send one message first (or resume a saved session), then /bridge on. Nothing was changed.",
 		);
 	} finally {
 		await file?.close();
@@ -1051,11 +1052,10 @@ export class BridgeSession {
 		// Older brokers omit maxReply and accept only MAX_TEXT; never exceed this build's own bound.
 		const max = Math.min(attachment.snapshot.maxReply ?? DISCORD_MODE_MAX_TEXT, DISCORD_MODE_MAX_REPLY);
 		const text =
-			active.delivery.source === "owner" &&
-			!active.contaminated &&
-			!active.reported &&
-			assistant?.stopReason === "stop"
-				? finalText(assistant, max)
+			active.delivery.source === "owner" && !active.contaminated && !active.reported && assistant
+				? assistant.stopReason === "stop"
+					? finalText(assistant, max)
+					: formatDiscordTurnFailure(assistant)
 				: undefined;
 		await this.#complete(attachment, active, text);
 	}

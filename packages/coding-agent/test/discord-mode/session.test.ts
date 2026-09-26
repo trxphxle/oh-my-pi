@@ -329,8 +329,10 @@ async function fixture(
 			messages.push(message);
 			emit({ type: "message_start", message });
 		},
-		finish(text: string) {
-			const message = assistant(text);
+		finish(text: string, failure?: string) {
+			const message: AssistantMessage = failure
+				? { ...assistant(text), stopReason: "error", errorMessage: failure }
+				: assistant(text);
 			messages.push(message);
 			state.busy = false;
 			emit({ type: "message_end", message });
@@ -424,6 +426,19 @@ describe("native Discord session routing", () => {
 		expect(f.prompts[0]).toContain("Discord owner owner-id");
 		f.finish("Owner result");
 		expect((await f.completed).text).toBe("Owner result");
+	});
+
+	test("a provider error answers the owner with the error line instead of leaving the channel silent", async () => {
+		const f = await fixture();
+		await f.enroll();
+		f.queue(f.delivery());
+		await f.mode.poll();
+		f.finish("partial draft", "Codex error event: The usage limit has been reached\ninternal detail");
+		const text = (await f.completed).text!;
+		expect(text).toContain("The usage limit has been reached");
+		expect(text).not.toContain("internal detail");
+		expect(text).not.toContain("partial draft");
+		expect(text).not.toContain("private reasoning");
 	});
 
 	test("a concurrent local user boundary suppresses automatic publication", async () => {

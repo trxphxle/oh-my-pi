@@ -360,6 +360,20 @@ describe("official OMP bridge adapter", () => {
 		expect(f.requests.find(request => request.op === "register")).toMatchObject({ label: "Research terminal" });
 	});
 
+	test("bare /bridge offers the actions for the current state and runs the pick", async () => {
+		const f = await fixture();
+		await f.command("");
+		expect(f.connects).toBe(0);
+		f.selections.push("Turn on — share this conversation to Discord");
+		await f.command("");
+		expect(f.requests.some(request => request.op === "register")).toBe(true);
+		expect(f.activeTools).toContain("bridge");
+		f.selections.push("Turn off — stop sharing this conversation");
+		await f.command("");
+		expect(f.requests.some(request => request.op === "off")).toBe(true);
+		expect(f.activeTools).not.toContain("bridge");
+	});
+
 	test("off removes only its own tool and does not restore stale tool choices", async () => {
 		const f = await fixture();
 		await f.command("on");

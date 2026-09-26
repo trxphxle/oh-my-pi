@@ -35,6 +35,24 @@ export interface BridgeExtensionOptions {
 
 const TOOL_NAME = "bridge";
 const USAGE = "/bridge on [label] | off | status | reconcile | repair";
+const SUBCOMMANDS = [
+	{ value: "on", description: "Share this conversation to Discord (optional channel label)" },
+	{ value: "off", description: "Stop sharing this conversation, also when resumed" },
+	{ value: "status", description: "Show whether this conversation is shared" },
+	{ value: "repair", description: "Create or adopt a Discord destination" },
+	{ value: "reconcile", description: "Resolve uncertain deliveries without replaying them" },
+] as const;
+/** Bare `/bridge` menu labels → subcommand, like Haiso's bare `/discord`. */
+const MENU_OFF: Record<string, string> = {
+	"Turn on — share this conversation to Discord": "on",
+	Status: "status",
+};
+const MENU_ON: Record<string, string> = {
+	Status: "status",
+	"Turn off — stop sharing this conversation": "off",
+	"Repair Discord destination": "repair",
+	"Reconcile uncertain deliveries": "reconcile",
+};
 
 function identity(ctx: ExtensionContext): string {
 	return JSON.stringify([ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile(), ctx.cwd]);
@@ -349,15 +367,30 @@ export function installBridge(pi: ExtensionAPI, options: BridgeExtensionOptions 
 		description: "Existing Haiso Discord broker root (default: HAISO_BRIDGE_ROOT or ~/.omp/agent/discord-mode)",
 	});
 	pi.registerCommand(TOOL_NAME, {
-		description:
-			"Opt in to the existing Haiso Discord broker; approvals stay local, and Discord may change model, effort, and context when idle",
+		description: "Share this conversation to Discord through Haiso (/bridge on); approvals stay local",
+		getArgumentCompletions(prefix) {
+			if (prefix.includes(" ")) return null;
+			const items = SUBCOMMANDS.filter(item => item.value.startsWith(prefix)).map(item => ({
+				value: item.value,
+				label: item.value,
+				description: item.description,
+			}));
+			return items.length ? items : null;
+		},
 		async handler(args, ctx) {
 			await useContext(ctx);
 			if (ctx.mode !== "tui" || !ctx.hasUI) {
 				ctx.ui.notify("/bridge requires the local interactive OMP terminal.", "error");
 				return;
 			}
-			const [action = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+			const [typed = "", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+			let action = typed;
+			if (!action) {
+				const menu = session?.enabled ? MENU_ON : MENU_OFF;
+				const picked = await ctx.ui.select("Discord bridge", Object.keys(menu));
+				if (!picked) return;
+				action = menu[picked]!;
+			}
 			if (action !== "on" && rest.length) {
 				ctx.ui.notify(USAGE, "error");
 				return;
